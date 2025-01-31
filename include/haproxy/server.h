@@ -26,31 +26,43 @@
 
 #include <haproxy/api.h>
 #include <haproxy/applet-t.h>
+#include <haproxy/arg-t.h>
 #include <haproxy/freq_ctr.h>
 #include <haproxy/proxy-t.h>
 #include <haproxy/resolvers-t.h>
+#include <haproxy/sample-t.h>
 #include <haproxy/server-t.h>
 #include <haproxy/task.h>
 #include <haproxy/thread-t.h>
 #include <haproxy/time.h>
+#include <haproxy/tools.h>
 
 
 __decl_thread(extern HA_SPINLOCK_T idle_conn_srv_lock);
 extern struct idle_conns idle_conns[MAX_THREADS];
 extern struct task *idle_conn_task;
-extern struct list servers_list;
+extern struct mt_list servers_list;
 extern struct dict server_key_dict;
 
 int srv_downtime(const struct server *s);
-int srv_lastsession(const struct server *s);
 int srv_getinter(const struct check *check);
+void srv_settings_init(struct server *srv);
+void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl);
 int parse_server(const char *file, int linenum, char **args, struct proxy *curproxy, const struct proxy *defproxy, int parse_flags);
-int srv_update_addr(struct server *s, void *ip, int ip_sin_family, const char *updater);
-const char *srv_update_addr_port(struct server *s, const char *addr, const char *port, char *updater);
+int srv_update_addr(struct server *s, void *ip, int ip_sin_family, struct server_inetaddr_updater updater);
+struct sample_expr *_parse_srv_expr(char *expr, struct arg_list *args_px,
+                                    const char *file, int linenum, char **err);
+int server_set_inetaddr(struct server *s, const struct server_inetaddr *inetaddr, struct server_inetaddr_updater updater, struct buffer *msg);
+int server_set_inetaddr_warn(struct server *s, const struct server_inetaddr *inetaddr, struct server_inetaddr_updater updater);
+void server_get_inetaddr(struct server *s, struct server_inetaddr *inetaddr);
+const char *srv_update_addr_port(struct server *s, const char *addr, const char *port, struct server_inetaddr_updater updater);
+const char *server_inetaddr_updater_by_to_str(enum server_inetaddr_updater_by by);
 const char *srv_update_check_addr_port(struct server *s, const char *addr, const char *port);
 const char *srv_update_agent_addr_port(struct server *s, const char *addr, const char *port);
 struct server *server_find_by_id(struct proxy *bk, int id);
+struct server *server_find_by_id_unique(struct proxy *bk, int id, uint32_t rid);
 struct server *server_find_by_name(struct proxy *bk, const char *name);
+struct server *server_find_by_name_unique(struct proxy *bk, const char *name, uint32_t rid);
 struct server *server_find_best_match(struct proxy *bk, char *name, int id, int *diff);
 void apply_server_state(void);
 void srv_compute_all_admin_states(struct proxy *px);
@@ -60,13 +72,17 @@ struct server *cli_find_server(struct appctx *appctx, char *arg);
 struct server *new_server(struct proxy *proxy);
 void srv_take(struct server *srv);
 struct server *srv_drop(struct server *srv);
+void srv_free_params(struct server *srv);
 int srv_init_per_thr(struct server *srv);
 void srv_set_ssl(struct server *s, int use_ssl);
+const char *srv_adm_st_chg_cause(enum srv_adm_st_chg_cause cause);
+const char *srv_op_st_chg_cause(enum srv_op_st_chg_cause cause);
+void srv_event_hdl_publish_check(struct server *srv, struct check *check);
+int srv_check_for_deletion(const char *bename, const char *svname, struct proxy **pb, struct server **ps, const char **pm);
 
 /* functions related to server name resolution */
 int srv_prepare_for_resolution(struct server *srv, const char *hostname);
-int srvrq_update_srv_status(struct server *s, int has_no_ip);
-int snr_update_srv_status(struct server *s, int has_no_ip);
+int srvrq_set_srv_down(struct server *s);
 int srv_set_fqdn(struct server *srv, const char *fqdn, int resolv_locked);
 const char *srv_update_fqdn(struct server *server, const char *fqdn, const char *updater, int dns_locked);
 int snr_resolution_cb(struct resolv_requester *requester, struct dns_counters *counters);
@@ -78,7 +94,9 @@ void srv_release_conn(struct server *srv, struct connection *conn);
 struct connection *srv_lookup_conn(struct eb_root *tree, uint64_t hash);
 struct connection *srv_lookup_conn_next(struct connection *conn);
 
+void _srv_add_idle(struct server *srv, struct connection *conn, int is_safe);
 int srv_add_to_idle_list(struct server *srv, struct connection *conn, int is_safe);
+void srv_add_to_avail_list(struct server *srv, struct connection *conn);
 struct task *srv_cleanup_toremove_conns(struct task *task, void *context, unsigned int state);
 
 int srv_apply_track(struct server *srv, struct proxy *curproxy);
@@ -109,14 +127,6 @@ const char *server_parse_weight_change_request(struct server *sv,
 					       const char *weight_str);
 
 /*
- * Parses addr_str and configures sv accordingly. updater precise
- * the source of the change in the associated message log.
- * Returns NULL on success, error message string otherwise.
- */
-const char *server_parse_addr_change_request(struct server *sv,
-                                             const char *addr_str, const char *updater);
-
-/*
  * Parses maxconn_str and configures sv accordingly.
  * Returns NULL on success, error message string otherwise.
  */
@@ -138,9 +148,9 @@ void srv_shutdown_backup_streams(struct proxy *px, int why);
 void srv_append_status(struct buffer *msg, struct server *s, struct check *,
 		       int xferred, int forced);
 
-void srv_set_stopped(struct server *s, const char *reason, struct check *check);
-void srv_set_running(struct server *s, const char *reason, struct check *check);
-void srv_set_stopping(struct server *s, const char *reason, struct check *check);
+void srv_set_stopped(struct server *s, enum srv_op_st_chg_cause cause);
+void srv_set_running(struct server *s, enum srv_op_st_chg_cause cause);
+void srv_set_stopping(struct server *s, enum srv_op_st_chg_cause cause);
 
 /* Enables admin flag <mode> (among SRV_ADMF_*) on server <s>. This is used to
  * enforce either maint mode or drain mode. It is not allowed to set more than
@@ -150,7 +160,7 @@ void srv_set_stopping(struct server *s, const char *reason, struct check *check)
  * is done. If <cause> is non-null, it will be displayed at the end of the log
  * lines to justify the state change.
  */
-void srv_set_admin_flag(struct server *s, enum srv_admin mode, const char *cause);
+void srv_set_admin_flag(struct server *s, enum srv_admin mode, enum srv_adm_st_chg_cause cause);
 
 /* Disables admin flag <mode> (among SRV_ADMF_*) on server <s>. This is used to
  * stop enforcing either maint mode or drain mode. It is not allowed to set more
@@ -160,7 +170,7 @@ void srv_set_admin_flag(struct server *s, enum srv_admin mode, const char *cause
  */
 void srv_clr_admin_flag(struct server *s, enum srv_admin mode);
 
-/* Calculates the dynamic persitent cookie for a server, if a secret key has
+/* Calculates the dynamic persistent cookie for a server, if a secret key has
  * been provided.
  */
 void srv_set_dyncookie(struct server *s);
@@ -168,18 +178,18 @@ void srv_set_dyncookie(struct server *s);
 int srv_check_reuse_ws(struct server *srv);
 const struct mux_ops *srv_get_ws_proto(struct server *srv);
 
-/* increase the number of cumulated connections on the designated server */
+/* increase the number of cumulated streams on the designated server */
 static inline void srv_inc_sess_ctr(struct server *s)
 {
 	_HA_ATOMIC_INC(&s->counters.cum_sess);
 	HA_ATOMIC_UPDATE_MAX(&s->counters.sps_max,
-			     update_freq_ctr(&s->sess_per_sec, 1));
+	                     update_freq_ctr(&s->counters.sess_per_sec, 1));
 }
 
 /* set the time of last session on the designated server */
 static inline void srv_set_sess_last(struct server *s)
 {
-	s->counters.last_sess = now.tv_sec;
+	s->counters.last_sess = ns_to_sec(now_ns);
 }
 
 /* returns the current server throttle rate between 0 and 100% */
@@ -210,7 +220,7 @@ static inline int server_is_draining(const struct server *s)
  */
 static inline void srv_adm_set_maint(struct server *s)
 {
-	srv_set_admin_flag(s, SRV_ADMF_FMAINT, NULL);
+	srv_set_admin_flag(s, SRV_ADMF_FMAINT, SRV_ADM_STCHGC_NONE);
 	srv_clr_admin_flag(s, SRV_ADMF_FDRAIN);
 }
 
@@ -219,7 +229,7 @@ static inline void srv_adm_set_maint(struct server *s)
  */
 static inline void srv_adm_set_drain(struct server *s)
 {
-	srv_set_admin_flag(s, SRV_ADMF_FDRAIN, NULL);
+	srv_set_admin_flag(s, SRV_ADMF_FDRAIN, SRV_ADM_STCHGC_NONE);
 	srv_clr_admin_flag(s, SRV_ADMF_FMAINT);
 }
 
@@ -262,18 +272,51 @@ static inline enum srv_initaddr srv_get_next_initaddr(unsigned int *list)
 
 static inline void srv_use_conn(struct server *srv, struct connection *conn)
 {
-	unsigned int curr;
+	unsigned int curr, prev;
 
 	curr = _HA_ATOMIC_ADD_FETCH(&srv->curr_used_conns, 1);
+
 
 	/* It's ok not to do that atomically, we don't need an
 	 * exact max.
 	 */
-	if (srv->max_used_conns < curr)
-		srv->max_used_conns = curr;
+	prev = HA_ATOMIC_LOAD(&srv->max_used_conns);
+	if (prev < curr)
+		HA_ATOMIC_STORE(&srv->max_used_conns, curr);
 
-	if (srv->est_need_conns < curr)
-		srv->est_need_conns = curr;
+	prev = HA_ATOMIC_LOAD(&srv->est_need_conns);
+	if (prev < curr)
+		HA_ATOMIC_STORE(&srv->est_need_conns, curr);
+}
+
+/* checks if minconn and maxconn are consistent to each other
+ * and automatically adjust them if it is not the case
+ * This logic was historically implemented in check_config_validity()
+ * at boot time, but with the introduction of dynamic servers
+ * this may be used at multiple places in the code now
+ */
+static inline void srv_minmax_conn_apply(struct server *srv)
+{
+	if (srv->minconn > srv->maxconn) {
+		/* Only 'minconn' was specified, or it was higher than or equal
+		 * to 'maxconn'. Let's turn this into maxconn and clean it, as
+		 * this will avoid further useless expensive computations.
+		 */
+		srv->maxconn = srv->minconn;
+	} else if (srv->maxconn && !srv->minconn) {
+		/* minconn was not specified, so we set it to maxconn */
+		srv->minconn = srv->maxconn;
+	}
+}
+
+/* Returns true if server is used as transparent mode. */
+static inline int srv_is_transparent(const struct server *srv)
+{
+	/* A reverse server does not have any address but it is not used as a
+	 * transparent one.
+	 */
+	return (!is_addr(&srv->addr) && !(srv->flags & SRV_F_RHTTP)) ||
+	       (srv->flags & SRV_F_MAPPORTS);
 }
 
 #endif /* _HAPROXY_SERVER_H */

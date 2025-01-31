@@ -47,6 +47,7 @@ unsigned int mask_find_rank_bit_fast(unsigned int r, unsigned long m,
 void mask_prep_rank_map(unsigned long m,
                         unsigned long *a, unsigned long *b,
                         unsigned long *c, unsigned long *d);
+int one_among_mask(unsigned long v, int bit);
 
 
 /* Multiply the two 32-bit operands and shift the 64-bit result right 32 bits.
@@ -93,6 +94,132 @@ static inline uint64_t rotr64(uint64_t v, uint8_t bits)
 #endif
 	v = (v >> bits) | (v << (-bits & 63));
 	return v;
+}
+
+/* Returns non-zero if any of the 4 bytes composing the u32 <x> is below the
+ * value <min8> or above <min8>+127. Please note that the result will be made
+ * of a 0x80 at positions corresponding to the offending bytes, and that as
+ * such the result is a u32 as well. It is designed like this so that the
+ * operation can be cascaded by ORing the results of multiple blocks. It is
+ * crucial for performance that <min8> is passed as a build-time constant so
+ * as to avoid an expensive multiply. A zero on output confirms that all four
+ * bytes are greater than or equal to <min8> and not lower than <min8>-127.
+ * This is essentially used to skip long sequences of text matching the rule
+ * when the cost of stopping on a false positive is low (i.e. parse multiple
+ * bytes at a time and continue one byte at a time at the end of the series).
+ */
+static inline __attribute__((always_inline))
+uint32_t is_char4_below_opt(uint32_t x, uint8_t min8)
+{
+	uint32_t min32 = min8 * 0x01010101U;
+
+	return (x - min32) & 0x80808080U;
+}
+
+/* Returns non-zero if any of the 4 bytes composing the u32 <x> is above the
+ * value <max8> or below <max8>-127. Please note that the result will be made
+ * of a 0x80 at positions corresponding to the offending bytes, and that as
+ * such the result is a u32 as well. It is designed like this so that the
+ * operation can be cascaded by ORing the results of multiple blocks. It is
+ * crucial for performance that <max8> is passed as a build-time constant so
+ * as to avoid an expensive multiply. A zero on output confirms that all four
+ * bytes are lower than or equal to <max8> and not greater than <max8>+127.
+ * This is essentially used to skip long sequences of text matching the rule
+ * when the cost of stopping on a false positive is low (i.e. parse multiple
+ * bytes at a time and continue one byte at a time at the end of the series).
+ */
+static inline __attribute__((always_inline))
+uint32_t is_char4_above_opt(uint32_t x, uint8_t max8)
+{
+	uint32_t max32 = max8 * 0x01010101U;
+
+	return (max32 - x) & 0x80808080U;
+}
+
+/* Returns non-zero if any of the 4 bytes composing the u32 <x> is outside of
+ * the range defined by <min8> to <max8> included. Please note that the result
+ * will be made of a 0x80 at positions corresponding to the offending bytes,
+ * and that as such the result is a u32 as well. It is designed like this so
+ * that the operation can be cascaded by ORing the results of multiple blocks.
+ * There is one restriction in this simplified version, the distance between
+ * min8 and max8 must be lower than 0x80. It is crucial for performance that
+ * the bounds (min8 and max8) are passed as build-time constants so as to avoid
+ * an expensive multiply. A zero on output confirms that all four bytes are
+ * included in the defined range.
+ */
+static inline __attribute__((always_inline))
+uint32_t is_char4_outside(uint32_t x, uint8_t min8, uint8_t max8)
+{
+	uint32_t min32 = min8 * 0x01010101U;
+	uint32_t max32 = max8 * 0x01010101U;
+
+	return (((x - min32) | (max32 - x)) & 0x80808080U);
+}
+
+/* Returns non-zero if any of the 8 bytes composing the u64 <x> is below the
+ * value <min8> or above <min8>+127. Please note that the result will be made
+ * of a 0x80 at positions corresponding to the offending bytes, and that as
+ * such the result is a u64 as well. It is designed like this so that the
+ * operation can be cascaded by ORing the results of multiple blocks. It is
+ * crucial for performance that <min8> is passed as a build-time constant so
+ * as to avoid an expensive multiply. A zero on output confirms that all eight
+ * bytes are greater than or equal to <min8> and not lower than <min8>-127.
+ * This is essentially used to skip long sequences of text matching the rule
+ * when the cost of stopping on a false positive is low (i.e. parse multiple
+ * bytes at a time and continue one byte at a time at the end of the series).
+ */
+static inline __attribute__((always_inline))
+uint64_t is_char8_below_opt(uint64_t x, uint8_t min8)
+{
+	uint64_t min64 = min8 * 0x0101010101010101ULL;
+
+	return (x - min64) & 0x8080808080808080ULL;
+}
+
+/* Returns non-zero if any of the 8 bytes composing the u64 <x> is above the
+ * value <max8> or below <max8>-127. Please note that the result will be made
+ * of a 0x80 at positions corresponding to the offending bytes, and that as
+ * such the result is a u64 as well. It is designed like this so that the
+ * operation can be cascaded by ORing the results of multiple blocks. It is
+ * crucial for performance that <max8> is passed as a build-time constant so
+ * as to avoid an expensive multiply. A zero on output confirms that all eight
+ * bytes are lower than or equal to <max8> and not greater than <max8>+127.
+ * This is essentially used to skip long sequences of text matching the rule
+ * when the cost of stopping on a false positive is low (i.e. parse multiple
+ * bytes at a time and continue one byte at a time at the end of the series).
+ */
+static inline __attribute__((always_inline))
+uint64_t is_char8_above_opt(uint64_t x, uint8_t max8)
+{
+	uint64_t max64 = max8 * 0x0101010101010101ULL;
+
+	return (max64 - x) & 0x8080808080808080ULL;
+}
+
+/* Returns non-zero if any of the 8 bytes composing the u64 <x> is outside of
+ * the range defined by <min8> to <max8> included. Please note that the result
+ * will be made of a 0x80 at positions corresponding to some of the offending
+ * bytes, and that as such the result is a u64 as well. On 32-bit mcahines, the
+ * operation will be made of two adjacent 32-bit checks. It is designed like
+ * this so that the operation can be cascaded by ORing the results of multiple
+ * blocks. There is one restriction in this simplified version, the distance
+ * between min8 and max8 must be lower than 0x80. It is crucial for performance
+ * that the bounds (min8 and max8) are passed as build-time constants so as to
+ * avoid an expensive multiply. A zero on output confirms that all eight bytes
+ * are included in the defined range.
+ */
+static inline __attribute__((always_inline))
+uint64_t is_char8_outside(uint64_t x, uint8_t min8, uint8_t max8)
+{
+	if (sizeof(long) >= 8) {
+		uint64_t min64 = min8 * 0x0101010101010101ULL;
+		uint64_t max64 = max8 * 0x0101010101010101ULL;
+
+		return (((x - min64) | (max64 - x)) & 0x8080808080808080ULL);
+	}
+	else
+		return is_char4_outside(x >>  0, min8, max8) |
+		       is_char4_outside(x >> 32, min8, max8);
 }
 
 /* Simple popcountl implementation. It returns the number of ones in a word.
@@ -396,15 +523,15 @@ static inline unsigned int __read_uint(const char **s, const char *end)
 static inline int __varint_bytes(uint64_t v)
 {
 	switch (v) {
-	case 0x0000000000000000 ... 0x00000000000000ef: return 1;
-	case 0x00000000000000f0 ... 0x00000000000008ef: return 2;
-	case 0x00000000000008f0 ... 0x00000000000408ef: return 3;
-	case 0x00000000000408f0 ... 0x00000000020408ef: return 4;
-	case 0x00000000020408f0 ... 0x00000001020408ef: return 5;
-	case 0x00000001020408f0 ... 0x00000081020408ef: return 6;
-	case 0x00000081020408f0 ... 0x00004081020408ef: return 7;
-	case 0x00004081020408f0 ... 0x00204081020408ef: return 8;
-	case 0x00204081020408f0 ... 0x10204081020408ef: return 9;
+	case 0x0000000000000000ULL ... 0x00000000000000efULL: return 1;
+	case 0x00000000000000f0ULL ... 0x00000000000008efULL: return 2;
+	case 0x00000000000008f0ULL ... 0x00000000000408efULL: return 3;
+	case 0x00000000000408f0ULL ... 0x00000000020408efULL: return 4;
+	case 0x00000000020408f0ULL ... 0x00000001020408efULL: return 5;
+	case 0x00000001020408f0ULL ... 0x00000081020408efULL: return 6;
+	case 0x00000081020408f0ULL ... 0x00004081020408efULL: return 7;
+	case 0x00004081020408f0ULL ... 0x00204081020408efULL: return 8;
+	case 0x00204081020408f0ULL ... 0x10204081020408efULL: return 9;
 	default: return 10;
 	}
 }

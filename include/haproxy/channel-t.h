@@ -24,108 +24,86 @@
 
 #include <haproxy/api-t.h>
 #include <haproxy/buf-t.h>
+#include <haproxy/show_flags-t.h>
 
 /* The CF_* macros designate Channel Flags, which may be ORed in the bit field
  * member 'flags' in struct channel. Here we have several types of flags :
  *
  *   - pure status flags, reported by the data layer, which must be cleared
  *     before doing further I/O :
- *     CF_*_NULL, CF_*_PARTIAL
+ *     CF_*_EVENT, CF_*_PARTIAL
  *
- *   - pure status flags, reported by stream-interface layer, which must also
+ *   - pure status flags, reported by stream connector layer, which must also
  *     be cleared before doing further I/O :
- *     CF_*_TIMEOUT, CF_*_ERROR
+ *     CF_*_TIMEOUT
  *
  *   - read-only indicators reported by lower data levels :
  *     CF_STREAMER, CF_STREAMER_FAST
  *
- *   - write-once status flags reported by the stream-interface layer :
- *     CF_SHUTR, CF_SHUTW
- *
- *   - persistent control flags managed only by application level :
- *     CF_SHUT*_NOW, CF_*_ENA
- *
  * The flags have been arranged for readability, so that the read and write
  * bits have the same position in a byte (read being the lower byte and write
  * the second one). All flag names are relative to the channel. For instance,
- * 'write' indicates the direction from the channel to the stream interface.
+ * 'write' indicates the direction from the channel to the stream connector.
+ * Please also update the chn_show_flags() function below in case of changes.
  */
 
-#define CF_READ_NULL      0x00000001  /* last read detected on producer side */
-#define CF_READ_PARTIAL   0x00000002  /* some data were read from producer or a read exception occurred */
+#define CF_READ_EVENT     0x00000001  /* a read event detected on producer side */
+/* unused: 0x00000002 */
 #define CF_READ_TIMEOUT   0x00000004  /* timeout while waiting for producer */
-#define CF_READ_ERROR     0x00000008  /* unrecoverable error on producer side */
-#define CF_READ_ACTIVITY  (CF_READ_NULL|CF_READ_PARTIAL|CF_READ_ERROR)
+/* unused 0x00000008 */
 
-/* unused: 0x00000010 */
-#define CF_SHUTR          0x00000020  /* producer has already shut down */
-#define CF_SHUTR_NOW      0x00000040  /* the producer must shut down for reads ASAP */
-#define CF_READ_NOEXP     0x00000080  /* producer should not expire */
+/* unused: 0x00000010 - 0x00000080 */
 
-#define CF_WRITE_NULL     0x00000100  /* write(0) or connect() succeeded on consumer side */
-#define CF_WRITE_PARTIAL  0x00000200  /* some data were written to the consumer */
+#define CF_WRITE_EVENT    0x00000100  /* a write event detected on consumer side */
+/* unused: 0x00000200 */
 #define CF_WRITE_TIMEOUT  0x00000400  /* timeout while waiting for consumer */
-#define CF_WRITE_ERROR    0x00000800  /* unrecoverable error on consumer side */
-#define CF_WRITE_ACTIVITY (CF_WRITE_NULL|CF_WRITE_PARTIAL|CF_WRITE_ERROR)
+/* unused 0x00000800 */
 
 #define CF_WAKE_WRITE     0x00001000  /* wake the task up when there's write activity */
-#define CF_SHUTW          0x00002000  /* consumer has already shut down */
-#define CF_SHUTW_NOW      0x00004000  /* the consumer must shut down for writes ASAP */
+/* unused: 0x00002000 - 0x00004000 */
 #define CF_AUTO_CLOSE     0x00008000  /* producer can forward shutdown to other side */
-
-/* When CF_SHUTR_NOW is set, it is strictly forbidden for the producer to alter
- * the buffer contents. When CF_SHUTW_NOW is set, the consumer is free to perform
- * a shutw() when it has consumed the last contents, otherwise the session processor
- * will do it anyway.
- *
- * The SHUT* flags work like this :
- *
- *  SHUTR SHUTR_NOW  meaning
- *    0       0      normal case, connection still open and data is being read
- *    0       1      closing : the producer cannot feed data anymore but can close
- *    1       0      closed: the producer has closed its input channel.
- *    1       1      impossible
- *
- *  SHUTW SHUTW_NOW  meaning
- *    0       0      normal case, connection still open and data is being written
- *    0       1      closing: the consumer can send last data and may then close
- *    1       0      closed: the consumer has closed its output channel.
- *    1       1      impossible
- *
- * The SHUTW_NOW flag should be set by the session processor when SHUTR and AUTO_CLOSE
- * are both set. And it may also be set by the producer when it detects SHUTR while
- * directly forwarding data to the consumer.
- *
- * The SHUTR_NOW flag is mostly used to force the producer to abort when an error is
- * detected on the consumer side.
- */
 
 #define CF_STREAMER       0x00010000  /* the producer is identified as streaming data */
 #define CF_STREAMER_FAST  0x00020000  /* the consumer seems to eat the stream very fast */
 
 #define CF_WROTE_DATA     0x00040000  /* some data were sent from this buffer */
-#define CF_ANA_TIMEOUT    0x00080000  /* the analyser timeout has expired */
-#define CF_READ_ATTACHED  0x00100000  /* the read side is attached for the first time */
-#define CF_KERN_SPLICING  0x00200000  /* kernel splicing desired for this channel */
-#define CF_READ_DONTWAIT  0x00400000  /* wake the task up after every read (eg: HTTP request) */
+/* unused 0x00080000 - 0x00400000  */
 #define CF_AUTO_CONNECT   0x00800000  /* consumer may attempt to establish a new connection */
 
 #define CF_DONT_READ      0x01000000  /* disable reading for now */
-#define CF_EXPECT_MORE    0x02000000  /* more data expected to be sent very soon (one-shoot) */
-#define CF_SEND_DONTWAIT  0x04000000  /* don't wait for sending data (one-shoot) */
-#define CF_NEVER_WAIT     0x08000000  /* never wait for sending data (permanent) */
+/* unused 0x02000000 - 0x08000000 */
 
 #define CF_WAKE_ONCE      0x10000000  /* pretend there is activity on this channel (one-shoot) */
 #define CF_FLT_ANALYZE    0x20000000  /* at least one filter is still analyzing this channel */
-#define CF_EOI            0x40000000  /* end-of-input has been reached */
+/* unuse 0x40000000 */
 #define CF_ISRESP         0x80000000  /* 0 = request channel, 1 = response channel */
 
 /* Masks which define input events for stream analysers */
-#define CF_MASK_ANALYSER  (CF_READ_ATTACHED|CF_READ_ACTIVITY|CF_READ_TIMEOUT|CF_ANA_TIMEOUT|CF_WRITE_ACTIVITY|CF_WAKE_ONCE)
+#define CF_MASK_ANALYSER  (CF_READ_EVENT|CF_READ_TIMEOUT|CF_WRITE_EVENT|CF_WAKE_ONCE)
 
-/* Mask for static flags which cause analysers to be woken up when they change */
-#define CF_MASK_STATIC    (CF_SHUTR|CF_SHUTW|CF_SHUTR_NOW|CF_SHUTW_NOW)
-
+/* This function is used to report flags in debugging tools. Please reflect
+ * below any single-bit flag addition above in the same order via the
+ * __APPEND_FLAG macro. The new end of the buffer is returned.
+ */
+static forceinline char *chn_show_flags(char *buf, size_t len, const char *delim, uint flg)
+{
+#define _(f, ...) __APPEND_FLAG(buf, len, delim, flg, f, #f, __VA_ARGS__)
+	/* prologue */
+	_(0);
+	/* flags */
+	_(CF_READ_EVENT, _(CF_READ_TIMEOUT,
+	_(CF_WRITE_EVENT,
+	_(CF_WRITE_TIMEOUT,
+	_(CF_WAKE_WRITE, _(CF_AUTO_CLOSE,
+	_(CF_STREAMER, _(CF_STREAMER_FAST, _(CF_WROTE_DATA,
+	_(CF_AUTO_CONNECT, _(CF_DONT_READ,
+	_(CF_WAKE_ONCE, _(CF_FLT_ANALYZE,
+	_(CF_ISRESP))))))))))))));
+	/* epilogue */
+	_(~0U);
+	return buf;
+#undef _
+}
 
 /* Analysers (channel->analysers).
  * Those bits indicate that there are some processing to do on the buffer
@@ -133,6 +111,7 @@
  * analysers could be compared to higher level processors.
  * The field is blanked by channel_init() and only by analysers themselves
  * afterwards.
+ * Please also update the chn_show_analysers() function below in case of changes.
  */
 /* AN_REQ_FLT_START_FE:         0x00000001 */
 #define AN_REQ_INSPECT_FE       0x00000002  /* inspect request contents in the frontend */
@@ -183,6 +162,35 @@
 #define AN_RES_FLT_XFER_DATA    0x10000000
 #define AN_RES_FLT_END          0x20000000
 
+/* This function is used to report flags in debugging tools. Please reflect
+ * below any single-bit flag addition above in the same order via the
+ * __APPEND_FLAG macro. The new end of the buffer is returned.
+ */
+static forceinline char *chn_show_analysers(char *buf, size_t len, const char *delim, uint flg)
+{
+#define _(f, ...) __APPEND_FLAG(buf, len, delim, flg, f, #f, __VA_ARGS__)
+	/* prologue */
+	_(0);
+	/* request flags */
+	_(AN_REQ_FLT_START_FE, _(AN_REQ_INSPECT_FE, _(AN_REQ_WAIT_HTTP,
+	_(AN_REQ_HTTP_BODY, _(AN_REQ_HTTP_PROCESS_FE, _(AN_REQ_SWITCHING_RULES,
+	_(AN_REQ_FLT_START_BE, _(AN_REQ_INSPECT_BE, _(AN_REQ_HTTP_PROCESS_BE,
+	_(AN_REQ_HTTP_TARPIT, _(AN_REQ_SRV_RULES, _(AN_REQ_HTTP_INNER,
+	_(AN_REQ_PRST_RDP_COOKIE, _(AN_REQ_STICKING_RULES,
+	_(AN_REQ_FLT_HTTP_HDRS, _(AN_REQ_HTTP_XFER_BODY, _(AN_REQ_WAIT_CLI,
+	_(AN_REQ_FLT_XFER_DATA, _(AN_REQ_FLT_END,
+	/* response flags */
+	_(AN_RES_FLT_START_FE, _(AN_RES_FLT_START_BE, _(AN_RES_INSPECT,
+	_(AN_RES_WAIT_HTTP, _(AN_RES_STORE_RULES, _(AN_RES_HTTP_PROCESS_FE,
+	_(AN_RES_HTTP_PROCESS_BE, _(AN_RES_FLT_HTTP_HDRS,
+	_(AN_RES_HTTP_XFER_BODY, _(AN_RES_WAIT_CLI, _(AN_RES_FLT_XFER_DATA,
+	_(AN_RES_FLT_END)))))))))))))))))))))))))))))));
+	/* epilogue */
+	_(~0U);
+	return buf;
+#undef _
+}
+
 /* Magic value to forward infinite size (TCP, ...), used with ->to_forward */
 #define CHN_INFINITE_FORWARD    MAX_RANGE(unsigned int)
 
@@ -191,17 +199,12 @@ struct channel {
 	unsigned int flags;             /* CF_* */
 	unsigned int analysers;         /* bit field indicating what to do on the channel */
 	struct buffer buf;		/* buffer attached to the channel, always present but may move */
-	struct pipe *pipe;		/* non-NULL only when data present */
 	size_t output;                  /* part of buffer which is to be forwarded */
 	unsigned int to_forward;        /* number of bytes to forward after out without a wake-up */
 	unsigned short last_read;       /* 16 lower bits of last read date (max pause=65s) */
 	unsigned char xfer_large;       /* number of consecutive large xfers */
 	unsigned char xfer_small;       /* number of consecutive small xfers */
 	unsigned long long total;       /* total data read */
-	int rex;                        /* expiration date for a read, in ticks */
-	int wex;                        /* expiration date for a write or connect, in ticks */
-	int rto;                        /* read timeout, in ticks */
-	int wto;                        /* write timeout, in ticks */
 	int analyse_exp;                /* expiration date for current analysers (if set) */
 };
 

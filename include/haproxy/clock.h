@@ -26,16 +26,21 @@
 #include <haproxy/api.h>
 
 extern struct timeval              start_date;    /* the process's start date in wall-clock time */
-extern volatile ullong             global_now;    /* common monotonic date between all threads (32:32) */
+extern struct timeval              ready_date;    /* date when the process was considered ready */
+extern ullong                      start_time_ns; /* the process's start date in internal monotonic time (ns) */
+extern volatile ullong             global_now_ns; /* common monotonic date between all threads, in ns (wraps every 585 yr) */
 
-extern THREAD_LOCAL struct timeval now;           /* internal monotonic date derived from real clock */
+extern THREAD_LOCAL ullong         now_ns;        /* internal monotonic date derived from real clock, in ns (wraps every 585 yr) */
 extern THREAD_LOCAL struct timeval date;          /* the real current date (wall-clock time) */
 
 uint64_t now_cpu_time_thread(int thr);
 uint64_t now_mono_time(void);
+uint64_t now_mono_time_fast(void);
 uint64_t now_cpu_time(void);
+uint64_t now_cpu_time_fast(void);
 void clock_set_local_source(void);
-void clock_update_date(int max_wait, int interrupted);
+void clock_update_local_date(int max_wait, int interrupted);
+void clock_update_global_date();
 void clock_init_process_date(void);
 void clock_init_thread_date(void);
 int clock_setup_signal_timer(void *timer, int sig, int val);
@@ -43,5 +48,12 @@ char *timeofday_as_iso_us(int pad);
 uint clock_report_idle(void);
 void clock_leaving_poll(int timeout, int interrupted);
 void clock_entering_poll(void);
+void clock_adjust_now_offset(void);
+
+static inline void clock_update_date(int max_wait, int interrupted)
+{
+	clock_update_local_date(max_wait, interrupted);
+	clock_update_global_date();
+}
 
 #endif

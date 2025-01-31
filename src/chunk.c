@@ -82,15 +82,21 @@ static int alloc_trash_buffers_per_thread()
 static void free_trash_buffers_per_thread()
 {
 	chunk_destroy(&trash);
-	free(trash_buf2);
-	free(trash_buf1);
-	trash_buf2 = NULL;
-	trash_buf1 = NULL;
+	ha_free(&trash_buf2);
+	ha_free(&trash_buf1);
 }
 
 /* Initialize the trash buffers. It returns 0 if an error occurred. */
 int init_trash_buffers(int first)
 {
+	/* first, make sure we don't keep any trash in object in pools nor cache */
+	if (pool_head_trash) {
+		if (!(pool_debugging & POOL_DBG_NO_CACHE))
+			pool_evict_from_local_cache(pool_head_trash, 1);
+		pool_flush(pool_head_trash);
+	}
+
+	BUG_ON(!first && pool_used(pool_head_trash) > 0); /* we tried to keep a trash buffer after reinit the pool */
 	pool_destroy(pool_head_trash);
 	pool_head_trash = create_pool("trash",
 				      sizeof(struct buffer) + global.tune.bufsize,
@@ -100,24 +106,13 @@ int init_trash_buffers(int first)
 	return 1;
 }
 
-/*
- * Allocate a trash chunk from the reentrant pool. The buffer starts at the
- * end of the chunk. This chunk must be freed using free_trash_chunk(). This
- * call may fail and the caller is responsible for checking that the returned
- * pointer is not NULL.
+/* This is called during STG_POOL to allocate trash buffers early. They will
+ * be reallocated later once their final size is known. It returns 0 if an
+ * error occurred.
  */
-struct buffer *alloc_trash_chunk(void)
+static int alloc_early_trash(void)
 {
-	struct buffer *chunk;
-
-	chunk = pool_alloc(pool_head_trash);
-	if (chunk) {
-		char *buf = (char *)chunk + sizeof(struct buffer);
-		*buf = 0;
-		chunk_init(chunk, buf,
-			   pool_head_trash->size - sizeof(struct buffer));
-	}
-	return chunk;
+	return init_trash_buffers(1);
 }
 
 /*
@@ -152,15 +147,19 @@ int chunk_printf(struct buffer *chk, const char *fmt, ...)
 int chunk_appendf(struct buffer *chk, const char *fmt, ...)
 {
 	va_list argp;
+	size_t room;
 	int ret;
 
 	if (!chk->area || !chk->size)
 		return 0;
 
+	room = chk->size - chk->data;
+	if (!room)
+		return chk->data;
+
 	va_start(argp, fmt);
-	ret = vsnprintf(chk->area + chk->data, chk->size - chk->data, fmt,
-			argp);
-	if (ret >= chk->size - chk->data)
+	ret = vsnprintf(chk->area + chk->data, room, fmt, argp);
+	if (ret >= room)
 		/* do not copy anything in case of truncation */
 		chk->area[chk->data] = 0;
 	else
@@ -307,8 +306,10 @@ int chunk_strcasecmp(const struct buffer *chk, const char *str)
 	return diff;
 }
 
+INITCALL0(STG_POOL, alloc_early_trash);
 REGISTER_PER_THREAD_ALLOC(alloc_trash_buffers_per_thread);
 REGISTER_PER_THREAD_FREE(free_trash_buffers_per_thread);
+REGISTER_POST_DEINIT(free_trash_buffers_per_thread);
 
 /*
  * Local variables:

@@ -11,7 +11,6 @@
  */
 
 #include <errno.h>
-#include <fcntl.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -36,6 +35,7 @@ struct proto_fam proto_fam_inet4 = {
 	.name = "inet4",
 	.sock_domain = PF_INET,
 	.sock_family = AF_INET,
+	.real_family = AF_INET,
 	.sock_addrlen = sizeof(struct sockaddr_in),
 	.l3_addrlen = 32/8,
 	.addrcmp = sock_inet4_addrcmp,
@@ -49,6 +49,7 @@ struct proto_fam proto_fam_inet6 = {
 	.name = "inet6",
 	.sock_domain = PF_INET6,
 	.sock_family = AF_INET6,
+	.real_family = AF_INET6,
 	.sock_addrlen = sizeof(struct sockaddr_in6),
 	.l3_addrlen = 128/8,
 	.addrcmp = sock_inet6_addrcmp,
@@ -77,6 +78,12 @@ int sock_inet6_v6only_default = 0;
 /* Default TCPv4/TCPv6 MSS settings. -1=unknown. */
 int sock_inet_tcp_maxseg_default = -1;
 int sock_inet6_tcp_maxseg_default = -1;
+
+/* Default MPTCPv4/MPTCPv6 MSS settings. -1=unknown. */
+#ifdef HA_HAVE_MPTCP
+int sock_inet_mptcp_maxseg_default = -1;
+int sock_inet6_mptcp_maxseg_default = -1;
+#endif
 
 /* Compares two AF_INET sockaddr addresses. Returns 0 if they match or non-zero
  * if they do not match.
@@ -289,6 +296,30 @@ int sock_inet_bind_receiver(struct receiver *rx, char **errmsg)
 	if (rx->flags & RX_F_BOUND)
 		return ERR_NONE;
 
+	if (rx->flags & RX_F_MUST_DUP) {
+		/* this is a secondary receiver that is an exact copy of a
+		 * reference which must already be bound (or has failed).
+		 * We'll try to dup() the other one's FD and take it. We
+		 * try hard not to reconfigure the socket since it's shared.
+		 */
+		BUG_ON(!rx->shard_info);
+		if (!(rx->shard_info->ref->flags & RX_F_BOUND)) {
+			/* it's assumed that the first one has already reported
+			 * the error, let's not spam with another one, and do
+			 * not set ERR_ALERT.
+			 */
+			err |= ERR_RETRYABLE;
+			goto bind_ret_err;
+		}
+		/* taking the other one's FD will result in it being marked
+		 * extern and being dup()ed. Let's mark the receiver as
+		 * inherited so that it properly bypasses all second-stage
+		 * setup and avoids being passed to new processes.
+		 */
+		rx->flags |= RX_F_INHERITED;
+		rx->fd = rx->shard_info->ref->fd;
+	}
+
 	/* if no FD was assigned yet, we'll have to either find a compatible
 	 * one or create a new one.
 	 */
@@ -313,13 +344,31 @@ int sock_inet_bind_receiver(struct receiver *rx, char **errmsg)
 		}
 	}
 
+	if (ext && fd < global.maxsock && fdtab[fd].owner) {
+		/* This FD was already bound so this means that it was already
+		 * known and registered before parsing, hence it's an inherited
+		 * FD. The only reason why it's already known here is that it
+		 * has been registered multiple times (multiple listeners on the
+		 * same, or a "shards" directive on the line). There cannot be
+		 * multiple listeners on one FD but at least we can create a
+		 * new one from the original one. We won't reconfigure it,
+		 * however, as this was already done for the first one.
+		 */
+		fd = dup(fd);
+		if (fd == -1) {
+			err |= ERR_RETRYABLE | ERR_ALERT;
+			memprintf(errmsg, "cannot dup() receiving socket (%s)", strerror(errno));
+			goto bind_return;
+		}
+	}
+
 	if (fd >= global.maxsock) {
 		err |= ERR_FATAL | ERR_ABORT | ERR_ALERT;
 		memprintf(errmsg, "not enough free sockets (raise '-n' parameter)");
 		goto bind_close_return;
 	}
 
-	if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1) {
+	if (fd_set_nonblock(fd) == -1) {
 		err |= ERR_FATAL | ERR_ALERT;
 		memprintf(errmsg, "cannot make socket non-blocking");
 		goto bind_close_return;
@@ -335,8 +384,16 @@ int sock_inet_bind_receiver(struct receiver *rx, char **errmsg)
 	/* OpenBSD and Linux 3.9 support this. As it's present in old libc versions of
 	 * Linux, it might return an error that we will silently ignore.
 	 */
-	if (!ext && (global.tune.options & GTUNE_USE_REUSEPORT))
+	if (!ext && (rx->proto->flags & PROTO_F_REUSEPORT_SUPPORTED))
 		setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+#endif
+
+#ifdef SO_REUSEPORT_LB
+	/* FreeBSD 12 and above use this to load-balance incoming connections.
+	 * This is limited to 256 listeners per group however.
+	 */
+	if (!ext && (rx->proto->flags & PROTO_F_REUSEPORT_SUPPORTED))
+		setsockopt(fd, SOL_SOCKET, SO_REUSEPORT_LB, &one, sizeof(one));
 #endif
 
 	if (!ext && (rx->settings->options & RX_O_FOREIGN)) {
@@ -391,7 +448,7 @@ int sock_inet_bind_receiver(struct receiver *rx, char **errmsg)
 	rx->fd = fd;
 	rx->flags |= RX_F_BOUND;
 
-	fd_insert(fd, rx->owner, rx->iocb, thread_mask(rx->bind_thread) & all_threads_mask);
+	fd_insert(fd, rx->owner, rx->iocb, rx->bind_tgroup, rx->bind_thread);
 
 	/* for now, all regularly bound TCP listeners are exportable */
 	if (!(rx->flags & RX_F_INHERITED))
@@ -404,6 +461,7 @@ int sock_inet_bind_receiver(struct receiver *rx, char **errmsg)
 		addr_to_str(&addr_inet, pn, sizeof(pn));
 		memprintf(errmsg, "%s for [%s:%d]", *errmsg, pn, get_host_port(&addr_inet));
 	}
+ bind_ret_err:
 	return err;
 
  bind_close_return:
@@ -444,6 +502,30 @@ static void sock_inet_prepare()
 #endif
 		close(fd);
 	}
+
+#ifdef HA_HAVE_MPTCP
+	fd = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
+	if (fd >= 0) {
+#ifdef TCP_MAXSEG
+		/* retrieve the OS' default mss for MPTCPv4 */
+		len = sizeof(val);
+		if (getsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &val, &len) == 0)
+			sock_inet_mptcp_maxseg_default = val;
+#endif
+		close(fd);
+	}
+
+	fd = socket(AF_INET6, SOCK_STREAM, IPPROTO_MPTCP);
+	if (fd >= 0) {
+#ifdef TCP_MAXSEG
+		/* retrieve the OS' default mss for MPTCPv6 */
+		len = sizeof(val);
+		if (getsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &val, &len) == 0)
+			sock_inet6_mptcp_maxseg_default = val;
+#endif
+		close(fd);
+	}
+#endif
 }
 
 INITCALL0(STG_PREPARE, sock_inet_prepare);

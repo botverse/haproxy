@@ -18,22 +18,23 @@ jobs:
         - TARGET: linux-glibc
           CC: gcc
           os: ubuntu-latest
-    env:
-      H2SPEC_VERSION: '2.6.0'
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v4
     - name: Install h2spec
+      id: install-h2spec
       run: |
-        curl -fsSL https://github.com/summerwind/h2spec/releases/download/v${H2SPEC_VERSION}/h2spec_linux_amd64.tar.gz -o h2spec.tar.gz
+        H2SPEC_VERSION=`curl --silent "https://api.github.com/repos/summerwind/h2spec/releases/latest" | jq -r -j '.tag_name'`
+        curl -fsSL https://github.com/summerwind/h2spec/releases/download/${H2SPEC_VERSION}/h2spec_linux_amd64.tar.gz -o h2spec.tar.gz
         tar xvf h2spec.tar.gz
         sudo install -m755 h2spec /usr/local/bin/h2spec
+        echo "version=${H2SPEC_VERSION}" >> $GITHUB_OUTPUT
     - name: Compile HAProxy with ${{ matrix.CC }}
       run: |
         make -j$(nproc) all \
           ERR=1 \
           TARGET=${{ matrix.TARGET }} \
           CC=${{ matrix.CC }} \
-          DEBUG=-DDEBUG_STRICT=1 \
+          DEBUG="-DDEBUG_POOL_INTEGRITY" \
           USE_OPENSSL=1
         sudo make install
     - name: Show HAProxy version
@@ -49,8 +50,8 @@ jobs:
         fi
         echo "::endgroup::"
         haproxy -vv
-        echo "::set-output name=version::$(haproxy -v |awk 'NR==1{print $3}')"
+        echo "version=$(haproxy -v |awk 'NR==1{print $3}')" >> $GITHUB_OUTPUT
     - name: Launch HAProxy ${{ steps.show-version.outputs.version }}
       run: haproxy -f .github/h2spec.config -D
-    - name: Run h2spec
+    - name: Run h2spec ${{ steps.install-h2spec.outputs.version }}
       run: h2spec -Svtk -h 127.0.0.1 -p 8443

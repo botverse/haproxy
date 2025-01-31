@@ -35,7 +35,7 @@ jobs:
           - USE_THREAD=1
           - USE_ZLIB=1
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
     - uses: msys2/setup-msys2@v2
       with:
         install: >-
@@ -51,14 +51,17 @@ jobs:
           zlib-devel
     - name: Compile HAProxy with ${{ matrix.CC }}
       run: |
+        echo "::group::Show platform specific defines"
+        echo | ${{ matrix.CC }} -dM -xc -E -
+        echo "::endgroup::"
         make -j$(nproc) all \
           ERR=1 \
           TARGET=${{ matrix.TARGET }} \
           CC=${{ matrix.CC }} \
-          DEBUG=-DDEBUG_STRICT=1 \
+          DEBUG="-DDEBUG_POOL_INTEGRITY" \
           ${{ join(matrix.FLAGS, ' ') }}
     - name: Show HAProxy version
       id: show-version
       run: |
         ./haproxy -vv
-        echo "::set-output name=version::$(./haproxy -v |awk 'NR==1{print $3}')"
+        echo "version=$(./haproxy -v |awk 'NR==1{print $3}')" >> $GITHUB_OUTPUT

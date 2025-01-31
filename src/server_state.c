@@ -53,7 +53,7 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 	int srv_check_state, srv_agent_state;
 	int bk_f_forced_id;
 	int srv_f_forced_id;
-	int fqdn_set_by_cli;
+	int fqdn_changed;
 	const char *fqdn;
 	const char *port_st;
 	unsigned int port_svc;
@@ -112,12 +112,12 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 	p = NULL;
 	errno = 0;
 	srv_admin_state = strtol(params[2], &p, 10);
-	fqdn_set_by_cli = !!(srv_admin_state & SRV_ADMF_HMAINT);
+	fqdn_changed = !!(srv_admin_state & SRV_ADMF_FQDN_CHANGED);
 
 	/* inherited statuses will be recomputed later.
-	 * Also disable SRV_ADMF_HMAINT flag (set from stats socket fqdn).
+	 * Also disable SRV_ADMF_FQDN_CHANGED flag (set from stats socket fqdn).
 	 */
-	srv_admin_state &= ~SRV_ADMF_IDRAIN & ~SRV_ADMF_IMAINT & ~SRV_ADMF_HMAINT & ~SRV_ADMF_RMAINT;
+	srv_admin_state &= ~SRV_ADMF_IDRAIN & ~SRV_ADMF_IMAINT & ~SRV_ADMF_RMAINT & ~SRV_ADMF_FQDN_CHANGED;
 
 	if ((p == params[2]) || errno == EINVAL || errno == ERANGE ||
 	    (srv_admin_state != 0 &&
@@ -244,7 +244,7 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 	switch (srv_op_state) {
 		case SRV_ST_STOPPED:
 			srv->check.health = 0;
-			srv_set_stopped(srv, "changed from server-state after a reload", NULL);
+			srv_set_stopped(srv, SRV_OP_STCHGC_STATEFILE);
 			break;
 		case SRV_ST_STARTING:
 			/* If rise == 1 there is no STARTING state, let's switch to
@@ -252,7 +252,7 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 			 */
 			if (srv->check.rise == 1) {
 				srv->check.health = srv->check.rise + srv->check.fall - 1;
-				srv_set_running(srv, "", NULL);
+				srv_set_running(srv, SRV_OP_STCHGC_NONE);
 				break;
 			}
 			if (srv->check.health < 1 || srv->check.health >= srv->check.rise)
@@ -265,17 +265,17 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 			 */
 			if (srv->check.fall == 1) {
 				srv->check.health = 0;
-				srv_set_stopped(srv, "changed from server-state after a reload", NULL);
+				srv_set_stopped(srv, SRV_OP_STCHGC_STATEFILE);
 				break;
 			}
 			if (srv->check.health < srv->check.rise ||
 			    srv->check.health > srv->check.rise + srv->check.fall - 2)
 				srv->check.health = srv->check.rise;
-			srv_set_stopping(srv, "changed from server-state after a reload", NULL);
+			srv_set_stopping(srv, SRV_OP_STCHGC_STATEFILE);
 			break;
 		case SRV_ST_RUNNING:
 			srv->check.health = srv->check.rise + srv->check.fall - 1;
-			srv_set_running(srv, "", NULL);
+			srv_set_running(srv, SRV_OP_STCHGC_NONE);
 			break;
 	}
 
@@ -321,7 +321,7 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 			srv_adm_set_drain(srv);
 	}
 
-	srv->last_change = date.tv_sec - srv_last_time_change;
+	srv->counters.last_change = ns_to_sec(now_ns) - srv_last_time_change;
 	srv->check.status = srv_check_status;
 	srv->check.result = srv_check_result;
 
@@ -372,7 +372,7 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 			 * So we must reset the 'set from stats socket FQDN' flag to be consistent with
 			 * any further FQDN modification.
 			 */
-			srv->next_admin &= ~SRV_ADMF_HMAINT;
+			srv->next_admin &= ~SRV_ADMF_FQDN_CHANGED;
 		}
 		else {
 			/* If the FDQN has been changed from stats socket,
@@ -380,10 +380,10 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 			 * from stats socket).
 			 * Also ensure the runtime resolver will process this resolution.
 			 */
-			if (fqdn_set_by_cli) {
+			if (fqdn_changed) {
 				srv_set_fqdn(srv, fqdn, 0);
 				srv->flags &= ~SRV_F_NO_RESOLUTION;
-				srv->next_admin |= SRV_ADMF_HMAINT;
+				srv->next_admin |= SRV_ADMF_FQDN_CHANGED;
 			}
 		}
 	}
@@ -422,11 +422,13 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 		 * lookup is case sensitive but we don't care
 		 */
 		for (i = 0; tmp[i]; i++)
-			tmp[i] = tolower(tmp[i]);
+			tmp[i] = tolower((unsigned char)tmp[i]);
 
 		/* insert in tree and set the srvrq expiration date */
 		ebis_insert(&srv->srvrq->named_servers, &srv->host_dn);
-		task_schedule(srv->srvrq_check, tick_add(now_ms, srv->srvrq->resolvers->hold.timeout));
+		task_schedule(srv->srvrq_check, tick_add(now_ms, srv->srvrq->resolvers->timeout.resolve +
+							 srv->srvrq->resolvers->resolve_retries *
+							 srv->srvrq->resolvers->timeout.retry));
 
 		/* Unset SRV_F_MAPPORTS for SRV records.
 		 * SRV_F_MAPPORTS is unfortunately set by parse_server()
@@ -522,6 +524,7 @@ static void srv_state_px_update(const struct proxy *px, int vsn, struct eb_root 
 
 /*
  * read next line from file <f> and return the server state version if one found.
+ * If file is empty, then -1 is returned
  * If no version is found, then 0 is returned
  * Note that this should be the first read on <f>
  */
@@ -532,7 +535,7 @@ static int srv_state_get_version(FILE *f) {
 
 	/* first character of first line of the file must contain the version of the export */
 	if (fgets(mybuf, SRV_STATE_LINE_MAXLEN, f) == NULL)
-		return 0;
+		return -1;
 
 	vsn = strtol(mybuf, &endptr, 10);
 	if (endptr == mybuf || *endptr != '\n') {
@@ -571,7 +574,7 @@ static int srv_state_parse_line(char *buf, const int version, char **params)
 	}
 
 	/* skip blank characters at the beginning of the line */
-	while (isblank((unsigned char)*cur))
+	while (*cur == ' ' || *cur == '\t')
 		++cur;
 
 	/* ignore empty or commented lines */
@@ -592,7 +595,7 @@ static int srv_state_parse_line(char *buf, const int version, char **params)
 			break;
 
 		/* then skip leading spaces */
-		while (*cur && isblank((unsigned char)*cur)) {
+		while (*cur && (*cur == ' ' || *cur == '\t')) {
 			++cur;
 			if (!*cur)
 				break;
@@ -632,7 +635,7 @@ static int srv_state_parse_line(char *buf, const int version, char **params)
 		params[arg++] = cur;
 
 		/* look for the end of the current field */
-		while (*cur && !isblank((unsigned char)*cur)) {
+		while (*cur && *cur != ' ' && *cur != '\t') {
 			++cur;
 			if (!*cur)
 				break;
@@ -798,14 +801,21 @@ void apply_server_state(void)
 	errno = 0;
 	f = fopen(file, "r");
 	if (!f) {
-		ha_warning("config: Can't open global server state file '%s': %s\n", file, strerror(errno));
+		if (errno == ENOENT)
+			ha_notice("config: Can't open global server state file '%s': %s\n", file, strerror(errno));
+		else
+			ha_warning("config: Can't open global server state file '%s': %s\n", file, strerror(errno));
 		goto no_globalfile;
 	}
 
 	global_vsn = srv_state_get_version(f);
-	if (global_vsn == 0) {
-		ha_warning("config: Can't get version of the global server state file '%s'.\n",
-			   file);
+	if (global_vsn < 1) {
+		if (global_vsn == -1)
+			ha_notice("config: Empty global server state file '%s'.\n",
+				   file);
+		if (global_vsn == 0)
+			ha_warning("config: Can't get version of the global server state file '%s'.\n",
+				   file);
 		goto close_globalfile;
 	}
 
@@ -866,16 +876,24 @@ void apply_server_state(void)
 		errno = 0;
 		f = fopen(file, "r");
 		if (!f) {
-			ha_warning("Proxy '%s': Can't open server state file '%s': %s.\n",
-				   curproxy->id, file, strerror(errno));
+			if (errno == ENOENT)
+				ha_notice("Proxy '%s': Can't open server state file '%s': %s.\n",
+					   curproxy->id, file, strerror(errno));
+			else
+				ha_warning("Proxy '%s': Can't open server state file '%s': %s.\n",
+					   curproxy->id, file, strerror(errno));
 			continue; /* next proxy */
 		}
 
 		/* first character of first line of the file must contain the version of the export */
 		local_vsn = srv_state_get_version(f);
-		if (local_vsn == 0) {
-			ha_warning("Proxy '%s': Can't get version of the server state file '%s'.\n",
-				   curproxy->id, file);
+		if (local_vsn < 1) {
+			if (local_vsn == -1)
+				ha_notice("Proxy '%s': Empty server state file '%s'.\n",
+					   curproxy->id, file);
+			if (local_vsn == 0)
+				ha_warning("Proxy '%s': Can't get version of the server state file '%s'.\n",
+					   curproxy->id, file);
 			goto close_localfile;
 		}
 

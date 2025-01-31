@@ -14,7 +14,6 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,11 +24,13 @@
 #include <haproxy/arg.h>
 #include <haproxy/base64.h>
 #include <haproxy/buf-t.h>
+#include <haproxy/connection.h>
 #include <haproxy/obj_type.h>
 #include <haproxy/openssl-compat.h>
 #include <haproxy/sample.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/ssl_utils.h>
+#include <haproxy/stconn.h>
 #include <haproxy/tools.h>
 #include <haproxy/vars.h>
 
@@ -117,57 +118,38 @@ static int sample_conv_sha2(const struct arg *arg_p, struct sample *smp, void *p
 {
 	struct buffer *trash = get_trash_chunk();
 	int bits = 256;
+	EVP_MD_CTX *mdctx;
+	const EVP_MD *evp = NULL;
+	unsigned int digest_length = 0;
 	if (arg_p->data.sint)
 		bits = arg_p->data.sint;
 
 	switch (bits) {
-	case 224: {
-		SHA256_CTX ctx;
-
-		memset(&ctx, 0, sizeof(ctx));
-
-		SHA224_Init(&ctx);
-		SHA224_Update(&ctx, smp->data.u.str.area, smp->data.u.str.data);
-		SHA224_Final((unsigned char *) trash->area, &ctx);
-		trash->data = SHA224_DIGEST_LENGTH;
+	case 224:
+		evp = EVP_sha224();
 		break;
-	}
-	case 256: {
-		SHA256_CTX ctx;
-
-		memset(&ctx, 0, sizeof(ctx));
-
-		SHA256_Init(&ctx);
-		SHA256_Update(&ctx, smp->data.u.str.area, smp->data.u.str.data);
-		SHA256_Final((unsigned char *) trash->area, &ctx);
-		trash->data = SHA256_DIGEST_LENGTH;
+	case 256:
+		evp = EVP_sha256();
 		break;
-	}
-	case 384: {
-		SHA512_CTX ctx;
-
-		memset(&ctx, 0, sizeof(ctx));
-
-		SHA384_Init(&ctx);
-		SHA384_Update(&ctx, smp->data.u.str.area, smp->data.u.str.data);
-		SHA384_Final((unsigned char *) trash->area, &ctx);
-		trash->data = SHA384_DIGEST_LENGTH;
+	case 384:
+		evp = EVP_sha384();
 		break;
-	}
-	case 512: {
-		SHA512_CTX ctx;
-
-		memset(&ctx, 0, sizeof(ctx));
-
-		SHA512_Init(&ctx);
-		SHA512_Update(&ctx, smp->data.u.str.area, smp->data.u.str.data);
-		SHA512_Final((unsigned char *) trash->area, &ctx);
-		trash->data = SHA512_DIGEST_LENGTH;
+	case 512:
+		evp = EVP_sha512();
 		break;
-	}
 	default:
 		return 0;
 	}
+
+	mdctx = EVP_MD_CTX_new();
+	if (!mdctx)
+		return 0;
+	EVP_DigestInit_ex(mdctx, evp, NULL);
+	EVP_DigestUpdate(mdctx, smp->data.u.str.area, smp->data.u.str.data);
+	EVP_DigestFinal_ex(mdctx, (unsigned char*)trash->area, &digest_length);
+	trash->data = digest_length;
+
+	EVP_MD_CTX_free(mdctx);
 
 	smp->data.u.str = *trash;
 	smp->data.type = SMP_T_BIN;
@@ -237,6 +219,10 @@ static inline int sample_check_arg_base64(struct arg *arg, char **err)
 static int check_aes_gcm(struct arg *args, struct sample_conv *conv,
 						  const char *file, int line, char **err)
 {
+	if (conv->kw[8] == 'd')
+		/* flag it as "aes_gcm_dec" */
+		args[0].type_flags = 1;
+
 	switch(args[0].data.sint) {
 	case 128:
 	case 192:
@@ -256,7 +242,8 @@ static int check_aes_gcm(struct arg *args, struct sample_conv *conv,
 		memprintf(err, "failed to parse key : %s", *err);
 		return 0;
 	}
-	if (!sample_check_arg_base64(&args[3], err)) {
+	if ((args[0].type_flags && !sample_check_arg_base64(&args[3], err)) ||
+	    (!args[0].type_flags && !vars_check_arg(&args[3], err))) {
 		memprintf(err, "failed to parse aead_tag : %s", *err);
 		return 0;
 	}
@@ -264,13 +251,37 @@ static int check_aes_gcm(struct arg *args, struct sample_conv *conv,
 	return 1;
 }
 
+#define sample_conv_aes_gcm_init(a, b, c, d, e, f)	\
+	({						\
+		int _ret = (a) ?			\
+		    EVP_DecryptInit_ex(b, c, d, e, f) :	\
+		    EVP_EncryptInit_ex(b, c, d, e, f);	\
+		_ret;					\
+	})
+
+#define sample_conv_aes_gcm_update(a, b, c, d, e, f)	\
+	({						\
+		int _ret = (a) ?			\
+		    EVP_DecryptUpdate(b, c, d, e, f) :	\
+		    EVP_EncryptUpdate(b, c, d, e, f);	\
+		_ret;					\
+	})
+
+#define sample_conv_aes_gcm_final(a, b, c, d)		\
+	({						\
+		int _ret = (a) ?			\
+		    EVP_DecryptFinal_ex(b, c, d) :	\
+		    EVP_EncryptFinal_ex(b, c, d);	\
+		_ret;					\
+	})
+
 /* Arguments: AES size in bits, nonce, key, tag. The last three arguments are base64 encoded */
-static int sample_conv_aes_gcm_dec(const struct arg *arg_p, struct sample *smp, void *private)
+static int sample_conv_aes_gcm(const struct arg *arg_p, struct sample *smp, void *private)
 {
 	struct sample nonce, key, aead_tag;
 	struct buffer *smp_trash = NULL, *smp_trash_alloc = NULL;
-	EVP_CIPHER_CTX *ctx;
-	int dec_size, ret;
+	EVP_CIPHER_CTX *ctx = NULL;
+	int size, ret, dec;
 
 	smp_trash_alloc = alloc_trash_chunk();
 	if (!smp_trash_alloc)
@@ -296,30 +307,33 @@ static int sample_conv_aes_gcm_dec(const struct arg *arg_p, struct sample *smp, 
 		goto err;
 
 	if (arg_p[1].type == ARGT_VAR) {
-		dec_size = base64dec(nonce.data.u.str.area, nonce.data.u.str.data, smp_trash->area, smp_trash->size);
-		if (dec_size < 0)
+		size = base64dec(nonce.data.u.str.area, nonce.data.u.str.data, smp_trash->area, smp_trash->size);
+		if (size < 0)
 			goto err;
-		smp_trash->data = dec_size;
+		smp_trash->data = size;
 		nonce.data.u.str = *smp_trash;
 	}
+
+	/* encrypt (0) or decrypt (1) */
+	dec = (arg_p[0].type_flags == 1);
 
 	/* Set cipher type and mode */
 	switch(arg_p[0].data.sint) {
 	case 128:
-		EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, NULL, NULL);
+		sample_conv_aes_gcm_init(dec, ctx, EVP_aes_128_gcm(), NULL, NULL, NULL);
 		break;
 	case 192:
-		EVP_DecryptInit_ex(ctx, EVP_aes_192_gcm(), NULL, NULL, NULL);
+		sample_conv_aes_gcm_init(dec, ctx, EVP_aes_192_gcm(), NULL, NULL, NULL);
 		break;
 	case 256:
-		EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL);
+		sample_conv_aes_gcm_init(dec, ctx, EVP_aes_256_gcm(), NULL, NULL, NULL);
 		break;
 	}
 
 	EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, nonce.data.u.str.data, NULL);
 
 	/* Initialise IV */
-	if(!EVP_DecryptInit_ex(ctx, NULL, NULL, NULL, (unsigned char *) nonce.data.u.str.area))
+	if(!sample_conv_aes_gcm_init(dec, ctx, NULL, NULL, NULL, (unsigned char *) nonce.data.u.str.area))
 		goto err;
 
 	smp_set_owner(&key, smp->px, smp->sess, smp->strm, smp->opt);
@@ -327,52 +341,78 @@ static int sample_conv_aes_gcm_dec(const struct arg *arg_p, struct sample *smp, 
 		goto err;
 
 	if (arg_p[2].type == ARGT_VAR) {
-		dec_size = base64dec(key.data.u.str.area, key.data.u.str.data, smp_trash->area, smp_trash->size);
-		if (dec_size < 0)
+		size = base64dec(key.data.u.str.area, key.data.u.str.data, smp_trash->area, smp_trash->size);
+		if (size < 0)
 			goto err;
-		smp_trash->data = dec_size;
+		smp_trash->data = size;
 		key.data.u.str = *smp_trash;
 	}
 
 	/* Initialise key */
-	if (!EVP_DecryptInit_ex(ctx, NULL, NULL, (unsigned char *) key.data.u.str.area, NULL))
+	if (!sample_conv_aes_gcm_init(dec, ctx, NULL, NULL, (unsigned char *) key.data.u.str.area, NULL))
 		goto err;
 
-	if (!EVP_DecryptUpdate(ctx, (unsigned char *) smp_trash->area, (int *) &smp_trash->data,
-	                       (unsigned char *) smp_trash_alloc->area, (int) smp_trash_alloc->data))
+	if (!sample_conv_aes_gcm_update(dec, ctx, (unsigned char *) smp_trash->area, (int *) &smp_trash->data,
+	                                (unsigned char *) smp_trash_alloc->area, (int) smp_trash_alloc->data))
 		goto err;
 
 	smp_set_owner(&aead_tag, smp->px, smp->sess, smp->strm, smp->opt);
-	if (!sample_conv_var2smp_str(&arg_p[3], &aead_tag))
-		goto err;
-
-	if (arg_p[3].type == ARGT_VAR) {
-		dec_size = base64dec(aead_tag.data.u.str.area, aead_tag.data.u.str.data, smp_trash_alloc->area, smp_trash_alloc->size);
-		if (dec_size < 0)
+	if (dec) {
+		if (!sample_conv_var2smp_str(&arg_p[3], &aead_tag))
 			goto err;
-		smp_trash_alloc->data = dec_size;
-		aead_tag.data.u.str = *smp_trash_alloc;
+
+		if (arg_p[3].type == ARGT_VAR) {
+			size = base64dec(aead_tag.data.u.str.area, aead_tag.data.u.str.data, smp_trash_alloc->area,
+			                 smp_trash_alloc->size);
+			if (size < 0)
+				goto err;
+			smp_trash_alloc->data = size;
+			aead_tag.data.u.str = *smp_trash_alloc;
+		}
+
+		EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, aead_tag.data.u.str.data,
+		                    (void *) aead_tag.data.u.str.area);
 	}
 
-	dec_size = smp_trash->data;
+	size = smp_trash->data;
 
-	EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, aead_tag.data.u.str.data, (void *) aead_tag.data.u.str.area);
-	ret = EVP_DecryptFinal_ex(ctx, (unsigned char *) smp_trash->area + smp_trash->data, (int *) &smp_trash->data);
-
+	ret = sample_conv_aes_gcm_final(dec, ctx, (unsigned char *) smp_trash->area + smp_trash->data,
+	                                (int *) &smp_trash->data);
 	if (ret <= 0)
 		goto err;
 
-	smp->data.u.str.data = dec_size + smp_trash->data;
+	if (!dec) {
+		struct buffer *trash = get_trash_chunk();
+
+		EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, (void *) trash->area);
+
+		aead_tag.data.u.str = *smp_trash_alloc;
+		ret = a2base64(trash->area, 16, aead_tag.data.u.str.area, aead_tag.data.u.str.size);
+		if (ret < 0)
+			goto err;
+
+		aead_tag.data.u.str.data = ret;
+		aead_tag.data.type = SMP_T_STR;
+
+		if (!var_set(&arg_p[3].data.var, &aead_tag,
+		             (arg_p[3].data.var.scope == SCOPE_PROC) ? VF_COND_IFEXISTS : 0)) {
+			goto err;
+		}
+	}
+
+	smp->data.u.str.data = size + smp_trash->data;
 	smp->data.u.str.area = smp_trash->area;
 	smp->data.type = SMP_T_BIN;
 	smp_dup(smp);
 	free_trash_chunk(smp_trash_alloc);
 	free_trash_chunk(smp_trash);
+	EVP_CIPHER_CTX_free(ctx);
 	return 1;
 
 err:
 	free_trash_chunk(smp_trash_alloc);
 	free_trash_chunk(smp_trash);
+	EVP_CIPHER_CTX_free(ctx);
 	return 0;
 }
 #endif
@@ -414,6 +454,35 @@ static int sample_conv_crypto_digest(const struct arg *args, struct sample *smp,
 	smp->data.type = SMP_T_BIN;
 	smp->flags &= ~SMP_F_CONST;
 	return 1;
+}
+
+/* Take a numerical X509_V_ERR and return its constant name */
+static int sample_conv_x509_v_err(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	const char *res = x509_v_err_int_to_str(smp->data.u.sint);
+
+	/* if the value was found return its string */
+	if (res) {
+		smp->data.u.str.area = (char *)res;
+		smp->data.u.str.data = strlen(res);
+		smp->data.type = SMP_T_STR;
+		smp->flags |= SMP_F_CONST;
+
+		return 1;
+	} else {
+		struct buffer *smp_trash = get_trash_chunk();
+
+		/* if the conversion failed, output the numbers as string */
+		chunk_printf(smp_trash, "%llu", smp->data.u.sint);
+
+		smp->data.u.str = *smp_trash;
+		smp->data.type = SMP_T_STR;
+		smp->flags &= ~SMP_F_CONST;
+
+		return 1;
+	}
+
+	return 0;
 }
 
 static int check_crypto_hmac(struct arg *args, struct sample_conv *conv,
@@ -509,14 +578,11 @@ smp_fetch_ssl_fc_has_early(const struct arg *args, struct sample *smp, const cha
 static int
 smp_fetch_ssl_fc_has_crt(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	struct connection *conn;
-	struct ssl_sock_ctx *ctx;
+	struct connection *conn = objt_conn(smp->sess->origin);
+	struct ssl_sock_ctx *ctx = conn_get_ssl_sock_ctx(conn);
 
-	conn = objt_conn(smp->sess->origin);
-	if (!conn || conn->xprt != &ssl_sock)
+	if (!ctx)
 		return 0;
-
-	ctx = conn->xprt_ctx;
 
 	if (conn->flags & CO_FL_WAIT_XPRT) {
 		smp->flags |= SMP_F_MAY_CHANGE;
@@ -529,6 +595,64 @@ smp_fetch_ssl_fc_has_crt(const struct arg *args, struct sample *smp, const char 
 
 	return 1;
 }
+
+/* string, returns a string of a formatted full dn \C=..\O=..\OU=.. \CN=.. of the
+ * client certificate's root CA.
+ */
+#ifdef HAVE_SSL_get0_verified_chain
+static int
+smp_fetch_ssl_r_dn(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	X509 *crt = NULL;
+	X509_NAME *name;
+	int ret = 0;
+	struct buffer *smp_trash;
+	struct connection *conn;
+	SSL *ssl;
+
+	conn = objt_conn(smp->sess->origin);
+	ssl = ssl_sock_get_ssl_object(conn);
+	if (!ssl)
+		return 0;
+
+	if (conn->flags & CO_FL_WAIT_XPRT && !conn->err_code) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	crt = ssl_sock_get_verified_chain_root(ssl);
+	if (!crt)
+		goto out;
+
+	name = X509_get_subject_name(crt);
+	if (!name)
+		goto out;
+
+	smp_trash = get_trash_chunk();
+	if (args[0].type == ARGT_STR && args[0].data.str.data > 0) {
+		int pos = 1;
+
+		if (args[1].type == ARGT_SINT)
+			pos = args[1].data.sint;
+
+		if (ssl_sock_get_dn_entry(name, &args[0].data.str, pos, smp_trash) <= 0)
+			goto out;
+	}
+	else if (args[2].type == ARGT_STR && args[2].data.str.data > 0) {
+		if (ssl_sock_get_dn_formatted(name, &args[2].data.str, smp_trash) <= 0)
+			goto out;
+	}
+	else if (ssl_sock_get_dn_oneline(name, smp_trash) <= 0)
+		goto out;
+
+	smp->flags = SMP_F_VOL_SESS;
+	smp->data.type = SMP_T_STR;
+	smp->data.u.str = *smp_trash;
+	ret = 1;
+out:
+	return ret;
+}
+#endif
 
 /* binary, returns a certificate in a binary chunk (der/raw).
  * The 5th keyword char is used to know if SSL_get_certificate or SSL_get_peer_certificate
@@ -547,7 +671,7 @@ smp_fetch_ssl_x_der(const struct arg *args, struct sample *smp, const char *kw, 
 	SSL *ssl;
 
 	if (conn_server)
-		conn = smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+		conn = smp->strm ? sc_conn(smp->strm->scb) : NULL;
 	else
 		conn = objt_conn(smp->sess->origin);
 
@@ -602,7 +726,7 @@ smp_fetch_ssl_x_chain_der(const struct arg *args, struct sample *smp, const char
 	int i;
 
 	if (conn_server)
-		conn = smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+		conn = smp->strm ? sc_conn(smp->strm->scb) : NULL;
 	else
 		conn = objt_conn(smp->sess->origin);
 
@@ -665,7 +789,7 @@ smp_fetch_ssl_x_serial(const struct arg *args, struct sample *smp, const char *k
 	SSL *ssl;
 
 	if (conn_server)
-		conn = smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+		conn = smp->strm ? sc_conn(smp->strm->scb) : NULL;
 	else
 		conn = objt_conn(smp->sess->origin);
 	ssl = ssl_sock_get_ssl_object(conn);
@@ -718,7 +842,7 @@ smp_fetch_ssl_x_sha1(const struct arg *args, struct sample *smp, const char *kw,
 	SSL *ssl;
 
 	if (conn_server)
-		conn = smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+		conn = smp->strm ? sc_conn(smp->strm->scb) : NULL;
 	else
 		conn = objt_conn(smp->sess->origin);
 
@@ -769,7 +893,7 @@ smp_fetch_ssl_x_notafter(const struct arg *args, struct sample *smp, const char 
 	SSL *ssl;
 
 	if (conn_server)
-		conn = smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+		conn = smp->strm ? sc_conn(smp->strm->scb) : NULL;
 	else
 		conn = objt_conn(smp->sess->origin);
 
@@ -821,7 +945,7 @@ smp_fetch_ssl_x_i_dn(const struct arg *args, struct sample *smp, const char *kw,
 	SSL *ssl;
 
 	if (conn_server)
-		conn = smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+		conn = smp->strm ? sc_conn(smp->strm->scb) : NULL;
 	else
 		conn = objt_conn(smp->sess->origin);
 
@@ -873,6 +997,82 @@ out:
 	return ret;
 }
 
+/*
+ *  returns a string of comma separated SAN in a client certificate, Use "GENERAL_NAME_print"
+ *  Example:  "IP Address:127.0.0.1, IP Address:127.0.0.2, IP Address:127.0.0.3, URI:http://docs.haproxy.org/2.7/, DNS:ca.tests.haproxy.com"
+ */
+static int
+smp_fetch_ssl_x_san(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	int cert_peer = (kw[4] == 'c' || kw[4] == 's') ? 1 : 0;
+	int conn_server = (kw[4] == 's') ? 1 : 0;
+	STACK_OF(GENERAL_NAME) *names;
+	X509 *crt = NULL;
+	int ret = 0;
+	struct buffer *smp_trash;
+	struct connection *conn;
+	SSL *ssl;
+	int i, read;
+	BIO *bio = NULL;
+
+	if (conn_server)
+		conn = smp->strm ? sc_conn(smp->strm->scb) : NULL;
+	else
+		conn = objt_conn(smp->sess->origin);
+
+	ssl = ssl_sock_get_ssl_object(conn);
+	if (!ssl)
+		return 0;
+
+	if (conn->flags & CO_FL_WAIT_XPRT && !conn->err_code) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	if (cert_peer)
+		crt = ssl_sock_get_peer_certificate(ssl);
+	else
+		crt = SSL_get_certificate(ssl);
+	if (!crt)
+		goto out;
+
+	names = X509_get_ext_d2i(crt, NID_subject_alt_name, NULL, NULL);
+	if (!names)
+		goto out;
+
+	smp_trash = get_trash_chunk();
+
+        bio = BIO_new(BIO_s_mem());
+	if (!bio)
+		goto out;
+
+	for (i = 0; i < sk_GENERAL_NAME_num(names); i++) {
+		GENERAL_NAME *name = sk_GENERAL_NAME_value(names, i);
+		if (i != 0)
+			BIO_puts(bio, ", ");
+		GENERAL_NAME_print(bio, name);
+	}
+
+	sk_GENERAL_NAME_pop_free(names, GENERAL_NAME_free);
+
+	read = BIO_read(bio, smp_trash->area, smp_trash->size-1);
+	if (read <= 0) /* nothing to read, prevent negative array index */
+		goto out;
+	smp_trash->area[read] = '\0';
+	smp_trash->data = read;
+
+	smp->flags = SMP_F_VOL_SESS;
+	smp->data.type = SMP_T_STR;
+	smp->data.u.str = *smp_trash;
+	ret = 1;
+out:
+	/* SSL_get_peer_certificate, it increase X509 * ref count */
+	if (cert_peer && crt)
+		X509_free(crt);
+	BIO_free(bio);
+	return ret;
+}
+
 /* string, returns notbefore date in ASN1_UTCTIME format.
  * The 5th keyword char is used to know if SSL_get_certificate or SSL_get_peer_certificate
  * should be use.
@@ -889,7 +1089,7 @@ smp_fetch_ssl_x_notbefore(const struct arg *args, struct sample *smp, const char
 	SSL *ssl;
 
 	if (conn_server)
-		conn = smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+		conn = smp->strm ? sc_conn(smp->strm->scb) : NULL;
 	else
 		conn = objt_conn(smp->sess->origin);
 
@@ -941,7 +1141,7 @@ smp_fetch_ssl_x_s_dn(const struct arg *args, struct sample *smp, const char *kw,
 	SSL *ssl;
 
 	if (conn_server)
-		conn = smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+		conn = smp->strm ? sc_conn(smp->strm->scb) : NULL;
 	else
 		conn = objt_conn(smp->sess->origin);
 
@@ -1038,7 +1238,7 @@ smp_fetch_ssl_x_version(const struct arg *args, struct sample *smp, const char *
 	SSL *ssl;
 
 	if (conn_server)
-		conn = smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+		conn = smp->strm ? sc_conn(smp->strm->scb) : NULL;
 	else
 		conn = objt_conn(smp->sess->origin);
 	ssl = ssl_sock_get_ssl_object(conn);
@@ -1083,7 +1283,7 @@ smp_fetch_ssl_x_sig_alg(const struct arg *args, struct sample *smp, const char *
 	SSL *ssl;
 
 	if (conn_server)
-		conn = smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+		conn = smp->strm ? sc_conn(smp->strm->scb) : NULL;
 	else
 		conn = objt_conn(smp->sess->origin);
 
@@ -1140,7 +1340,7 @@ smp_fetch_ssl_x_key_alg(const struct arg *args, struct sample *smp, const char *
 	SSL *ssl;
 
 	if (conn_server)
-		conn = smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+		conn = smp->strm ? sc_conn(smp->strm->scb) : NULL;
 	else
 		conn = objt_conn(smp->sess->origin);
 	ssl = ssl_sock_get_ssl_object(conn);
@@ -1189,13 +1389,13 @@ smp_fetch_ssl_fc(const struct arg *args, struct sample *smp, const char *kw, voi
 	struct connection *conn;
 
 	if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-		conn = (kw[4] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
+		conn = (kw[4] == 'b') ? sc_conn(__objt_check(smp->sess->origin)->sc) : NULL;
 	else
 		conn = (kw[4] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+			smp->strm ? sc_conn(smp->strm->scb) : NULL;
 
 	smp->data.type = SMP_T_BOOL;
-	smp->data.u.sint = (conn && conn->xprt == &ssl_sock);
+	smp->data.u.sint = conn_is_ssl(conn);
 	return 1;
 }
 
@@ -1226,10 +1426,10 @@ smp_fetch_ssl_fc_is_resumed(const struct arg *args, struct sample *smp, const ch
 	SSL *ssl;
 
 	if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-		conn = (kw[4] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
+		conn = (kw[4] == 'b') ? sc_conn(__objt_check(smp->sess->origin)->sc) : NULL;
 	else
 		conn = (kw[4] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+			smp->strm ? sc_conn(smp->strm->scb) : NULL;
 
 	ssl = ssl_sock_get_ssl_object(conn);
 
@@ -1237,6 +1437,75 @@ smp_fetch_ssl_fc_is_resumed(const struct arg *args, struct sample *smp, const ch
 	smp->data.u.sint = ssl && SSL_session_reused(ssl);
 	return 1;
 }
+
+/*
+ * string, returns the EC curve used for key agreement on the
+ * front and backend connection.
+ *
+ * The function to get the curve name (SSL_get_negotiated_group) is only available
+ * in OpenSSLv3 onwards and not for previous versions.
+ */
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x3000000fL)
+static int
+smp_fetch_ssl_fc_ec(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct connection *conn;
+	SSL *ssl;
+	int __maybe_unused nid;
+	char *curve_name;
+
+	if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
+		conn = (kw[4] == 'b') ? sc_conn(__objt_check(smp->sess->origin)->sc) : NULL;
+	else
+		conn = (kw[4] != 'b') ? objt_conn(smp->sess->origin) :
+		       smp->strm ? sc_conn(smp->strm->scb) : NULL;
+
+	ssl = ssl_sock_get_ssl_object(conn);
+	if (!ssl)
+		return 0;
+
+	/*
+	 * SSL_get0_group_name is a function to get the curve name and is available from
+	 * OpenSSL v3.2 onwards. For OpenSSL >=3.0 and <3.2, we will continue to use
+	 * SSL_get_negotiated_group to get the curve name.
+	 */
+# if (HA_OPENSSL_VERSION_NUMBER >= 0x3020000fL)
+	curve_name = (char *)SSL_get0_group_name(ssl);
+	if (curve_name == NULL) {
+		return 0;
+	} else {
+		/*
+		 * The curve name returned by SSL_get0_group_name is in lowercase whereas the curve
+		 * name returned when we use `SSL_get_negotiated_group` and `OBJ_nid2sn` is the
+		 * short name and is in upper case. To make the return value consistent across the
+		 * different functional calls and to make it consistent while upgrading OpenSSL versions,
+		 * will convert the curve name returned by SSL_get0_group_name to upper case.
+		 */
+		int i;
+
+		for (i = 0; curve_name[i]; i++)
+			curve_name[i] = toupper((unsigned char)curve_name[i]);
+	}
+# else
+	nid = SSL_get_negotiated_group(ssl);
+	if (!nid)
+		return 0;
+	curve_name = (char *)OBJ_nid2sn(nid);
+	if (curve_name == NULL)
+		return 0;
+# endif
+
+	smp->data.u.str.area = curve_name;
+	if (!smp->data.u.str.area)
+		return 0;
+
+	smp->data.type = SMP_T_STR;
+	smp->flags |= SMP_F_VOL_SESS | SMP_F_CONST;
+	smp->data.u.str.data = strlen(smp->data.u.str.area);
+
+	return 1;
+}
+#endif
 
 /* string, returns the used cipher if front conn. transport layer is SSL.
  * This function is also usable on backend conn if the fetch keyword 5th
@@ -1249,10 +1518,10 @@ smp_fetch_ssl_fc_cipher(const struct arg *args, struct sample *smp, const char *
 	SSL *ssl;
 
 	if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-		conn = (kw[4] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
+		conn = (kw[4] == 'b') ? sc_conn(__objt_check(smp->sess->origin)->sc) : NULL;
 	else
 		conn = (kw[4] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+			smp->strm ? sc_conn(smp->strm->scb) : NULL;
 
 	smp->flags = 0;
 	ssl = ssl_sock_get_ssl_object(conn);
@@ -1283,10 +1552,10 @@ smp_fetch_ssl_fc_alg_keysize(const struct arg *args, struct sample *smp, const c
 	int sint;
 
 	if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-		conn = (kw[4] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
+		conn = (kw[4] == 'b') ? sc_conn(__objt_check(smp->sess->origin)->sc) : NULL;
 	else
 		conn = (kw[4] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+			smp->strm ? sc_conn(smp->strm->scb) : NULL;
 
 	smp->flags = 0;
 	ssl = ssl_sock_get_ssl_object(conn);
@@ -1314,10 +1583,10 @@ smp_fetch_ssl_fc_use_keysize(const struct arg *args, struct sample *smp, const c
 	SSL *ssl;
 
 	if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-		conn = (kw[4] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
+		conn = (kw[4] == 'b') ? sc_conn(__objt_check(smp->sess->origin)->sc) : NULL;
 	else
 		conn = (kw[4] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+			smp->strm ? sc_conn(smp->strm->scb) : NULL;
 
 	smp->flags = 0;
 	ssl = ssl_sock_get_ssl_object(conn);
@@ -1346,10 +1615,10 @@ smp_fetch_ssl_fc_npn(const struct arg *args, struct sample *smp, const char *kw,
 	smp->data.type = SMP_T_STR;
 
 	if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-		conn = (kw[4] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
+		conn = (kw[4] == 'b') ? sc_conn(__objt_check(smp->sess->origin)->sc) : NULL;
 	else
 		conn = (kw[4] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+			smp->strm ? sc_conn(smp->strm->scb) : NULL;
 
 	ssl = ssl_sock_get_ssl_object(conn);
 	if (!ssl)
@@ -1381,10 +1650,10 @@ smp_fetch_ssl_fc_alpn(const struct arg *args, struct sample *smp, const char *kw
 	smp->data.type = SMP_T_STR;
 
 	if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-		conn = (kw[4] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
+		conn = (kw[4] == 'b') ? sc_conn(__objt_check(smp->sess->origin)->sc) : NULL;
 	else
 		conn = (kw[4] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+			smp->strm ? sc_conn(smp->strm->scb) : NULL;
 
 	ssl = ssl_sock_get_ssl_object(conn);
 	if (!ssl)
@@ -1414,10 +1683,10 @@ smp_fetch_ssl_fc_protocol(const struct arg *args, struct sample *smp, const char
 	SSL *ssl;
 
 	if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-		conn = (kw[4] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
+		conn = (kw[4] == 'b') ? sc_conn(__objt_check(smp->sess->origin)->sc) : NULL;
 	else
 		conn = (kw[4] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+			smp->strm ? sc_conn(smp->strm->scb) : NULL;
 
 	smp->flags = 0;
 	ssl = ssl_sock_get_ssl_object(conn);
@@ -1452,10 +1721,10 @@ smp_fetch_ssl_fc_session_id(const struct arg *args, struct sample *smp, const ch
 	smp->data.type = SMP_T_BIN;
 
 	if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-		conn = (kw[4] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
+		conn = (kw[4] == 'b') ? sc_conn(__objt_check(smp->sess->origin)->sc) : NULL;
 	else
 		conn = (kw[4] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+			smp->strm ? sc_conn(smp->strm->scb) : NULL;
 
 	ssl = ssl_sock_get_ssl_object(conn);
 	if (!ssl)
@@ -1484,10 +1753,10 @@ smp_fetch_ssl_fc_random(const struct arg *args, struct sample *smp, const char *
 	SSL *ssl;
 
 	if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-		conn = (kw[4] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
+		conn = (kw[4] == 'b') ? sc_conn(__objt_check(smp->sess->origin)->sc) : NULL;
 	else
 		conn = (kw[4] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+			smp->strm ? sc_conn(smp->strm->scb) : NULL;
 
 	ssl = ssl_sock_get_ssl_object(conn);
 	if (!ssl)
@@ -1521,10 +1790,10 @@ smp_fetch_ssl_fc_session_key(const struct arg *args, struct sample *smp, const c
 	SSL *ssl;
 
 	if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-		conn = (kw[4] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
+		conn = (kw[4] == 'b') ? sc_conn(__objt_check(smp->sess->origin)->sc) : NULL;
 	else
 		conn = (kw[4] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+			smp->strm ? sc_conn(smp->strm->scb) : NULL;
 
 	ssl = ssl_sock_get_ssl_object(conn);
 	if (!ssl)
@@ -1565,10 +1834,18 @@ smp_fetch_ssl_fc_sni(const struct arg *args, struct sample *smp, const char *kw,
 		return 0;
 
 	smp->data.u.str.area = (char *)SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
-	if (!smp->data.u.str.area)
-		return 0;
+	if (!smp->data.u.str.area) {
+		/* We might have stored the SNI ourselves, look for it in the
+		 * context's ex_data.
+		 */
+		smp->data.u.str.area = SSL_get_ex_data(ssl, ssl_client_sni_index);
+
+		if (!smp->data.u.str.area)
+			return 0;
+	}
 
 	smp->data.u.str.data = strlen(smp->data.u.str.area);
+
 	return 1;
 #else
 	/* SNI not supported */
@@ -1662,20 +1939,20 @@ smp_fetch_ssl_fc_err(const struct arg *args, struct sample *smp, const char *kw,
 	struct ssl_sock_ctx *ctx;
 
 	if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-		conn = (kw[4] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
+		conn = (kw[4] == 'b') ? sc_conn(__objt_check(smp->sess->origin)->sc) : NULL;
 	else
 		conn = (kw[4] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+			smp->strm ? sc_conn(smp->strm->scb) : NULL;
 
-	if (!conn || conn->xprt != &ssl_sock)
+	if (!conn)
 		return 0;
-	ctx = conn->xprt_ctx;
 
 	if (conn->flags & CO_FL_WAIT_XPRT && !conn->err_code) {
 		smp->flags = SMP_F_MAY_CHANGE;
 		return 0;
 	}
 
+	ctx = conn_get_ssl_sock_ctx(conn);
 	if (!ctx)
 		return 0;
 
@@ -1708,6 +1985,72 @@ smp_fetch_ssl_fc_protocol_hello_id(const struct arg *args, struct sample *smp, c
 }
 
 static int
+smp_fetch_ssl_fc_supver_bin(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct buffer *smp_trash;
+	struct connection *conn;
+	struct ssl_capture *capture;
+	SSL *ssl;
+
+	conn = objt_conn(smp->sess->origin);
+	ssl = ssl_sock_get_ssl_object(conn);
+	if (!ssl)
+		return 0;
+
+	capture = SSL_get_ex_data(ssl, ssl_capture_ptr_index);
+	if (!capture)
+		return 0;
+
+	if (args[0].data.sint) {
+		smp_trash = get_trash_chunk();
+		exclude_tls_grease(capture->data + capture->supver_offset, capture->supver_len, smp_trash);
+		smp->data.u.str.area = smp_trash->area;
+		smp->data.u.str.data = smp_trash->data;
+		smp->flags = SMP_F_VOL_SESS;
+		smp->data.type = SMP_T_BIN;
+	} else {
+		smp->flags = SMP_F_VOL_SESS | SMP_F_CONST;
+		smp->data.type = SMP_T_BIN;
+		smp->data.u.str.area = capture->data + capture->supver_offset;
+		smp->data.u.str.data = capture->supver_len;
+	}
+	return 1;
+}
+
+static int
+smp_fetch_ssl_fc_sigalgs_bin(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct buffer *smp_trash;
+	struct connection *conn;
+	struct ssl_capture *capture;
+	SSL *ssl;
+
+	conn = objt_conn(smp->sess->origin);
+	ssl = ssl_sock_get_ssl_object(conn);
+	if (!ssl)
+		return 0;
+
+	capture = SSL_get_ex_data(ssl, ssl_capture_ptr_index);
+	if (!capture)
+		return 0;
+
+	if (args[0].data.sint) {
+		smp_trash = get_trash_chunk();
+		exclude_tls_grease(capture->data + capture->sigalgs_offset, capture->sigalgs_len, smp_trash);
+		smp->data.u.str.area = smp_trash->area;
+		smp->data.u.str.data = smp_trash->data;
+		smp->flags = SMP_F_VOL_SESS;
+		smp->data.type = SMP_T_BIN;
+	} else {
+		smp->flags = SMP_F_VOL_SESS | SMP_F_CONST;
+		smp->data.type = SMP_T_BIN;
+		smp->data.u.str.area = capture->data + capture->sigalgs_offset;
+		smp->data.u.str.data = capture->sigalgs_len;
+	}
+	return 1;
+}
+
+static int
 smp_fetch_ssl_fc_err_str(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
 	struct connection *conn;
@@ -1715,20 +2058,20 @@ smp_fetch_ssl_fc_err_str(const struct arg *args, struct sample *smp, const char 
 	const char *err_code_str;
 
 	if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-		conn = (kw[4] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
+		conn = (kw[4] == 'b') ? sc_conn(__objt_check(smp->sess->origin)->sc) : NULL;
 	else
 		conn = (kw[4] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+			smp->strm ? sc_conn(smp->strm->scb) : NULL;
 
-	if (!conn || conn->xprt != &ssl_sock)
+	if (!conn)
 		return 0;
-	ctx = conn->xprt_ctx;
 
 	if (conn->flags & CO_FL_WAIT_XPRT && !conn->err_code) {
 		smp->flags = SMP_F_MAY_CHANGE;
 		return 0;
 	}
 
+	ctx = conn_get_ssl_sock_ctx(conn);
 	if (!ctx || !ctx->error_code)
 		return 0;
 
@@ -1850,8 +2193,11 @@ static int smp_fetch_ssl_x_keylog(const struct arg *args, struct sample *smp, co
 	char *src = NULL;
 	const char *sfx;
 
+	if (global_ssl.keylog <= 0)
+		return 0;
+
 	conn = (kw[4] != 'b') ? objt_conn(smp->sess->origin) :
-	       smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+	       smp->strm ? sc_conn(smp->strm->scb) : NULL;
 
 	if (!conn)
 		return 0;
@@ -1945,10 +2291,10 @@ smp_fetch_ssl_fc_unique_id(const struct arg *args, struct sample *smp, const cha
 	SSL *ssl;
 
 	if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-		conn = (kw[4] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
+		conn = (kw[4] == 'b') ? sc_conn(__objt_check(smp->sess->origin)->sc) : NULL;
 	else
 		conn = (kw[4] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+			smp->strm ? sc_conn(smp->strm->scb) : NULL;
 
 	smp->flags = 0;
 	ssl = ssl_sock_get_ssl_object(conn);
@@ -1986,15 +2332,10 @@ smp_fetch_ssl_fc_unique_id(const struct arg *args, struct sample *smp, const cha
 static int
 smp_fetch_ssl_c_ca_err(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	struct connection *conn;
-	struct ssl_sock_ctx *ctx;
+	struct connection *conn = objt_conn(smp->sess->origin);
+	struct ssl_sock_ctx *ctx = conn_get_ssl_sock_ctx(conn);
 
-	conn = objt_conn(smp->sess->origin);
-	if (!conn || conn->xprt != &ssl_sock)
-		return 0;
-	ctx = conn->xprt_ctx;
-
-	if (conn->flags & CO_FL_WAIT_XPRT && !conn->err_code) {
+	if (conn && conn->flags & CO_FL_WAIT_XPRT && !conn->err_code) {
 		smp->flags = SMP_F_MAY_CHANGE;
 		return 0;
 	}
@@ -2013,18 +2354,13 @@ smp_fetch_ssl_c_ca_err(const struct arg *args, struct sample *smp, const char *k
 static int
 smp_fetch_ssl_c_ca_err_depth(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	struct connection *conn;
-	struct ssl_sock_ctx *ctx;
+	struct connection *conn = objt_conn(smp->sess->origin);
+	struct ssl_sock_ctx *ctx = conn_get_ssl_sock_ctx(conn);
 
-	conn = objt_conn(smp->sess->origin);
-	if (!conn || conn->xprt != &ssl_sock)
-		return 0;
-
-	if (conn->flags & CO_FL_WAIT_XPRT && !conn->err_code) {
+	if (conn && conn->flags & CO_FL_WAIT_XPRT && !conn->err_code) {
 		smp->flags = SMP_F_MAY_CHANGE;
 		return 0;
 	}
-	ctx = conn->xprt_ctx;
 
 	if (!ctx)
 		return 0;
@@ -2040,19 +2376,13 @@ smp_fetch_ssl_c_ca_err_depth(const struct arg *args, struct sample *smp, const c
 static int
 smp_fetch_ssl_c_err(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	struct connection *conn;
-	struct ssl_sock_ctx *ctx;
+	struct connection *conn = objt_conn(smp->sess->origin);
+	struct ssl_sock_ctx *ctx = conn_get_ssl_sock_ctx(conn);
 
-	conn = objt_conn(smp->sess->origin);
-	if (!conn || conn->xprt != &ssl_sock)
-		return 0;
-
-	if (conn->flags & CO_FL_WAIT_XPRT && !conn->err_code) {
+	if (conn && conn->flags & CO_FL_WAIT_XPRT && !conn->err_code) {
 		smp->flags = SMP_F_MAY_CHANGE;
 		return 0;
 	}
-
-	ctx = conn->xprt_ctx;
 
 	if (!ctx)
 		return 0;
@@ -2113,6 +2443,9 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "ssl_bc_alpn",            smp_fetch_ssl_fc_alpn,        0,                   NULL,    SMP_T_STR,  SMP_USE_L5SRV },
 #endif
 	{ "ssl_bc_cipher",          smp_fetch_ssl_fc_cipher,      0,                   NULL,    SMP_T_STR,  SMP_USE_L5SRV },
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x3000000fL)
+        { "ssl_bc_curve",           smp_fetch_ssl_fc_ec,          0,                   NULL,    SMP_T_STR,  SMP_USE_L5SRV },
+#endif
 #if defined(OPENSSL_NPN_NEGOTIATED) && !defined(OPENSSL_NO_NEXTPROTONEG)
 	{ "ssl_bc_npn",             smp_fetch_ssl_fc_npn,         0,                   NULL,    SMP_T_STR,  SMP_USE_L5SRV },
 #endif
@@ -2128,6 +2461,15 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "ssl_bc_server_random",   smp_fetch_ssl_fc_random,      0,                   NULL,    SMP_T_BIN,  SMP_USE_L5SRV },
 	{ "ssl_bc_session_key",     smp_fetch_ssl_fc_session_key, 0,                   NULL,    SMP_T_BIN,  SMP_USE_L5SRV },
 #endif
+#ifdef HAVE_SSL_KEYLOG
+	{ "ssl_bc_client_early_traffic_secret",     smp_fetch_ssl_x_keylog,       0,   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_bc_client_handshake_traffic_secret", smp_fetch_ssl_x_keylog,       0,   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_bc_server_handshake_traffic_secret", smp_fetch_ssl_x_keylog,       0,   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_bc_client_traffic_secret_0",         smp_fetch_ssl_x_keylog,       0,   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_bc_server_traffic_secret_0",         smp_fetch_ssl_x_keylog,       0,   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_bc_exporter_secret",                 smp_fetch_ssl_x_keylog,       0,   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_bc_early_exporter_secret",           smp_fetch_ssl_x_keylog,       0,   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+#endif
 	{ "ssl_bc_err",             smp_fetch_ssl_fc_err,         0,                   NULL,    SMP_T_SINT, SMP_USE_L5SRV },
 	{ "ssl_bc_err_str",         smp_fetch_ssl_fc_err_str,     0,                   NULL,    SMP_T_STR,  SMP_USE_L5SRV },
 	{ "ssl_c_ca_err",           smp_fetch_ssl_c_ca_err,       0,                   NULL,    SMP_T_SINT, SMP_USE_L5CLI },
@@ -2139,7 +2481,11 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "ssl_c_key_alg",          smp_fetch_ssl_x_key_alg,      0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
 	{ "ssl_c_notafter",         smp_fetch_ssl_x_notafter,     0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
 	{ "ssl_c_notbefore",        smp_fetch_ssl_x_notbefore,    0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+#ifdef HAVE_SSL_get0_verified_chain
+	{ "ssl_c_r_dn",             smp_fetch_ssl_r_dn,           ARG3(0,STR,SINT,STR),val_dnfmt,    SMP_T_STR,  SMP_USE_L5CLI },
+#endif
 	{ "ssl_c_sig_alg",          smp_fetch_ssl_x_sig_alg,      0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_c_san",              smp_fetch_ssl_x_san,          0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
 	{ "ssl_c_s_dn",             smp_fetch_ssl_x_s_dn,         ARG3(0,STR,SINT,STR),val_dnfmt,    SMP_T_STR,  SMP_USE_L5CLI },
 	{ "ssl_c_serial",           smp_fetch_ssl_x_serial,       0,                   NULL,    SMP_T_BIN,  SMP_USE_L5CLI },
 	{ "ssl_c_sha1",             smp_fetch_ssl_x_sha1,         0,                   NULL,    SMP_T_BIN,  SMP_USE_L5CLI },
@@ -2159,6 +2505,9 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "ssl_fc",                 smp_fetch_ssl_fc,             0,                   NULL,    SMP_T_BOOL, SMP_USE_L5CLI },
 	{ "ssl_fc_alg_keysize",     smp_fetch_ssl_fc_alg_keysize, 0,                   NULL,    SMP_T_SINT, SMP_USE_L5CLI },
 	{ "ssl_fc_cipher",          smp_fetch_ssl_fc_cipher,      0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x3000000fL)
+        { "ssl_fc_curve",           smp_fetch_ssl_fc_ec,          0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+#endif
 	{ "ssl_fc_has_crt",         smp_fetch_ssl_fc_has_crt,     0,                   NULL,    SMP_T_BOOL, SMP_USE_L5CLI },
 	{ "ssl_fc_has_early",       smp_fetch_ssl_fc_has_early,   0,                   NULL,    SMP_T_BOOL, SMP_USE_L5CLI },
 	{ "ssl_fc_has_sni",         smp_fetch_ssl_fc_has_sni,     0,                   NULL,    SMP_T_BOOL, SMP_USE_L5CLI },
@@ -2204,6 +2553,8 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "ssl_fc_extlist_bin",     smp_fetch_ssl_fc_ext_bin,     ARG1(0,SINT),        NULL,    SMP_T_STR,  SMP_USE_L5CLI },
 	{ "ssl_fc_eclist_bin",      smp_fetch_ssl_fc_ecl_bin,     ARG1(0,SINT),        NULL,    SMP_T_STR,  SMP_USE_L5CLI },
 	{ "ssl_fc_ecformats_bin",   smp_fetch_ssl_fc_ecf_bin,     0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_fc_supported_versions_bin", smp_fetch_ssl_fc_supver_bin, ARG1(0,SINT),  NULL,    SMP_T_BIN,  SMP_USE_L5CLI },
+	{ "ssl_fc_sigalgs_bin",     smp_fetch_ssl_fc_sigalgs_bin, ARG1(0,SINT),        NULL,    SMP_T_BIN,  SMP_USE_L5CLI },
 
 /* SSL server certificate fetches */
 	{ "ssl_s_der",              smp_fetch_ssl_x_der,          0,                   NULL,    SMP_T_BIN,  SMP_USE_L5CLI },
@@ -2226,8 +2577,10 @@ INITCALL1(STG_REGISTER, sample_register_fetches, &sample_fetch_keywords);
 static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "sha2",               sample_conv_sha2,             ARG1(0, SINT),            smp_check_sha2,          SMP_T_BIN,  SMP_T_BIN  },
 #ifdef EVP_CIPH_GCM_MODE
-	{ "aes_gcm_dec",        sample_conv_aes_gcm_dec,      ARG4(4,SINT,STR,STR,STR), check_aes_gcm,           SMP_T_BIN,  SMP_T_BIN  },
+	{ "aes_gcm_enc",        sample_conv_aes_gcm,          ARG4(4,SINT,STR,STR,STR), check_aes_gcm,           SMP_T_BIN,  SMP_T_BIN  },
+	{ "aes_gcm_dec",        sample_conv_aes_gcm,          ARG4(4,SINT,STR,STR,STR), check_aes_gcm,           SMP_T_BIN,  SMP_T_BIN  },
 #endif
+	{ "x509_v_err_str",     sample_conv_x509_v_err,       0,                        NULL,                    SMP_T_SINT, SMP_T_STR },
 	{ "digest",             sample_conv_crypto_digest,    ARG1(1,STR),              check_crypto_digest,     SMP_T_BIN,  SMP_T_BIN  },
 	{ "hmac",               sample_conv_crypto_hmac,      ARG2(2,STR,STR),          check_crypto_hmac,       SMP_T_BIN,  SMP_T_BIN  },
 #if defined(HAVE_CRYPTO_memcmp)

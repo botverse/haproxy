@@ -24,6 +24,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#define _GNU_SOURCE     // for POLLRDHUP
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/types.h>
@@ -31,7 +32,13 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/ioctl.h>
+#include <sys/un.h>
 #include <sys/wait.h>
+
+#ifdef __linux__
+#include <sys/epoll.h>
+#endif
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -49,6 +56,11 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+/* for OSes which don't have it */
+#ifndef POLLRDHUP
+#define POLLRDHUP 0
+#endif
 
 #ifndef MSG_MORE
 #define MSG_MORE 0
@@ -71,7 +83,10 @@ volatile int nbproc = 0;
 static struct timeval start_time;
 static int showtime;
 static int verbose;
+static int use_epoll;
 static int pid;
+static int sock_type = SOCK_STREAM;
+static int sock_proto = IPPROTO_TCP;
 
 
 /* display the message and exit with the code */
@@ -95,33 +110,38 @@ __attribute__((noreturn)) void usage(int code, const char *arg0)
 	    "\n"
 	    "options :\n"
 	    "  -v           : verbose\n"
+	    "  -u           : use UDP instead of TCP (limited)\n"
+	    "  -U           : use UNIX instead of TCP (limited, addr must have one '/')\n"
 	    "  -t|-tt|-ttt  : show time (msec / relative / absolute)\n"
+	    "  -e           : use epoll instead of poll on Linux\n"
 	    "actions :\n"
-	    "  L[<backlog>] : Listens to ip:port and optionally sets backlog\n"
-	    "                 Note: fd=socket,bind(fd),listen(fd)\n"
-	    "  C            : Connects to ip:port\n"
-	    "                 Note: fd=socket,connect(fd)\n"
-	    "  D            : Disconnect (connect to AF_UNSPEC)\n"
 	    "  A[<count>]   : Accepts <count> incoming sockets and closes count-1\n"
 	    "                 Note: fd=accept(fd)\n"
+	    "  B[[ip]:port] : Bind a new socket to ip:port or default one if unspecified.\n"
+	    "                 Note: fd=socket,bind(fd)\n"
+	    "  C[[ip]:port] : Connects to ip:port or default ones if unspecified.\n"
+	    "                 Note: fd=socket,connect(fd)\n"
+	    "  D            : Disconnect (connect to AF_UNSPEC)\n"
+	    "  E[<size>]    : Echo this amount of bytes. 0=infinite. unset=any amount.\n"
+	    "  F            : FIN : shutdown(SHUT_WR)\n"
+	    "  G            : disable lingering\n"
+	    "  I            : wait for Input data to be present (POLLIN)\n"
 	    "  J            : Jump back to oldest post-fork/post-accept action\n"
 	    "  K            : kill the connection and go on with next operation\n"
-	    "  G            : disable lingering\n"
-	    "  T            : set TCP_NODELAY\n"
+	    "  L[<backlog>] : Listens to ip:port and optionally sets backlog\n"
+	    "                 Note: fd=socket,bind(fd),listen(fd)\n"
+	    "  N<max>       : fork New process, limited to <max> concurrent (default 1)\n"
+	    "  O            : wait for Output queue to be empty (POLLOUT + TIOCOUTQ)\n"
+	    "  P[<time>]    : Pause for <time> ms (100 by default)\n"
 	    "  Q            : disable TCP Quick-ack\n"
 	    "  R[<size>]    : Read this amount of bytes. 0=infinite. unset=any amount.\n"
 	    "  S[<size>]    : Send this amount of bytes. 0=infinite. unset=any amount.\n"
 	    "  S:<string>   : Send this exact string. \\r, \\n, \\t, \\\\ supported.\n"
-	    "  E[<size>]    : Echo this amount of bytes. 0=infinite. unset=any amount.\n"
+	    "  T            : set TCP_NODELAY\n"
 	    "  W[<time>]    : Wait for any event on the socket, maximum <time> ms\n"
-	    "  P[<time>]    : Pause for <time> ms (100 by default)\n"
-	    "  I            : wait for Input data to be present (POLLIN)\n"
-	    "  O            : wait for Output queue to be empty (POLLOUT + TIOCOUTQ)\n"
-	    "  F            : FIN : shutdown(SHUT_WR)\n"
-	    "  r            : shutr : shutdown(SHUT_RD) (pauses a listener or ends recv)\n"
-	    "  N<max>       : fork New process, limited to <max> concurrent (default 1)\n"
 	    "  X[i|o|e]* ** : execvp() next args passing socket as stdin/stdout/stderr.\n"
 	    "                 If i/o/e present, only stdin/out/err are mapped to socket.\n"
+	    "  r            : shutr : shutdown(SHUT_RD) (pauses a listener or ends recv)\n"
 	    "\n"
 	    "It's important to note that a single FD is used at once and that Accept\n"
 	    "replaces the listening FD with the accepted one. Thus always do it after\n"
@@ -236,19 +256,27 @@ void sig_handler(int sig)
 /* converts str in the form [[<ipv4>|<ipv6>|<hostname>]:]port to struct sockaddr_storage.
  * Returns < 0 with err set in case of error.
  */
-int addr_to_ss(char *str, struct sockaddr_storage *ss, struct err_msg *err)
+int addr_to_ss(const char *str, struct sockaddr_storage *ss, struct err_msg *err)
 {
 	char *port_str;
 	int port;
 
 	memset(ss, 0, sizeof(*ss));
 
+	/* if there's a slash it's a unix socket */
+	if (strchr(str, '/')) {
+		((struct sockaddr_un *)ss)->sun_family = AF_UNIX;
+		strncpy(((struct sockaddr_un *)ss)->sun_path, str, sizeof(((struct sockaddr_un *)ss)->sun_path) - 1);
+		((struct sockaddr_un *)ss)->sun_path[sizeof(((struct sockaddr_un *)ss)->sun_path)] = 0;
+		return 0;
+	}
+
 	/* look for the addr/port delimiter, it's the last colon. If there's no
 	 * colon, it's 0:<port>.
 	 */
 	if ((port_str = strrchr(str, ':')) == NULL) {
 		port = atoi(str);
-		if (port <= 0 || port > 65535) {
+		if (port < 0 || port > 65535) {
 			err->len = snprintf(err->msg, err->size, "Missing/invalid port number: '%s'\n", str);
 			return -1;
 		}
@@ -294,18 +322,43 @@ int addr_to_ss(char *str, struct sockaddr_storage *ss, struct err_msg *err)
 	return 0;
 }
 
-/* waits up to one second on fd <fd> for events <events> (POLLIN|POLLOUT).
+/* waits up to <ms> milliseconds on fd <fd> for events <events> (POLLIN|POLLRDHUP|POLLOUT).
  * returns poll's status.
  */
-int wait_on_fd(int fd, int events)
+int wait_on_fd(int fd, int events, int ms)
 {
 	struct pollfd pollfd;
 	int ret;
 
+#ifdef __linux__
+	while (use_epoll) {
+		struct epoll_event evt;
+		static int epoll_fd = -1;
+
+		if (epoll_fd == -1)
+			epoll_fd = epoll_create(1024);
+		if (epoll_fd == -1)
+			break;
+		evt.events = ((events & POLLIN) ? EPOLLIN : 0)      |
+		             ((events & POLLOUT) ? EPOLLOUT : 0)    |
+		             ((events & POLLRDHUP) ? EPOLLRDHUP : 0);
+		evt.data.fd = fd;
+		epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &evt);
+
+		do {
+			ret = epoll_wait(epoll_fd, &evt, 1, ms);
+		} while (ret == -1 && errno == EINTR);
+
+		evt.data.fd = fd;
+		epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, &evt);
+		return ret;
+	}
+#endif
+
 	do {
 		pollfd.fd = fd;
 		pollfd.events = events;
-		ret = poll(&pollfd, 1, 1000);
+		ret = poll(&pollfd, 1, ms);
 	} while (ret == -1 && errno == EINTR);
 
 	return ret;
@@ -331,26 +384,40 @@ int tcp_set_noquickack(int sock, const char *arg)
 #endif
 }
 
-/* Try to listen to address <sa>. Return the fd or -1 in case of error */
-int tcp_listen(const struct sockaddr_storage *sa, const char *arg)
+/* Create a new TCP socket for either listening or connecting */
+int tcp_socket(sa_family_t fam)
 {
 	int sock;
-	int backlog;
 
-	if (arg[1])
-		backlog = atoi(arg + 1);
-	else
-		backlog = 1000;
-
-	if (backlog < 0 || backlog > 65535) {
-		fprintf(stderr, "backlog must be between 0 and 65535 inclusive (was %d)\n", backlog);
-		return -1;
-	}
-
-	sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	sock = socket(fam, sock_type, sock_proto);
 	if (sock < 0) {
 		perror("socket()");
 		return -1;
+	}
+
+	return sock;
+}
+
+/* Try to bind to local address <sa>. Return the fd or -1 in case of error.
+ * Supports being passed NULL for arg if none has to be passed.
+ */
+int tcp_bind(int sock, const struct sockaddr_storage *sa, const char *arg)
+{
+	struct sockaddr_storage conn_addr;
+
+	if (arg && arg[1]) {
+		struct err_msg err;
+
+		if (addr_to_ss(arg + 1, &conn_addr, &err) < 0)
+			die(1, "%s\n", err.msg);
+		sa = &conn_addr;
+	}
+
+
+	if (sock < 0) {
+		sock = tcp_socket(sa->ss_family);
+		if (sock < 0)
+			return sock;
 	}
 
 	if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) == -1) {
@@ -367,6 +434,33 @@ int tcp_listen(const struct sockaddr_storage *sa, const char *arg)
 	if (bind(sock, (struct sockaddr *)sa, sa->ss_family == AF_INET6 ?
 		 sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in)) == -1) {
 		perror("bind");
+		goto fail;
+	}
+
+	return sock;
+ fail:
+	close(sock);
+	return -1;
+}
+
+/* Try to listen to address <sa>. Return the fd or -1 in case of error */
+int tcp_listen(int sock, const struct sockaddr_storage *sa, const char *arg)
+{
+	int backlog;
+
+	if (sock < 0) {
+		sock = tcp_bind(sock, sa, NULL);
+		if (sock < 0)
+			return sock;
+	}
+
+	if (arg[1])
+		backlog = atoi(arg + 1);
+	else
+		backlog = 1000;
+
+	if (backlog < 0 || backlog > 65535) {
+		fprintf(stderr, "backlog must be between 0 and 65535 inclusive (was %d)\n", backlog);
 		goto fail;
 	}
 
@@ -416,13 +510,23 @@ int tcp_accept(int sock, const char *arg)
 }
 
 /* Try to establish a new connection to <sa>. Return the fd or -1 in case of error */
-int tcp_connect(const struct sockaddr_storage *sa, const char *arg)
+int tcp_connect(int sock, const struct sockaddr_storage *sa, const char *arg)
 {
-	int sock;
+	struct sockaddr_storage conn_addr;
 
-	sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (sock < 0)
-		return -1;
+	if (arg[1]) {
+		struct err_msg err;
+
+		if (addr_to_ss(arg + 1, &conn_addr, &err) < 0)
+			die(1, "%s\n", err.msg);
+		sa = &conn_addr;
+	}
+
+	if (sock < 0) {
+		sock = tcp_socket(sa->ss_family);
+		if (sock < 0)
+			return sock;
+	}
 
 	if (fcntl(sock, F_SETFL, O_NONBLOCK) == -1)
 		goto fail;
@@ -480,7 +584,7 @@ int tcp_recv(int sock, const char *arg)
 				dolog("recv %d\n", ret);
 				return -1;
 			}
-			while (!wait_on_fd(sock, POLLIN));
+			while (!wait_on_fd(sock, POLLIN | POLLRDHUP, 1000));
 			continue;
 		}
 		dolog("recv %d\n", ret);
@@ -533,7 +637,7 @@ int tcp_send(int sock, const char *arg)
 				dolog("send %d\n", ret);
 				return -1;
 			}
-			while (!wait_on_fd(sock, POLLOUT));
+			while (!wait_on_fd(sock, POLLOUT, 1000));
 			continue;
 		}
 		dolog("send %d\n", ret);
@@ -578,7 +682,7 @@ int tcp_echo(int sock, const char *arg)
 					dolog("recv %d\n", rcvd);
 					return -1;
 				}
-				while (!wait_on_fd(sock, POLLIN));
+				while (!wait_on_fd(sock, POLLIN | POLLRDHUP, 1000));
 				continue;
 			}
 			dolog("recv %d\n", rcvd);
@@ -595,7 +699,7 @@ int tcp_echo(int sock, const char *arg)
 					dolog("send %d\n", ret);
 					return -1;
 				}
-				while (!wait_on_fd(sock, POLLOUT));
+				while (!wait_on_fd(sock, POLLOUT, 1000));
 				continue;
 			}
 			dolog("send %d\n", ret);
@@ -620,7 +724,6 @@ int tcp_echo(int sock, const char *arg)
  */
 int tcp_wait(int sock, const char *arg)
 {
-	struct pollfd pollfd;
 	int delay = -1; // wait forever
 	int ret;
 
@@ -633,14 +736,9 @@ int tcp_wait(int sock, const char *arg)
 	}
 
 	/* FIXME: this doesn't take into account delivered signals */
-	do {
-		pollfd.fd = sock;
-		pollfd.events = POLLIN | POLLOUT;
-		ret = poll(&pollfd, 1, delay);
-	} while (ret == -1 && errno == EINTR);
-
-	if (ret > 0 && pollfd.revents & POLLERR)
-		return -1;
+	ret = wait_on_fd(sock, POLLIN | POLLRDHUP | POLLOUT, delay);
+	if (ret < 0)
+		return ret;
 
 	return 0;
 }
@@ -648,17 +746,11 @@ int tcp_wait(int sock, const char *arg)
 /* waits for the input data to be present */
 int tcp_wait_in(int sock, const char *arg)
 {
-	struct pollfd pollfd;
 	int ret;
 
-	do {
-		pollfd.fd = sock;
-		pollfd.events = POLLIN;
-		ret = poll(&pollfd, 1, 1000);
-	} while (ret == -1 && errno == EINTR);
-
-	if (ret > 0 && pollfd.revents & POLLERR)
-		return -1;
+	ret = wait_on_fd(sock, POLLIN | POLLRDHUP, 1000);
+	if (ret < 0)
+		return ret;
 
 	return 0;
 }
@@ -666,17 +758,11 @@ int tcp_wait_in(int sock, const char *arg)
 /* waits for the output queue to be empty */
 int tcp_wait_out(int sock, const char *arg)
 {
-	struct pollfd pollfd;
 	int ret;
 
-	do {
-		pollfd.fd = sock;
-		pollfd.events = POLLOUT;
-		ret = poll(&pollfd, 1, 1000);
-	} while (ret == -1 && errno == EINTR);
-
-	if (ret > 0 && pollfd.revents & POLLERR)
-		return -1;
+	ret = wait_on_fd(sock, POLLOUT, 1000);
+	if (ret < 0)
+		return ret;
 
 	/* Now wait for data to leave the socket */
 	do {
@@ -732,7 +818,7 @@ int tcp_fork(int sock, const char *arg)
 
 int main(int argc, char **argv)
 {
-	struct sockaddr_storage ss;
+	struct sockaddr_storage default_addr;
 	struct err_msg err;
 	const char *arg0;
 	int loop_arg;
@@ -751,8 +837,17 @@ int main(int argc, char **argv)
 			showtime += 2;
 		else if (strcmp(argv[0], "-ttt") == 0)
 			showtime += 3;
+		else if (strcmp(argv[0], "-e") == 0)
+			use_epoll = 1;
 		else if (strcmp(argv[0], "-v") == 0)
 			verbose ++;
+		else if (strcmp(argv[0], "-u") == 0) {
+			sock_type = SOCK_DGRAM;
+			sock_proto = IPPROTO_UDP;
+		}
+		else if (strcmp(argv[0], "-U") == 0) {
+			sock_proto = 0;
+		}
 		else if (strcmp(argv[0], "--") == 0)
 			break;
 		else
@@ -765,7 +860,7 @@ int main(int argc, char **argv)
 	pid = getpid();
 	signal(SIGCHLD, sig_handler);
 
-	if (addr_to_ss(argv[1], &ss, &err) < 0)
+	if (addr_to_ss(argv[1], &default_addr, &err) < 0)
 		die(1, "%s\n", err.msg);
 
 	gettimeofday(&start_time, NULL);
@@ -775,17 +870,21 @@ int main(int argc, char **argv)
 	for (arg = loop_arg; arg < argc; arg++) {
 		switch (argv[arg][0]) {
 		case 'L':
-			/* silently ignore existing connections */
-			if (sock == -1)
-				sock = tcp_listen(&ss, argv[arg]);
+			sock = tcp_listen(sock, &default_addr, argv[arg]);
 			if (sock < 0)
 				die(1, "Fatal: tcp_listen() failed.\n");
 			break;
 
-		case 'C':
+		case 'B':
 			/* silently ignore existing connections */
-			if (sock == -1)
-				sock = tcp_connect(&ss, argv[arg]);
+			sock = tcp_bind(sock, &default_addr, argv[arg]);
+			if (sock < 0)
+				die(1, "Fatal: tcp_connect() failed.\n");
+			dolog("connect\n");
+			break;
+
+		case 'C':
+			sock = tcp_connect(sock, &default_addr, argv[arg]);
 			if (sock < 0)
 				die(1, "Fatal: tcp_connect() failed.\n");
 			dolog("connect\n");

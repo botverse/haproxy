@@ -23,7 +23,7 @@
 #ifndef _HAPROXY_CLI_H
 #define _HAPROXY_CLI_H
 
-#include <haproxy/applet-t.h>
+#include <haproxy/applet.h>
 #include <haproxy/channel-t.h>
 #include <haproxy/cli-t.h>
 #include <haproxy/global.h>
@@ -33,17 +33,20 @@
 
 void cli_register_kw(struct cli_kw_list *kw_list);
 struct cli_kw* cli_find_kw_exact(char **args);
+void cli_list_keywords(void);
 
 int cli_has_level(struct appctx *appctx, int level);
 
 int cli_parse_default(char **args, char *payload, struct appctx *appctx, void *private);
 
 /* mworker proxy functions */
-
-int mworker_cli_proxy_create(void);
-int mworker_cli_proxy_new_listener(char *line);
-int mworker_cli_sockpair_new(struct mworker_proc *mworker_proc, int proc);
+int mworker_cli_create_master_proxy(char **errmsg);
+int mworker_cli_attach_server(char **errmsg);
+struct bind_conf *mworker_cli_master_proxy_new_listener(char *line);
+int mworker_cli_global_proxy_new_listener(struct mworker_proc *proc);
 void mworker_cli_proxy_stop(void);
+
+extern struct bind_conf *mcli_reload_bind_conf;
 
 /* proxy mode cli functions */
 
@@ -56,8 +59,10 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit);
  */
 static inline int cli_msg(struct appctx *appctx, int severity, const char *msg)
 {
-	appctx->ctx.cli.severity = severity;
-	appctx->ctx.cli.msg = msg;
+	struct cli_print_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
+	ctx->severity = severity;
+	ctx->msg = msg;
 	appctx->st0 = CLI_ST_PRINT;
 	return 1;
 }
@@ -68,7 +73,9 @@ static inline int cli_msg(struct appctx *appctx, int severity, const char *msg)
  */
 static inline int cli_err(struct appctx *appctx, const char *err)
 {
-	appctx->ctx.cli.msg = err;
+	struct cli_print_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
+	ctx->msg = err;
 	appctx->st0 = CLI_ST_PRINT_ERR;
 	return 1;
 }
@@ -79,8 +86,10 @@ static inline int cli_err(struct appctx *appctx, const char *err)
  */
 static inline int cli_dynmsg(struct appctx *appctx, int severity, char *msg)
 {
-	appctx->ctx.cli.severity = severity;
-	appctx->ctx.cli.err = msg;
+	struct cli_print_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
+	ctx->severity = severity;
+	ctx->err = msg;
 	appctx->st0 = CLI_ST_PRINT_DYN;
 	return 1;
 }
@@ -92,11 +101,38 @@ static inline int cli_dynmsg(struct appctx *appctx, int severity, char *msg)
  */
 static inline int cli_dynerr(struct appctx *appctx, char *err)
 {
-	appctx->ctx.cli.err = err;
-	appctx->st0 = CLI_ST_PRINT_FREE;
+	struct cli_print_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
+	ctx->err = err;
+	appctx->st0 = CLI_ST_PRINT_DYNERR;
 	return 1;
 }
 
+/* updates the CLI's context to log messages stored in thread-local
+ * usermsgs_ctx at <severity> level. usermsgs_ctx will be reset when done.
+ * This is for use in CLI parsers to deal with quick response messages.
+ *
+ * Always returns 1.
+ */
+static inline int cli_umsg(struct appctx *appctx, int severity)
+{
+	struct cli_print_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
+	ctx->severity = severity;
+	appctx->st0 = CLI_ST_PRINT_UMSG;
+	return 1;
+}
+
+/* updates the CLI's context to log messages stored in thread-local
+ * usermsgs_ctx using error level. usermsgs_ctx will be reset when done.
+ * This is for use in CLI parsers to deal with quick response messages.
+ *
+ * Always returns 1.
+ */
+static inline int cli_umsgerr(struct appctx *appctx)
+{
+	appctx->st0 = CLI_ST_PRINT_UMSGERR;
+	return 1;
+}
 
 #endif /* _HAPROXY_CLI_H */
-

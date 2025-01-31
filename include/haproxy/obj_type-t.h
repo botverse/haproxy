@@ -40,9 +40,12 @@ enum obj_type {
 	OBJ_TYPE_APPCTX,       /* object is a struct appctx */
 	OBJ_TYPE_CONN,         /* object is a struct connection */
 	OBJ_TYPE_SRVRQ,        /* object is a struct dns_srvrq */
-	OBJ_TYPE_CS,           /* object is a struct conn_stream */
+	OBJ_TYPE_SC,           /* object is a struct stconn */
 	OBJ_TYPE_STREAM,       /* object is a struct stream */
 	OBJ_TYPE_CHECK,        /* object is a struct check */
+#ifdef USE_QUIC
+	OBJ_TYPE_DGRAM,        /* object is a struct quic_dgram */
+#endif
 	OBJ_TYPE_ENTRIES       /* last one : number of entries */
 } __attribute__((packed)) ;
 

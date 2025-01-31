@@ -12,7 +12,6 @@
 
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +29,7 @@
 #include <haproxy/protocol.h>
 #include <haproxy/sock.h>
 #include <haproxy/sock_unix.h>
+#include <haproxy/tools.h>
 
 static int uxdg_bind_listener(struct listener *listener, char *errmsg, int errlen);
 static void uxdg_enable_listener(struct listener *listener);
@@ -41,7 +41,7 @@ struct protocol proto_uxdg = {
 	.name           = "uxdg",
 
 	/* connection layer */
-	.ctrl_type      = SOCK_DGRAM,
+	.xprt_type      = PROTO_TYPE_DGRAM,
 	.listen         = uxdg_bind_listener,
 	.enable         = uxdg_enable_listener,
 	.disable        = uxdg_disable_listener,
@@ -63,11 +63,73 @@ struct protocol proto_uxdg = {
 	.rx_enable      = sock_enable,
 	.rx_disable     = sock_disable,
 	.rx_unbind      = sock_unbind,
-	.receivers      = LIST_HEAD_INIT(proto_uxdg.receivers),
+};
+
+/* Note: must not be declared <const> as its list will be overwritten */
+struct protocol proto_abns_dgram = {
+	.name           = "abns_dgram",
+
+	/* connection layer */
+	.xprt_type      = PROTO_TYPE_DGRAM,
+	.listen         = uxdg_bind_listener,
+	.enable         = uxdg_enable_listener,
+	.disable        = uxdg_disable_listener,
+	.add            = default_add_listener,
+	.unbind         = default_unbind_listener,
+	.suspend        = default_suspend_listener,
+	.resume         = default_resume_listener,
+
+	/* binding layer */
+	.rx_suspend     = uxdg_suspend_receiver,
+
+	/* address family */
+	.fam            = &proto_fam_abns,
+
+	/* socket layer */
+	.proto_type     = PROTO_TYPE_DGRAM,
+	.sock_type      = SOCK_DGRAM,
+	.sock_prot      = 0,
+	.rx_enable      = sock_enable,
+	.rx_disable     = sock_disable,
+	.rx_unbind      = sock_unbind,
+	.receivers      = LIST_HEAD_INIT(proto_abns_dgram.receivers),
+	.nb_receivers   = 0,
+};
+
+/* Note: must not be declared <const> as its list will be overwritten */
+struct protocol proto_abnsz_dgram = {
+	.name           = "abnsz_dgram",
+
+	/* connection layer */
+	.xprt_type      = PROTO_TYPE_DGRAM,
+	.listen         = uxdg_bind_listener,
+	.enable         = uxdg_enable_listener,
+	.disable        = uxdg_disable_listener,
+	.add            = default_add_listener,
+	.unbind         = default_unbind_listener,
+	.suspend        = default_suspend_listener,
+	.resume         = default_resume_listener,
+
+	/* binding layer */
+	.rx_suspend     = uxdg_suspend_receiver,
+
+	/* address family */
+	.fam            = &proto_fam_abnsz,
+
+	/* socket layer */
+	.proto_type     = PROTO_TYPE_DGRAM,
+	.sock_type      = SOCK_DGRAM,
+	.sock_prot      = 0,
+	.rx_enable      = sock_enable,
+	.rx_disable     = sock_disable,
+	.rx_unbind      = sock_unbind,
+	.receivers      = LIST_HEAD_INIT(proto_abnsz_dgram.receivers),
 	.nb_receivers   = 0,
 };
 
 INITCALL1(STG_REGISTER, protocol_register, &proto_uxdg);
+INITCALL1(STG_REGISTER, protocol_register, &proto_abns_dgram);
+INITCALL1(STG_REGISTER, protocol_register, &proto_abnsz_dgram);
 
 /* This function tries to bind dgram unix socket listener. It may return a warning or
  * an error message in <errmsg> if the message is at most <errlen> bytes long
@@ -96,6 +158,7 @@ int uxdg_bind_listener(struct listener *listener, char *errmsg, int errlen)
 
 	if (!(listener->rx.flags & RX_F_BOUND)) {
 		msg = "receiving socket not bound";
+		err |= ERR_FATAL | ERR_ALERT;
 		goto uxdg_return;
 	}
 
@@ -103,8 +166,11 @@ int uxdg_bind_listener(struct listener *listener, char *errmsg, int errlen)
 
  uxdg_return:
 	if (msg && errlen) {
-		const char *path = ((struct sockaddr_un *)&listener->rx.addr)->sun_path;
-                snprintf(errmsg, errlen, "%s for [%s]", msg, path);
+		char *path_str;
+
+		path_str = sa2str((struct sockaddr_storage *)&listener->rx.addr, 0, 0);
+		snprintf(errmsg, errlen, "%s for [%s]", msg, ((path_str) ? path_str : ""));
+		ha_free(&path_str);
 	}
 	return err;
 }
@@ -126,17 +192,20 @@ static void uxdg_disable_listener(struct listener *l)
 }
 
 /* Suspend a receiver. Returns < 0 in case of failure, 0 if the receiver
- * was totally stopped, or > 0 if correctly suspended. Nothing is done for
- * plain unix sockets since currently it's the new process which handles
- * the renaming. Abstract sockets are completely unbound and closed so
- * there's no need to stop the poller.
+ * was totally stopped, or > 0 if correctly suspended. For plain unix sockets
+ * we only disable the listener to prevent data from being handled but nothing
+ * more is done since currently it's the new process which handles the renaming.
+ * Abstract sockets are completely unbound and closed so there's no need to stop
+ * the poller.
  */
 static int uxdg_suspend_receiver(struct receiver *rx)
 {
         struct listener *l = LIST_ELEM(rx, struct listener *, rx);
 
-        if (((struct sockaddr_un *)&rx->addr)->sun_path[0])
+        if (((struct sockaddr_un *)&rx->addr)->sun_path[0]) {
+		uxdg_disable_listener(l);
                 return 1;
+	}
 
         /* Listener's lock already held. Call lockless version of
          * unbind_listener. */

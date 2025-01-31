@@ -10,9 +10,13 @@
  *
  */
 
+/* this is to have tcp_info defined on systems using musl
+ * library, such as Alpine Linux.
+ */
+#define _GNU_SOURCE
+
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,13 +53,14 @@ static int tcp_suspend_receiver(struct receiver *rx);
 static int tcp_resume_receiver(struct receiver *rx);
 static void tcp_enable_listener(struct listener *listener);
 static void tcp_disable_listener(struct listener *listener);
+static int tcp_get_info(struct connection *conn, long long int *info, int info_num);
 
 /* Note: must not be declared <const> as its list will be overwritten */
 struct protocol proto_tcpv4 = {
 	.name           = "tcpv4",
 
 	/* connection layer */
-	.ctrl_type      = SOCK_STREAM,
+	.xprt_type      = PROTO_TYPE_STREAM,
 	.listen         = tcp_bind_listener,
 	.enable         = tcp_enable_listener,
 	.disable        = tcp_disable_listener,
@@ -70,6 +75,7 @@ struct protocol proto_tcpv4 = {
 	.drain          = sock_drain,
 	.check_events   = sock_check_events,
 	.ignore_events  = sock_ignore_events,
+	.get_info       = tcp_get_info,
 
 	/* binding layer */
 	.rx_suspend     = tcp_suspend_receiver,
@@ -87,8 +93,9 @@ struct protocol proto_tcpv4 = {
 	.rx_unbind      = sock_unbind,
 	.rx_listening   = sock_accepting_conn,
 	.default_iocb   = sock_accept_iocb,
-	.receivers      = LIST_HEAD_INIT(proto_tcpv4.receivers),
-	.nb_receivers   = 0,
+#ifdef SO_REUSEPORT
+	.flags          = PROTO_F_REUSEPORT_SUPPORTED,
+#endif
 };
 
 INITCALL1(STG_REGISTER, protocol_register, &proto_tcpv4);
@@ -98,7 +105,7 @@ struct protocol proto_tcpv6 = {
 	.name           = "tcpv6",
 
 	/* connection layer */
-	.ctrl_type      = SOCK_STREAM,
+	.xprt_type      = PROTO_TYPE_STREAM,
 	.listen         = tcp_bind_listener,
 	.enable         = tcp_enable_listener,
 	.disable        = tcp_disable_listener,
@@ -113,6 +120,7 @@ struct protocol proto_tcpv6 = {
 	.drain          = sock_drain,
 	.check_events   = sock_check_events,
 	.ignore_events  = sock_ignore_events,
+	.get_info       = tcp_get_info,
 
 	/* binding layer */
 	.rx_suspend     = tcp_suspend_receiver,
@@ -130,11 +138,104 @@ struct protocol proto_tcpv6 = {
 	.rx_unbind      = sock_unbind,
 	.rx_listening   = sock_accepting_conn,
 	.default_iocb   = sock_accept_iocb,
-	.receivers      = LIST_HEAD_INIT(proto_tcpv6.receivers),
-	.nb_receivers   = 0,
+#ifdef SO_REUSEPORT
+	.flags          = PROTO_F_REUSEPORT_SUPPORTED,
+#endif
 };
 
 INITCALL1(STG_REGISTER, protocol_register, &proto_tcpv6);
+
+#ifdef HA_HAVE_MPTCP
+/* Most fields are copied from proto_tcpv4 */
+struct protocol proto_mptcpv4 = {
+	.name           = "mptcpv4",
+
+	/* connection layer */
+	.xprt_type      = PROTO_TYPE_STREAM,
+	.listen         = tcp_bind_listener,
+	.enable         = tcp_enable_listener,
+	.disable        = tcp_disable_listener,
+	.add            = default_add_listener,
+	.unbind         = default_unbind_listener,
+	.suspend        = default_suspend_listener,
+	.resume         = default_resume_listener,
+	.accept_conn    = sock_accept_conn,
+	.ctrl_init      = sock_conn_ctrl_init,
+	.ctrl_close     = sock_conn_ctrl_close,
+	.connect        = tcp_connect_server,
+	.drain          = sock_drain,
+	.check_events   = sock_check_events,
+	.ignore_events  = sock_ignore_events,
+	.get_info       = tcp_get_info,
+
+	/* binding layer */
+	.rx_suspend     = tcp_suspend_receiver,
+	.rx_resume      = tcp_resume_receiver,
+
+	/* address family */
+	.fam            = &proto_fam_inet4,
+
+	/* socket layer */
+	.proto_type     = PROTO_TYPE_STREAM,
+	.sock_type      = SOCK_STREAM,
+	.sock_prot      = IPPROTO_MPTCP,		/* MPTCP specific */
+	.rx_enable      = sock_enable,
+	.rx_disable     = sock_disable,
+	.rx_unbind      = sock_unbind,
+	.rx_listening   = sock_accepting_conn,
+	.default_iocb   = sock_accept_iocb,
+#ifdef SO_REUSEPORT
+	.flags          = PROTO_F_REUSEPORT_SUPPORTED,
+#endif
+};
+
+INITCALL1(STG_REGISTER, protocol_register, &proto_mptcpv4);
+
+/* Most fields are copied from proto_tcpv6 */
+struct protocol proto_mptcpv6 = {
+	.name           = "mptcpv6",
+
+	/* connection layer */
+	.xprt_type      = PROTO_TYPE_STREAM,
+	.listen         = tcp_bind_listener,
+	.enable         = tcp_enable_listener,
+	.disable        = tcp_disable_listener,
+	.add            = default_add_listener,
+	.unbind         = default_unbind_listener,
+	.suspend        = default_suspend_listener,
+	.resume         = default_resume_listener,
+	.accept_conn    = sock_accept_conn,
+	.ctrl_init      = sock_conn_ctrl_init,
+	.ctrl_close     = sock_conn_ctrl_close,
+	.connect        = tcp_connect_server,
+	.drain          = sock_drain,
+	.check_events   = sock_check_events,
+	.ignore_events  = sock_ignore_events,
+	.get_info       = tcp_get_info,
+
+	/* binding layer */
+	.rx_suspend     = tcp_suspend_receiver,
+	.rx_resume      = tcp_resume_receiver,
+
+	/* address family */
+	.fam            = &proto_fam_inet6,
+
+	/* socket layer */
+	.proto_type     = PROTO_TYPE_STREAM,
+	.sock_type      = SOCK_STREAM,
+	.sock_prot      = IPPROTO_MPTCP,		/* MPTCP specific */
+	.rx_enable      = sock_enable,
+	.rx_disable     = sock_disable,
+	.rx_unbind      = sock_unbind,
+	.rx_listening   = sock_accepting_conn,
+	.default_iocb   = sock_accept_iocb,
+#ifdef SO_REUSEPORT
+	.flags          = PROTO_F_REUSEPORT_SUPPORTED,
+#endif
+};
+
+INITCALL1(STG_REGISTER, protocol_register, &proto_mptcpv6);
+#endif
 
 /* Binds ipv4/ipv6 address <local> to socket <fd>, unless <flags> is set, in which
  * case we try to bind <remote>. <flags> is a 2-bit field consisting of :
@@ -260,22 +361,24 @@ int tcp_bind_socket(int fd, int flags, struct sockaddr_storage *local, struct so
 
 int tcp_connect_server(struct connection *conn, int flags)
 {
-	int fd;
+	int fd, stream_err;
 	struct server *srv;
 	struct proxy *be;
 	struct conn_src *src;
 	int use_fastopen = 0;
 	struct sockaddr_storage *addr;
 
+	BUG_ON(!conn->dst);
+
 	conn->flags |= CO_FL_WAIT_L4_CONN; /* connection in progress */
 
 	switch (obj_type(conn->target)) {
 	case OBJ_TYPE_PROXY:
-		be = objt_proxy(conn->target);
+		be = __objt_proxy(conn->target);
 		srv = NULL;
 		break;
 	case OBJ_TYPE_SERVER:
-		srv = objt_server(conn->target);
+		srv = __objt_server(conn->target);
 		be = srv->proxy;
 		/* Make sure we check that we have data before activating
 		 * TFO, or we could trigger a kernel issue whereby after
@@ -291,73 +394,14 @@ int tcp_connect_server(struct connection *conn, int flags)
 		return SF_ERR_INTERNAL;
 	}
 
-	if (!conn->dst) {
-		conn->flags |= CO_FL_ERROR;
-		return SF_ERR_INTERNAL;
-	}
 
-	fd = conn->handle.fd = sock_create_server_socket(conn);
 
-	if (fd == -1) {
-		qfprintf(stderr, "Cannot get a server socket.\n");
+	/* perform common checks on obtained socket FD, return appropriate Stream Error Flag in case of failure */
+	fd = conn->handle.fd = sock_create_server_socket(conn, be, &stream_err);
+	if (fd == -1)
+		return stream_err;
 
-		if (errno == ENFILE) {
-			conn->err_code = CO_ER_SYS_FDLIM;
-			send_log(be, LOG_EMERG,
-				 "Proxy %s reached system FD limit (maxsock=%d). Please check system tunables.\n",
-				 be->id, global.maxsock);
-		}
-		else if (errno == EMFILE) {
-			conn->err_code = CO_ER_PROC_FDLIM;
-			send_log(be, LOG_EMERG,
-				 "Proxy %s reached process FD limit (maxsock=%d). Please check 'ulimit-n' and restart.\n",
-				 be->id, global.maxsock);
-		}
-		else if (errno == ENOBUFS || errno == ENOMEM) {
-			conn->err_code = CO_ER_SYS_MEMLIM;
-			send_log(be, LOG_EMERG,
-				 "Proxy %s reached system memory limit (maxsock=%d). Please check system tunables.\n",
-				 be->id, global.maxsock);
-		}
-		else if (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT) {
-			conn->err_code = CO_ER_NOPROTO;
-		}
-		else
-			conn->err_code = CO_ER_SOCK_ERR;
-
-		/* this is a resource error */
-		conn->flags |= CO_FL_ERROR;
-		return SF_ERR_RESOURCE;
-	}
-
-	if (fd >= global.maxsock) {
-		/* do not log anything there, it's a normal condition when this option
-		 * is used to serialize connections to a server !
-		 */
-		ha_alert("socket(): not enough free sockets. Raise -n argument. Giving up.\n");
-		close(fd);
-		conn->err_code = CO_ER_CONF_FDLIM;
-		conn->flags |= CO_FL_ERROR;
-		return SF_ERR_PRXCOND; /* it is a configuration limit */
-	}
-
-	if ((fcntl(fd, F_SETFL, O_NONBLOCK)==-1) ||
-	    (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == -1)) {
-		qfprintf(stderr,"Cannot set client socket to non blocking mode.\n");
-		close(fd);
-		conn->err_code = CO_ER_SOCK_ERR;
-		conn->flags |= CO_FL_ERROR;
-		return SF_ERR_INTERNAL;
-	}
-
-	if (master == 1 && (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1)) {
-		ha_alert("Cannot set CLOEXEC on client socket.\n");
-		close(fd);
-		conn->err_code = CO_ER_SOCK_ERR;
-		conn->flags |= CO_FL_ERROR;
-		return SF_ERR_INTERNAL;
-	}
-
+	/* FD is OK, continue with protocol specific settings */
 	if (be->options & PR_O_TCP_SRV_KA) {
 		setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
 
@@ -514,9 +558,9 @@ int tcp_connect_server(struct connection *conn, int flags)
 			/* should normally not happen but if so, indicates that it's OK */
 			conn->flags &= ~CO_FL_WAIT_L4_CONN;
 		}
-		else if (errno == EAGAIN || errno == EADDRINUSE || errno == EADDRNOTAVAIL) {
+		else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EADDRINUSE || errno == EADDRNOTAVAIL) {
 			char *msg;
-			if (errno == EAGAIN || errno == EADDRNOTAVAIL) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EADDRNOTAVAIL) {
 				msg = "no free ports";
 				conn->err_code = CO_ER_FREE_PORTS;
 			}
@@ -555,8 +599,6 @@ int tcp_connect_server(struct connection *conn, int flags)
 		/* connect() == 0, this is great! */
 		conn->flags &= ~CO_FL_WAIT_L4_CONN;
 	}
-
-	conn->flags |= CO_FL_ADDR_TO_SET;
 
 	conn_ctrl_init(conn);       /* registers the FD */
 	HA_ATOMIC_OR(&fdtab[fd].state, FD_LINGER_RISK);  /* close hard if needed */
@@ -609,9 +651,12 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 		goto tcp_return;
 	}
 
+	if (listener->rx.flags & RX_F_MUST_DUP)
+		goto done;
+
 	fd = listener->rx.fd;
 
-	if (listener->options & LI_O_NOLINGER)
+	if (listener->bind_conf->options & BC_O_NOLINGER)
 		setsockopt(fd, SOL_SOCKET, SO_LINGER, &nolinger, sizeof(struct linger));
 	else {
 		struct linger tmplinger;
@@ -626,37 +671,48 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 	}
 
 #if defined(TCP_MAXSEG)
-	if (listener->maxseg > 0) {
+	if (listener->bind_conf->maxseg > 0) {
 		if (setsockopt(fd, IPPROTO_TCP, TCP_MAXSEG,
-			       &listener->maxseg, sizeof(listener->maxseg)) == -1) {
-			chunk_appendf(msg, "%scannot set MSS to %d", msg->data ? ", " : "", listener->maxseg);
+			       &listener->bind_conf->maxseg, sizeof(listener->bind_conf->maxseg)) == -1) {
+			chunk_appendf(msg, "%scannot set MSS to %d, (%s)", msg->data ? ", " : "", listener->bind_conf->maxseg,
+				      strerror(errno));
 			err |= ERR_WARN;
 		}
 	} else {
 		/* we may want to try to restore the default MSS if the socket was inherited */
 		int tmpmaxseg = -1;
 		int defaultmss;
+		int v4 = listener->rx.addr.ss_family == AF_INET;
 		socklen_t len = sizeof(tmpmaxseg);
 
-		if (listener->rx.addr.ss_family == AF_INET)
-			defaultmss = sock_inet_tcp_maxseg_default;
-		else
-			defaultmss = sock_inet6_tcp_maxseg_default;
+		if (listener->rx.proto->sock_prot == IPPROTO_MPTCP) {
+			if (v4)
+				defaultmss = sock_inet_mptcp_maxseg_default;
+			else
+				defaultmss = sock_inet6_mptcp_maxseg_default;
+		} else {
+			if (v4)
+				defaultmss = sock_inet_tcp_maxseg_default;
+			else
+				defaultmss = sock_inet6_tcp_maxseg_default;
+		}
 
 		getsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &tmpmaxseg, &len);
 		if (defaultmss > 0 &&
 		    tmpmaxseg != defaultmss &&
 		    setsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &defaultmss, sizeof(defaultmss)) == -1) {
-			chunk_appendf(msg, "%scannot set MSS to %d", msg->data ? ", " : "", defaultmss);
+			chunk_appendf(msg, "%scannot set MSS to %d, (%s)", msg->data ? ", " : "", defaultmss,
+				      strerror(errno));
 			err |= ERR_WARN;
 		}
 	}
 #endif
 #if defined(TCP_USER_TIMEOUT)
-	if (listener->tcp_ut) {
+	if (listener->bind_conf->tcp_ut) {
 		if (setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT,
-			       &listener->tcp_ut, sizeof(listener->tcp_ut)) == -1) {
-			chunk_appendf(msg, "%scannot set TCP User Timeout", msg->data ? ", " : "");
+			       &listener->bind_conf->tcp_ut, sizeof(listener->bind_conf->tcp_ut)) == -1) {
+			chunk_appendf(msg, "%scannot set TCP User Timeout, (%s)", msg->data ? ", " : "",
+				      strerror(errno));
 			err |= ERR_WARN;
 		}
 	} else
@@ -664,11 +720,12 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 		    sizeof(zero));
 #endif
 #if defined(TCP_DEFER_ACCEPT)
-	if (listener->options & LI_O_DEF_ACCEPT) {
+	if (listener->bind_conf->options & BC_O_DEF_ACCEPT) {
 		/* defer accept by up to one second */
 		int accept_delay = 1;
 		if (setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &accept_delay, sizeof(accept_delay)) == -1) {
-			chunk_appendf(msg, "%scannot enable DEFER_ACCEPT", msg->data ? ", " : "");
+			chunk_appendf(msg, "%scannot enable DEFER_ACCEPT, (%s)", msg->data ? ", " : "",
+				      strerror(errno));
 			err |= ERR_WARN;
 		}
 	} else
@@ -676,11 +733,12 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 		    sizeof(zero));
 #endif
 #if defined(TCP_FASTOPEN)
-	if (listener->options & LI_O_TCP_FO) {
+	if (listener->bind_conf->options & BC_O_TCP_FO) {
 		/* TFO needs a queue length, let's use the configured backlog */
 		int qlen = listener_backlog(listener);
 		if (setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN, &qlen, sizeof(qlen)) == -1) {
-			chunk_appendf(msg, "%scannot enable TCP_FASTOPEN", msg->data ? ", " : "");
+			chunk_appendf(msg, "%scannot enable TCP_FASTOPEN, (%s)", msg->data ? ", " : "",
+				      strerror(errno));
 			err |= ERR_WARN;
 		}
 	} else {
@@ -694,7 +752,8 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 		    qlen != 0) {
 			if (setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN, &zero,
 			    sizeof(zero)) == -1) {
-				chunk_appendf(msg, "%scannot disable TCP_FASTOPEN", msg->data ? ", " : "");
+				chunk_appendf(msg, "%scannot disable TCP_FASTOPEN, (%s)", msg->data ? ", " : "",
+					      strerror(errno));
 				err |= ERR_WARN;
 			}
 		}
@@ -706,37 +765,38 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 	if (!ready && /* only listen if not already done by external process */
 	    listen(fd, listener_backlog(listener)) == -1) {
 		err |= ERR_RETRYABLE | ERR_ALERT;
-		chunk_appendf(msg, "%scannot listen to socket", msg->data ? ", " : "");
+		chunk_appendf(msg, "%scannot listen to socket: (%s)", msg->data ? ", " : "",
+			      strerror(errno));
 		goto tcp_close_return;
 	}
 
 #if !defined(TCP_DEFER_ACCEPT) && defined(SO_ACCEPTFILTER)
 	/* the socket needs to listen first */
-	if (listener->options & LI_O_DEF_ACCEPT) {
+	if (listener->bind_conf->options & BC_O_DEF_ACCEPT) {
 		struct accept_filter_arg accept;
 		memset(&accept, 0, sizeof(accept));
-		strcpy(accept.af_name, "dataready");
+		strlcpy2(accept.af_name, "dataready", sizeof(accept.af_name));
 		if (setsockopt(fd, SOL_SOCKET, SO_ACCEPTFILTER, &accept, sizeof(accept)) == -1) {
-			chunk_appendf(msg, "%scannot enable ACCEPT_FILTER", msg->data ? ", " : "");
+			chunk_appendf(msg, "%scannot enable ACCEPT_FILTER, (%s)", msg->data ? ", " : "",
+				      strerror(errno));
 			err |= ERR_WARN;
 		}
 	}
 #endif
 #if defined(TCP_QUICKACK)
-	if (listener->options & LI_O_NOQUICKACK)
+	if (listener->bind_conf->options & BC_O_NOQUICKACK)
 		setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &zero, sizeof(zero));
 	else
 		setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
 #endif
 
+ done:
 	/* the socket is ready */
 	listener_set_state(listener, LI_LISTEN);
 	goto tcp_return;
 
  tcp_close_return:
-	free_trash_chunk(msg);
-	msg = NULL;
-	close(fd);
+	fd_delete(fd);
  tcp_return:
 	if (msg && errlen && msg->data) {
 		char pn[INET6_ADDRSTRLEN];
@@ -766,22 +826,24 @@ static void tcp_disable_listener(struct listener *l)
 }
 
 /* Suspend a receiver. Returns < 0 in case of failure, 0 if the receiver
- * was totally stopped, or > 0 if correctly suspended.
+ * was totally stopped, or > 0 if correctly suspended. Note that inherited FDs
+ * are neither suspended nor resumed, we only enable/disable polling on them.
  */
 static int tcp_suspend_receiver(struct receiver *rx)
 {
 	const struct sockaddr sa = { .sa_family = AF_UNSPEC };
 	int ret;
 
-	/* we never do that with a shared FD otherwise we'd break it in the
+	/* We never disconnect a shared FD otherwise we'd break it in the
 	 * parent process and any possible subsequent worker inheriting it.
+	 * Thus we just stop receiving from it.
 	 */
 	if (rx->flags & RX_F_INHERITED)
-		return -1;
+		goto done;
 
 	if (connect(rx->fd, &sa, sizeof(sa)) < 0)
 		goto check_already_done;
-
+ done:
 	fd_stop_recv(rx->fd);
 	return 1;
 
@@ -802,7 +864,8 @@ static int tcp_suspend_receiver(struct receiver *rx)
 }
 
 /* Resume a receiver. Returns < 0 in case of failure, 0 if the receiver
- * was totally stopped, or > 0 if correctly suspended.
+ * was totally stopped, or > 0 if correctly resumed. Note that inherited FDs
+ * are neither suspended nor resumed, we only enable/disable polling on them.
  */
 static int tcp_resume_receiver(struct receiver *rx)
 {
@@ -811,12 +874,70 @@ static int tcp_resume_receiver(struct receiver *rx)
 	if (rx->fd < 0)
 		return 0;
 
-	if (listen(rx->fd, listener_backlog(l)) == 0) {
+	if ((rx->flags & RX_F_INHERITED) || listen(rx->fd, listener_backlog(l)) == 0) {
 		fd_want_recv(l->rx.fd);
 		return 1;
 	}
 	return -1;
 }
+
+#ifdef TCP_INFO
+/* Returns some tcp_info data if it's available for <conn> connection into <*info>.
+ * "info_num" represents the required value.
+ * If the function fails it returns 0, otherwise it returns 1 and "result" is filled.
+ */
+static int tcp_get_info(struct connection *conn, long long int *info, int info_num)
+{
+	struct tcp_info tcp_info;
+	socklen_t optlen;
+
+	/* The fd may not be available for the tcp_info struct, and the
+	  syscal can fail. */
+	optlen = sizeof(tcp_info);
+	if ((conn->flags & CO_FL_FDLESS) ||
+	    getsockopt(conn->handle.fd, IPPROTO_TCP, TCP_INFO, &tcp_info, &optlen) == -1)
+		return 0;
+
+	switch (info_num) {
+#if defined(__APPLE__)
+	case 0:  *info = tcp_info.tcpi_rttcur;         break;
+	case 1:  *info = tcp_info.tcpi_rttvar;         break;
+	case 2:  *info = tcp_info.tcpi_tfo_syn_data_acked; break;
+	case 4:  *info = tcp_info.tcpi_tfo_syn_loss;   break;
+	case 5:  *info = tcp_info.tcpi_rto;            break;
+#else
+	/* all other platforms supporting TCP_INFO have these ones */
+	case 0:  *info = tcp_info.tcpi_rtt;            break;
+	case 1:  *info = tcp_info.tcpi_rttvar;         break;
+# if defined(__linux__)
+	/* these ones are common to all Linux versions */
+	case 2:  *info = tcp_info.tcpi_unacked;        break;
+	case 3:  *info = tcp_info.tcpi_sacked;         break;
+	case 4:  *info = tcp_info.tcpi_lost;           break;
+	case 5:  *info = tcp_info.tcpi_retrans;        break;
+	case 6:  *info = tcp_info.tcpi_fackets;        break;
+	case 7:  *info = tcp_info.tcpi_reordering;     break;
+# elif defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+	/* the ones are found on FreeBSD, NetBSD and OpenBSD featuring TCP_INFO */
+	case 2:  *info = tcp_info.__tcpi_unacked;      break;
+	case 3:  *info = tcp_info.__tcpi_sacked;       break;
+	case 4:  *info = tcp_info.__tcpi_lost;         break;
+	case 5:  *info = tcp_info.__tcpi_retrans;      break;
+	case 6:  *info = tcp_info.__tcpi_fackets;      break;
+	case 7:  *info = tcp_info.__tcpi_reordering;   break;
+# endif
+#endif // apple
+	default: return 0;
+	}
+
+	return 1;
+}
+#else
+static int tcp_get_info(struct connection *conn, long long int *info, int info_num)
+{
+	return 0;
+}
+#endif /* TCP_INFO */
 
 
 /*

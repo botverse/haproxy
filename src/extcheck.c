@@ -18,7 +18,6 @@
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -33,6 +32,8 @@
 #include <haproxy/errors.h>
 #include <haproxy/global.h>
 #include <haproxy/list.h>
+#include <haproxy/limits.h>
+#include <haproxy/protocol.h>
 #include <haproxy/proxy.h>
 #include <haproxy/server.h>
 #include <haproxy/signal.h>
@@ -56,7 +57,7 @@ struct extcheck_env {
                                                   * such environment variables are not updatable. */
 #define EXTCHK_SIZE_ULONG     20                 /* max string length for an unsigned long value */
 #define EXTCHK_SIZE_UINT      11                 /* max string length for an unsigned int value */
-#define EXTCHK_SIZE_ADDR      INET6_ADDRSTRLEN+1 /* max string length for an address */
+#define EXTCHK_SIZE_ADDR      256                /* max string length for an IPv4/IPv6/UNIX address */
 
 /* external checks environment variables */
 enum {
@@ -75,6 +76,8 @@ enum {
 	EXTCHK_HAPROXY_SERVER_PORT,	/* the server port if available (or empty) */
 	EXTCHK_HAPROXY_SERVER_MAXCONN,	/* the server max connections */
 	EXTCHK_HAPROXY_SERVER_CURCONN,	/* the current number of connections on the server */
+	EXTCHK_HAPROXY_SERVER_SSL,	/* "1" if the server supports SSL, otherwise zero */
+	EXTCHK_HAPROXY_SERVER_PROTO,	/* the server's configured proto, if any */
 
 	EXTCHK_SIZE
 };
@@ -91,6 +94,8 @@ const struct extcheck_env extcheck_envs[EXTCHK_SIZE] = {
 	[EXTCHK_HAPROXY_SERVER_PORT]    = { "HAPROXY_SERVER_PORT",    EXTCHK_SIZE_UINT },
 	[EXTCHK_HAPROXY_SERVER_MAXCONN] = { "HAPROXY_SERVER_MAXCONN", EXTCHK_SIZE_EVAL_INIT },
 	[EXTCHK_HAPROXY_SERVER_CURCONN] = { "HAPROXY_SERVER_CURCONN", EXTCHK_SIZE_ULONG },
+	[EXTCHK_HAPROXY_SERVER_SSL]     = { "HAPROXY_SERVER_SSL",     EXTCHK_SIZE_UINT },
+	[EXTCHK_HAPROXY_SERVER_PROTO]   = { "HAPROXY_SERVER_PROTO",   EXTCHK_SIZE_EVAL_INIT },
 };
 
 void block_sigchld(void)
@@ -157,7 +162,7 @@ static void pid_list_expire(pid_t pid, int status)
 	HA_SPIN_LOCK(PID_LIST_LOCK, &pid_list_lock);
 	list_for_each_entry(elem, &pid_list, list) {
 		if (elem->pid == pid) {
-			elem->t->expire = now_ms;
+			elem->t->expire = tick_add(now_ms, 0);
 			elem->status = status;
 			elem->exited = 1;
 			task_wakeup(elem->t, TASK_WOKEN_IO);
@@ -263,6 +268,7 @@ int prepare_external_check(struct check *check)
 	int i;
 	const char *path = px->check_path ? px->check_path : DEF_CHECK_PATH;
 	char buf[256];
+	const char *svmode = NULL;
 
 	list_for_each_entry(l, &px->conf.listeners, by_fe)
 		/* Use the first INET, INET6 or UNIX listener */
@@ -299,7 +305,9 @@ int prepare_external_check(struct check *check)
 		port_to_str(&listener->rx.addr, buf, sizeof(buf));
 		check->argv[2] = strdup(buf);
 	}
-	else if (listener->rx.addr.ss_family == AF_UNIX) {
+	else if (listener->rx.addr.ss_family == AF_UNIX ||
+	         listener->rx.addr.ss_family == AF_CUST_ABNS ||
+	         listener->rx.addr.ss_family == AF_CUST_ABNSZ) {
 		const struct sockaddr_un *un;
 
 		un = (struct sockaddr_un *)&listener->rx.addr;
@@ -311,21 +319,9 @@ int prepare_external_check(struct check *check)
 		goto err;
 	}
 
-	if (!check->argv[1] || !check->argv[2]) {
-		ha_alert("Starting [%s:%s] check: out of memory.\n", px->id, s->id);
-		goto err;
-	}
-
+	/* args 3 and 4 are the address, they're replaced on each check */
 	check->argv[3] = calloc(EXTCHK_SIZE_ADDR, sizeof(*check->argv[3]));
 	check->argv[4] = calloc(EXTCHK_SIZE_UINT, sizeof(*check->argv[4]));
-	if (!check->argv[3] || !check->argv[4]) {
-		ha_alert("Starting [%s:%s] check: out of memory.\n", px->id, s->id);
-		goto err;
-	}
-
-	addr_to_str(&s->addr, check->argv[3], EXTCHK_SIZE_ADDR);
-	if (s->addr.ss_family == AF_INET || s->addr.ss_family == AF_INET6)
-		snprintf(check->argv[4], EXTCHK_SIZE_UINT, "%u", s->svc_port);
 
 	for (i = 0; i < 5; i++) {
 		if (!check->argv[i]) {
@@ -347,6 +343,19 @@ int prepare_external_check(struct check *check)
 	EXTCHK_SETENV(check, EXTCHK_HAPROXY_SERVER_PORT, check->argv[4], err);
 	EXTCHK_SETENV(check, EXTCHK_HAPROXY_SERVER_MAXCONN, ultoa_r(s->maxconn, buf, sizeof(buf)), err);
 	EXTCHK_SETENV(check, EXTCHK_HAPROXY_SERVER_CURCONN, ultoa_r(s->cur_sess, buf, sizeof(buf)), err);
+	EXTCHK_SETENV(check, EXTCHK_HAPROXY_SERVER_SSL, s->use_ssl ? "1" : "0", err);
+
+	switch (px->mode) {
+	case PR_MODE_CLI:    svmode = "cli"; break;
+	case PR_MODE_SYSLOG: svmode = "syslog"; break;
+	case PR_MODE_PEERS:  svmode = "peers"; break;
+	case PR_MODE_HTTP:   svmode = (s->mux_proto) ? s->mux_proto->token.ptr : "h1"; break;
+	case PR_MODE_TCP:    svmode = "tcp"; break;
+	case PR_MODE_SPOP:   svmode = "spop"; break;
+	/* all valid cases must be enumerated above, below is to avoid a warning */
+	case PR_MODES:       svmode = "?"; break;
+	}
+	EXTCHK_SETENV(check, EXTCHK_HAPROXY_SERVER_PROTO, svmode, err);
 
 	/* Ensure that we don't leave any hole in check->envp */
 	for (i = 0; i < EXTCHK_SIZE; i++)
@@ -406,6 +415,7 @@ static int connect_proc_chk(struct task *t)
 		extern char **environ;
 		struct rlimit limit;
 		int fd;
+		sa_family_t family;
 
 		/* close all FDs. Keep stdin/stdout/stderr in verbose mode */
 		fd = (global.mode & (MODE_QUIET|MODE_VERBOSE)) == MODE_QUIET ? 0 : 3;
@@ -415,26 +425,49 @@ static int connect_proc_chk(struct task *t)
 		/* restore the initial FD limits */
 		limit.rlim_cur = rlim_fd_cur_at_boot;
 		limit.rlim_max = rlim_fd_max_at_boot;
-		if (setrlimit(RLIMIT_NOFILE, &limit) == -1) {
+		if (raise_rlim_nofile(NULL, &limit) != 0) {
 			getrlimit(RLIMIT_NOFILE, &limit);
 			ha_warning("External check: failed to restore initial FD limits (cur=%u max=%u), using cur=%u max=%u\n",
 				   rlim_fd_cur_at_boot, rlim_fd_max_at_boot,
 				   (unsigned int)limit.rlim_cur, (unsigned int)limit.rlim_max);
 		}
 
-		environ = check->envp;
+		if (global.external_check < 2) {
+			/* fresh new env for each check */
+			environ = check->envp;
+		}
 
 		/* Update some environment variables and command args: curconn, server addr and server port */
 		EXTCHK_SETENV(check, EXTCHK_HAPROXY_SERVER_CURCONN, ultoa_r(s->cur_sess, buf, sizeof(buf)), fail);
 
-		addr_to_str(&s->addr, check->argv[3], EXTCHK_SIZE_ADDR);
-		EXTCHK_SETENV(check, EXTCHK_HAPROXY_SERVER_ADDR, check->argv[3], fail);
+		family = real_family(s->addr.ss_family);
+		if (family == AF_UNIX) {
+			const struct sockaddr_un *un = (struct sockaddr_un *)&s->addr;
+			strlcpy2(check->argv[3], un->sun_path, EXTCHK_SIZE_ADDR);
+			memcpy(check->argv[4], "NOT_USED", 9);
+		} else {
+			addr_to_str(&s->addr, check->argv[3], EXTCHK_SIZE_ADDR);
+			*check->argv[4] = 0; // just in case the address family changed
+			if (family == AF_INET || family == AF_INET6)
+				snprintf(check->argv[4], EXTCHK_SIZE_UINT, "%u", s->svc_port);
+		}
 
-		*check->argv[4] = 0;
-		if (s->addr.ss_family == AF_INET || s->addr.ss_family == AF_INET6)
-			snprintf(check->argv[4], EXTCHK_SIZE_UINT, "%u", s->svc_port);
+		EXTCHK_SETENV(check, EXTCHK_HAPROXY_SERVER_ADDR, check->argv[3], fail);
 		EXTCHK_SETENV(check, EXTCHK_HAPROXY_SERVER_PORT, check->argv[4], fail);
 
+		if (global.external_check >= 2) {
+			/* environment is preserved, let's merge new vars */
+			int i;
+
+			for (i = 0; check->envp[i] && *check->envp[i]; i++) {
+				char *delim = strchr(check->envp[i], '=');
+				if (!delim)
+					continue;
+				*(delim++) = 0;
+				if (setenv(check->envp[i], delim, 1) != 0)
+					goto fail;
+			}
+		}
 		haproxy_unblock_signals();
 		execvp(px->check_command, check->argv);
 		ha_alert("Failed to exec process for external health check: %s. Aborting.\n",
@@ -515,7 +548,7 @@ struct task *process_chk_proc(struct task *t, void *context, unsigned int state)
 				int t_con = tick_add(now_ms, s->proxy->timeout.connect);
 				t->expire = tick_first(t->expire, t_con);
 			}
-			task_set_affinity(t, tid_bit);
+			task_set_thread(t, tid);
 			goto reschedule;
 		}
 
@@ -578,7 +611,7 @@ struct task *process_chk_proc(struct task *t, void *context, unsigned int state)
 			/* a success was detected */
 			check_notify_success(check);
 		}
-		task_set_affinity(t, 1);
+		task_set_thread(t, 0);
 		check->state &= ~CHK_ST_INPROGRESS;
 
 		pid_list_del(check->curpid);
@@ -586,7 +619,7 @@ struct task *process_chk_proc(struct task *t, void *context, unsigned int state)
 		rv = 0;
 		if (global.spread_checks > 0) {
 			rv = srv_getinter(check) * global.spread_checks / 100;
-			rv -= (int) (2 * rv * (ha_random32() / 4294967295.0));
+			rv -= (int) (2 * rv * (statistical_prng() / 4294967295.0));
 		}
 		t->expire = tick_add(now_ms, MS_TO_TICKS(srv_getinter(check) + rv));
 	}

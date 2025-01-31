@@ -43,6 +43,7 @@
 
 #define ERR_CODE	(ERR_RETRYABLE|ERR_FATAL|ERR_ABORT)	/* mask */
 
+extern struct ring *startup_logs;
 
 /* These codes may be used by config parsing functions which detect errors and
  * which need to inform the upper layer about them. They are all prefixed with
@@ -67,6 +68,7 @@ enum {
 void usermsgs_clr(const char *prefix);
 int usermsgs_empty(void);
 const char *usermsgs_str(void);
+extern uint tot_warnings;
 
 /************ Error reporting functions ***********/
 
@@ -122,6 +124,10 @@ void ha_notice(const char *fmt, ...)
  */
 void qfprintf(FILE *out, const char *fmt, ...)
 	__attribute__ ((format(printf, 2, 3)));
+
+void startup_logs_init();
+struct ring *startup_logs_dup(struct ring *src);
+void startup_logs_free(struct ring *r);
 
 #endif /* _HAPROXY_ERRORS_H */
 

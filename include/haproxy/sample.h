@@ -31,12 +31,16 @@
 extern sample_cast_fct sample_casts[SMP_TYPES][SMP_TYPES];
 extern const unsigned int fetch_cap[SMP_SRC_ENTRIES];
 extern const char *smp_to_type[SMP_TYPES];
+int type_to_smp(const char *type);
 
 struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, int line, char **err, struct arg_list *al, char **endptr);
+int sample_parse_expr_cnv(char **str, int *idx, char **endptr, char **err_msg, struct arg_list *al, const char *file, int line,
+                          struct sample_expr *expr, const char *start);
 struct sample_conv *find_sample_conv(const char *kw, int len);
 struct sample *sample_process(struct proxy *px, struct session *sess,
                               struct stream *strm, unsigned int opt,
                               struct sample_expr *expr, struct sample *p);
+int sample_process_cnv(struct sample_expr *expr, struct sample *p);
 struct sample *sample_fetch_as_type(struct proxy *px, struct session *sess,
                                    struct stream *strm, unsigned int opt,
                                    struct sample_expr *expr, int smp_type);
@@ -49,12 +53,15 @@ void sample_register_convs(struct sample_conv_kw_list *psl);
 const char *sample_src_names(unsigned int use);
 const char *sample_ckp_names(unsigned int use);
 struct sample_fetch *find_sample_fetch(const char *kw, int len);
+void smp_dump_fetch_kw(void);
+void smp_dump_conv_kw(void);
 struct sample_fetch *sample_fetch_getnext(struct sample_fetch *current, int *idx);
 struct sample_conv *sample_conv_getnext(struct sample_conv *current, int *idx);
 int smp_resolve_args(struct proxy *p, char **err);
 int smp_check_date_unit(struct arg *args, char **err);
 int smp_expr_output_type(struct sample_expr *expr);
 int c_none(struct sample *smp);
+int c_pseudo(struct sample *smp);
 int smp_dup(struct sample *smp);
 
 /*
@@ -97,7 +104,7 @@ int smp_is_safe(struct sample *smp)
 	case SMP_T_METH:
 		if (smp->data.u.meth.meth != HTTP_METH_OTHER)
 			return 1;
-		/* Fall through */
+		__fallthrough;
 
 	case SMP_T_STR:
 		if (!smp->data.u.str.size || smp->data.u.str.data >= smp->data.u.str.size)
@@ -147,7 +154,7 @@ int smp_is_rw(struct sample *smp)
 	case SMP_T_METH:
 		if (smp->data.u.meth.meth != HTTP_METH_OTHER)
 			return 1;
-		/* Fall through */
+		__fallthrough;
 
 	case SMP_T_STR:
 		if (!smp->data.u.str.size ||

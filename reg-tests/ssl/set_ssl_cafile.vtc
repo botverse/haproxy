@@ -16,7 +16,7 @@
 
 varnishtest "Test the 'set ssl ca-file' feature of the CLI"
 feature cmd "$HAPROXY_PROGRAM -cc 'version_atleast(2.5-dev0)'"
-feature cmd "$HAPROXY_PROGRAM -cc 'feature(OPENSSL)'"
+feature cmd "$HAPROXY_PROGRAM -cc 'feature(OPENSSL) && !ssllib_name_startswith(wolfSSL)'"
 feature cmd "command -v socat"
 feature ignore_unknown_macro
 
@@ -27,7 +27,9 @@ server s1 -repeat 4 {
 
 haproxy h1 -conf {
     global
+    .if !ssllib_name_startswith(AWS-LC)
         tune.ssl.default-dh-param 2048
+    .endif
         tune.ssl.capture-buffer-size 1
         stats socket "${tmpdir}/h1/stats" level admin
 
@@ -43,6 +45,8 @@ haproxy h1 -conf {
 
     listen clear-lst
         bind "fd@${clearlst}"
+       # dummy bind used to test a change when the same crt is used as server and bind
+        bind "fd@${foobarlst}" ssl crt ${testdir}/set_cafile_client.pem ca-file ${testdir}/set_cafile_interCA1.crt verify none
         server s1 "${tmpdir}/ssl.sock" ssl crt ${testdir}/set_cafile_client.pem ca-file ${testdir}/set_cafile_interCA1.crt verify none
 
     listen clear-verified-lst
@@ -77,7 +81,7 @@ client c1 -connect ${h1_clearlst_sock} {
     rxresp
     expect resp.status == 200
     # unable to verify the client certificate
-    expect resp.http.X-SSL-Client-Verify == 21
+    expect resp.http.X-SSL-Client-Verify ~ "20|21"
 } -run
 
 # Set a new ca-file without committing it and check that the new ca-file is not taken into account
@@ -106,7 +110,7 @@ client c1 -connect ${h1_clearlst_sock} {
     rxresp
     expect resp.status == 200
     # unable to verify the client certificate
-    expect resp.http.X-SSL-Client-Verify == 21
+    expect resp.http.X-SSL-Client-Verify ~ "20|21"
 } -run
 
 haproxy h1 -cli {
@@ -136,7 +140,9 @@ client c1 -connect ${h1_clearverifiedlst_sock} {
 # Update the server line's ca-file. The server certificate should now be accepted by
 # the frontend. We replace the single CA by a list of CAs that includes the correct one.
 shell {
-    printf "set ssl ca-file ${testdir}/set_cafile_interCA1.crt <<\n$(cat ${testdir}/set_cafile_interCA1.crt)\n$(cat ${testdir}/set_cafile_interCA2.crt)\n$(cat ${testdir}/set_cafile_rootCA.crt)\n\n" | socat "${tmpdir}/h1/stats" -
+    printf "set ssl ca-file ${testdir}/set_cafile_interCA1.crt <<\n$(cat ${testdir}/set_cafile_interCA1.crt)\n\n" | socat "${tmpdir}/h1/stats" -
+    printf "add ssl ca-file ${testdir}/set_cafile_interCA1.crt <<\n$(cat ${testdir}/set_cafile_interCA2.crt)\n\n" | socat "${tmpdir}/h1/stats" -
+    printf "add ssl ca-file ${testdir}/set_cafile_interCA1.crt <<\n$(cat ${testdir}/set_cafile_rootCA.crt)\n\n" | socat "${tmpdir}/h1/stats" -
     echo "commit ssl ca-file ${testdir}/set_cafile_interCA1.crt" | socat "${tmpdir}/h1/stats" -
 }
 

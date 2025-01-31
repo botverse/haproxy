@@ -29,49 +29,38 @@
 
 /* exported functions from freq_ctr.c */
 ullong freq_ctr_total(const struct freq_ctr *ctr, uint period, int pend);
+int freq_ctr_overshoot_period(const struct freq_ctr *ctr, uint period, uint freq);
+uint update_freq_ctr_period_slow(struct freq_ctr *ctr, uint period, uint inc);
+
+/* Only usable during single threaded startup phase. */
+static inline void preload_freq_ctr(struct freq_ctr *ctr, uint value)
+{
+	ctr->curr_ctr = 0;
+	ctr->prev_ctr = value;
+	ctr->curr_tick = now_ms & ~1;
+}
 
 /* Update a frequency counter by <inc> incremental units. It is automatically
  * rotated if the period is over. It is important that it correctly initializes
- * a null area. This one works on frequency counters which have a period
- * different from one second.
+ * a null area.
  */
-static inline unsigned int update_freq_ctr_period(struct freq_ctr *ctr,
-						  unsigned int period, unsigned int inc)
+static inline uint update_freq_ctr_period(struct freq_ctr *ctr, uint period, uint inc)
 {
-	unsigned int curr_tick;
-	uint32_t now_ms_tmp;
+	uint curr_tick;
 
-	/* atomically update the counter if still within the period, even if
-	 * a rotation is in progress (no big deal).
+	/* our local clock (now_ms) is most of the time strictly equal to
+	 * global_now_ms, and during the edge of the millisecond, global_now_ms
+	 * might have been pushed further by another thread. Given that
+	 * accessing this shared variable is extremely expensive, we first try
+	 * to use our local date, which will be good almost every time. And we
+	 * only switch to the global clock when we're out of the period so as
+	 * to never put a date in the past there.
 	 */
-	for (;; __ha_cpu_relax()) {
-		curr_tick  = HA_ATOMIC_LOAD(&ctr->curr_tick);
-		now_ms_tmp = HA_ATOMIC_LOAD(&global_now_ms);
+	curr_tick  = HA_ATOMIC_LOAD(&ctr->curr_tick);
+	if (likely(now_ms - curr_tick < period))
+		return HA_ATOMIC_ADD_FETCH(&ctr->curr_ctr, inc);
 
-		if (now_ms_tmp - curr_tick < period)
-			return HA_ATOMIC_ADD_FETCH(&ctr->curr_ctr, inc);
-
-		/* a rotation is needed */
-		if (!(curr_tick & 1) &&
-		    HA_ATOMIC_CAS(&ctr->curr_tick, &curr_tick, curr_tick | 0x1))
-			break;
-	}
-
-	/* atomically switch the new period into the old one without losing any
-	 * potential concurrent update. We're the only one performing the rotate
-	 * (locked above), others are only adding positive values to curr_ctr.
-	 */
-	HA_ATOMIC_STORE(&ctr->prev_ctr, HA_ATOMIC_XCHG(&ctr->curr_ctr, inc));
-	curr_tick += period;
-	if (likely(now_ms_tmp - curr_tick >= period)) {
-		/* we missed at least two periods */
-		HA_ATOMIC_STORE(&ctr->prev_ctr, 0);
-		curr_tick = now_ms_tmp;
-	}
-
-	/* release the lock and update the time in case of rotate. */
-	HA_ATOMIC_STORE(&ctr->curr_tick, curr_tick & ~1);
-	return inc;
+	return update_freq_ctr_period_slow(ctr, period, inc);
 }
 
 /* Update a 1-sec frequency counter by <inc> incremental units. It is automatically
@@ -96,7 +85,7 @@ static inline unsigned int update_freq_ctr(struct freq_ctr *ctr, unsigned int in
  * instead which does not have the flapping correction, so that even frequencies
  * as low as one event/period are properly handled.
  */
-static inline uint read_freq_ctr_period(struct freq_ctr *ctr, uint period)
+static inline uint read_freq_ctr_period(const struct freq_ctr *ctr, uint period)
 {
 	ullong total = freq_ctr_total(ctr, period, -1);
 
@@ -106,7 +95,7 @@ static inline uint read_freq_ctr_period(struct freq_ctr *ctr, uint period)
 /* same as read_freq_ctr_period() above except that floats are used for the
  * output so that low rates can be more precise.
  */
-static inline double read_freq_ctr_period_flt(struct freq_ctr *ctr, uint period)
+static inline double read_freq_ctr_period_flt(const struct freq_ctr *ctr, uint period)
 {
 	ullong total = freq_ctr_total(ctr, period, -1);
 
@@ -116,7 +105,7 @@ static inline double read_freq_ctr_period_flt(struct freq_ctr *ctr, uint period)
 /* Read a 1-sec frequency counter taking history into account for missing time
  * in current period.
  */
-static inline unsigned int read_freq_ctr(struct freq_ctr *ctr)
+static inline unsigned int read_freq_ctr(const struct freq_ctr *ctr)
 {
 	return read_freq_ctr_period(ctr, MS_TO_TICKS(1000));
 }
@@ -124,7 +113,7 @@ static inline unsigned int read_freq_ctr(struct freq_ctr *ctr)
 /* same as read_freq_ctr() above except that floats are used for the
  * output so that low rates can be more precise.
  */
-static inline double read_freq_ctr_flt(struct freq_ctr *ctr)
+static inline double read_freq_ctr_flt(const struct freq_ctr *ctr)
 {
 	return read_freq_ctr_period_flt(ctr, MS_TO_TICKS(1000));
 }
@@ -133,7 +122,7 @@ static inline double read_freq_ctr_flt(struct freq_ctr *ctr)
  * while respecting <freq> events per period, and taking into account that
  * <pend> events are already known to be pending. Returns 0 if limit was reached.
  */
-static inline uint freq_ctr_remain_period(struct freq_ctr *ctr, uint period, uint freq, uint pend)
+static inline uint freq_ctr_remain_period(const struct freq_ctr *ctr, uint period, uint freq, uint pend)
 {
 	ullong total = freq_ctr_total(ctr, period, pend);
 	uint avg     = div64_32(total, period);
@@ -147,7 +136,7 @@ static inline uint freq_ctr_remain_period(struct freq_ctr *ctr, uint period, uin
  * while respecting <freq> and taking into account that <pend> events are
  * already known to be pending. Returns 0 if limit was reached.
  */
-static inline unsigned int freq_ctr_remain(struct freq_ctr *ctr, unsigned int freq, unsigned int pend)
+static inline unsigned int freq_ctr_remain(const struct freq_ctr *ctr, unsigned int freq, unsigned int pend)
 {
 	return freq_ctr_remain_period(ctr, MS_TO_TICKS(1000), freq, pend);
 }
@@ -158,7 +147,7 @@ static inline unsigned int freq_ctr_remain(struct freq_ctr *ctr, unsigned int fr
  * time, which will be rounded down 1ms for better accuracy, with a minimum
  * of one ms.
  */
-static inline uint next_event_delay_period(struct freq_ctr *ctr, uint period, uint freq, uint pend)
+static inline uint next_event_delay_period(const struct freq_ctr *ctr, uint period, uint freq, uint pend)
 {
 	ullong total = freq_ctr_total(ctr, period, pend);
 	ullong limit = (ullong)freq * period;
@@ -183,7 +172,7 @@ static inline uint next_event_delay_period(struct freq_ctr *ctr, uint period, ui
  * the wait time, which will be rounded down 1ms for better accuracy, with a
  * minimum of one ms.
  */
-static inline unsigned int next_event_delay(struct freq_ctr *ctr, unsigned int freq, unsigned int pend)
+static inline unsigned int next_event_delay(const struct freq_ctr *ctr, unsigned int freq, unsigned int pend)
 {
 	return next_event_delay_period(ctr, MS_TO_TICKS(1000), freq, pend);
 }
@@ -362,8 +351,43 @@ static inline unsigned int swrate_add_scaled(unsigned int *sum, unsigned int n, 
 
 	old_sum = *sum;
 	do {
-		new_sum = old_sum + v * s - div64_32((unsigned long long)(old_sum + n) * s, n);
+		new_sum = old_sum + v * s - div64_32((unsigned long long)old_sum * s + n - 1, n);
 	} while (!HA_ATOMIC_CAS(sum, &old_sum, new_sum) && __ha_cpu_relax());
+	return new_sum;
+}
+
+/* opportunistic versions of the functions above: an attempt is made to update
+ * the value, but in case of contention, it's not retried. This is fine when
+ * rough estimates are needed and speed is preferred over accuracy.
+ */
+
+static inline uint swrate_add_opportunistic(uint *sum, uint n, uint v)
+{
+	uint new_sum, old_sum;
+
+	old_sum = *sum;
+	new_sum = old_sum - (old_sum + n - 1) / n + v;
+	HA_ATOMIC_CAS(sum, &old_sum, new_sum);
+	return new_sum;
+}
+
+static inline uint swrate_add_dynamic_opportunistic(uint *sum, uint n, uint v)
+{
+	uint new_sum, old_sum;
+
+	old_sum = *sum;
+	new_sum = old_sum - (n ? (old_sum + n - 1) / n : 0) + v;
+	HA_ATOMIC_CAS(sum, &old_sum, new_sum);
+	return new_sum;
+}
+
+static inline uint swrate_add_scaled_opportunistic(uint *sum, uint n, uint v, uint s)
+{
+	uint new_sum, old_sum;
+
+	old_sum = *sum;
+	new_sum = old_sum + v * s - div64_32((unsigned long long)old_sum * s + n - 1, n);
+	HA_ATOMIC_CAS(sum, &old_sum, new_sum);
 	return new_sum;
 }
 

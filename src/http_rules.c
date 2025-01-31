@@ -50,6 +50,21 @@ struct action_kw_list http_after_res_keywords = {
        .list = LIST_HEAD_INIT(http_after_res_keywords.list)
 };
 
+void http_req_keywords_register(struct action_kw_list *kw_list)
+{
+	LIST_APPEND(&http_req_keywords.list, &kw_list->list);
+}
+
+void http_res_keywords_register(struct action_kw_list *kw_list)
+{
+	LIST_APPEND(&http_res_keywords.list, &kw_list->list);
+}
+
+void http_after_res_keywords_register(struct action_kw_list *kw_list)
+{
+	LIST_APPEND(&http_after_res_keywords.list, &kw_list->list);
+}
+
 /*
  * Return the struct http_req_action_kw associated to a keyword.
  */
@@ -84,7 +99,7 @@ struct act_rule *parse_http_req_cond(const char **args, const char *file, int li
 	rule = new_act_rule(ACT_F_HTTP_REQ, file, linenum);
 	if (!rule) {
 		ha_alert("parsing [%s:%d]: out of memory.\n", file, linenum);
-		goto out_err;
+		goto out;
 	}
 
 	if (((custom = action_http_req_custom(args[0])) != NULL)) {
@@ -148,7 +163,8 @@ struct act_rule *parse_http_req_cond(const char **args, const char *file, int li
 
 	return rule;
  out_err:
-	free(rule);
+	free_act_rule(rule);
+ out:
 	return NULL;
 }
 
@@ -162,7 +178,7 @@ struct act_rule *parse_http_res_cond(const char **args, const char *file, int li
 	rule = new_act_rule(ACT_F_HTTP_RES, file, linenum);
 	if (!rule) {
 		ha_alert("parsing [%s:%d]: out of memory.\n", file, linenum);
-		goto out_err;
+		goto out;
 	}
 
 	if (((custom = action_http_res_custom(args[0])) != NULL)) {
@@ -226,7 +242,8 @@ struct act_rule *parse_http_res_cond(const char **args, const char *file, int li
 
 	return rule;
  out_err:
-	free(rule);
+	free_act_rule(rule);
+ out:
 	return NULL;
 }
 
@@ -241,7 +258,7 @@ struct act_rule *parse_http_after_res_cond(const char **args, const char *file, 
 	rule = new_act_rule(ACT_F_HTTP_RES, file, linenum);
 	if (!rule) {
 		ha_alert("parsing [%s:%d]: out of memory.\n", file, linenum);
-		goto out_err;
+		goto out;
 	}
 
 	if (((custom = action_http_after_res_custom(args[0])) != NULL)) {
@@ -295,8 +312,22 @@ struct act_rule *parse_http_after_res_cond(const char **args, const char *file, 
 
 	return rule;
  out_err:
-	free(rule);
+	free_act_rule(rule);
+ out:
 	return NULL;
+}
+
+/* completely free redirect rule */
+void http_free_redirect_rule(struct redirect_rule *rdr)
+{
+	free_acl_cond(rdr->cond);
+	free(rdr->rdr_str);
+	if ((rdr->flags & REDIRECT_FLAG_COOKIE_FMT))
+		lf_expr_deinit(&rdr->cookie.fmt);
+	else
+		istfree(&rdr->cookie.str);
+	lf_expr_deinit(&rdr->rdr_fmt);
+	free(rdr);
 }
 
 /* Parses a redirect rule. Returns the redirect rule on success or NULL on error,
@@ -307,13 +338,14 @@ struct act_rule *parse_http_after_res_cond(const char **args, const char *file, 
 struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, struct proxy *curproxy,
                                                const char **args, char **errmsg, int use_fmt, int dir)
 {
-	struct redirect_rule *rule;
+	struct redirect_rule *rule = NULL;
 	int cur_arg;
 	int type = REDIRECT_TYPE_NONE;
 	int code = 302;
 	const char *destination = NULL;
 	const char *cookie = NULL;
 	int cookie_set = 0;
+	size_t cookie_len = 0;
 	unsigned int flags = (!dir ? REDIRECT_FLAG_FROM_REQ : REDIRECT_FLAG_NONE);
 	struct acl_cond *cond = NULL;
 
@@ -350,6 +382,14 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 			cookie = args[cur_arg];
 			cookie_set = 1;
 		}
+		else if (strcmp(args[cur_arg], "set-cookie-fmt") == 0) {
+			if (!*args[cur_arg + 1])
+				goto missing_arg;
+
+			cur_arg++;
+			cookie = args[cur_arg];
+			cookie_set = 2;
+		}
 		else if (strcmp(args[cur_arg], "clear-cookie") == 0) {
 			if (!*args[cur_arg + 1])
 				goto missing_arg;
@@ -368,11 +408,14 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 				memprintf(errmsg,
 				          "'%s': unsupported HTTP code '%s' (must be one of 301, 302, 303, 307 or 308)",
 				          args[cur_arg - 1], args[cur_arg]);
-				return NULL;
+				goto err;
 			}
 		}
 		else if (strcmp(args[cur_arg], "drop-query") == 0) {
 			flags |= REDIRECT_FLAG_DROP_QS;
+		}
+		else if (strcmp(args[cur_arg], "keep-query") == 0) {
+			flags |= REDIRECT_FLAG_KEEP_QS;
 		}
 		else if (strcmp(args[cur_arg], "append-slash") == 0) {
 			flags |= REDIRECT_FLAG_APPEND_SLASH;
@@ -385,40 +428,41 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 			cond = build_acl_cond(file, linenum, &curproxy->acl, curproxy, (const char **)args + cur_arg, errmsg);
 			if (!cond) {
 				memprintf(errmsg, "error in condition: %s", *errmsg);
-				return NULL;
+				goto err;
 			}
 			break;
 		}
 		else {
 			memprintf(errmsg,
-			          "expects 'code', 'prefix', 'location', 'scheme', 'set-cookie', 'clear-cookie', 'drop-query', 'ignore-empty' or 'append-slash' (was '%s')",
+			          "expects 'code', 'prefix', 'location', 'scheme', 'set-cookie', 'set-cookie-fmt',"
+				  " 'clear-cookie', 'drop-query', 'keep-query', 'ignore-empty' or 'append-slash' (was '%s')",
 			          args[cur_arg]);
-			return NULL;
+			goto err;
 		}
 		cur_arg++;
 	}
 
 	if (type == REDIRECT_TYPE_NONE) {
 		memprintf(errmsg, "redirection type expected ('prefix', 'location', or 'scheme')");
-		return NULL;
+		goto err;
 	}
 
 	if (dir && type != REDIRECT_TYPE_LOCATION) {
 		memprintf(errmsg, "response only supports redirect type 'location'");
-		return NULL;
+		goto err;
 	}
 
 	rule = calloc(1, sizeof(*rule));
-	if (!rule) {
-		memprintf(errmsg, "parsing [%s:%d]: out of memory.", file, linenum);
-		return NULL;
-	}
+	if (!rule)
+		goto out_of_memory;
 	rule->cond = cond;
-	LIST_INIT(&rule->rdr_fmt);
+	lf_expr_init(&rule->rdr_fmt);
 
 	if (!use_fmt) {
 		/* old-style static redirect rule */
 		rule->rdr_str = strdup(destination);
+		if (!rule->rdr_str)
+			goto out_of_memory;
 		rule->rdr_len = strlen(destination);
 	}
 	else {
@@ -436,11 +480,8 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 			cap |= (dir ? SMP_VAL_BE_HRS_HDR : SMP_VAL_BE_HRQ_HDR);
 		if (!(type == REDIRECT_TYPE_PREFIX && destination[0] == '/' && destination[1] == '\0')) {
 			if (!parse_logformat_string(destination, curproxy, &rule->rdr_fmt, LOG_OPT_HTTP, cap, errmsg)) {
-				return  NULL;
+				goto err;
 			}
-			free(curproxy->conf.lfs_file);
-			curproxy->conf.lfs_file = strdup(curproxy->conf.args.file);
-			curproxy->conf.lfs_line = curproxy->conf.args.line;
 		}
 	}
 
@@ -448,17 +489,38 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 		/* depending on cookie_set, either we want to set the cookie, or to clear it.
 		 * a clear consists in appending "; path=/; Max-Age=0;" at the end.
 		 */
-		rule->cookie_len = strlen(cookie);
-		if (cookie_set) {
-			rule->cookie_str = malloc(rule->cookie_len + 10);
-			memcpy(rule->cookie_str, cookie, rule->cookie_len);
-			memcpy(rule->cookie_str + rule->cookie_len, "; path=/;", 10);
-			rule->cookie_len += 9;
-		} else {
-			rule->cookie_str = malloc(rule->cookie_len + 21);
-			memcpy(rule->cookie_str, cookie, rule->cookie_len);
-			memcpy(rule->cookie_str + rule->cookie_len, "; path=/; Max-Age=0;", 21);
-			rule->cookie_len += 20;
+		cookie_len = strlen(cookie);
+		if (cookie_set == 1) { // set-cookie
+			rule->cookie.str = istalloc(cookie_len+9);
+			if (!isttest(rule->cookie.str))
+				goto out_of_memory;
+			istcpy(&rule->cookie.str, ist2(cookie, cookie_len), cookie_len);
+			istcat(&rule->cookie.str, ist2("; path=/;", 9), cookie_len+10);
+		}
+		else if (cookie_set == 2) { // set-cookie-fmt
+			int cap = 0;
+
+			lf_expr_init(&rule->cookie.fmt);
+			curproxy->conf.args.ctx = ARGC_RDR;
+			if (curproxy->cap & PR_CAP_FE)
+				cap |= (dir ? SMP_VAL_FE_HRS_HDR : SMP_VAL_FE_HRQ_HDR);
+			if (curproxy->cap & PR_CAP_BE)
+				cap |= (dir ? SMP_VAL_BE_HRS_HDR : SMP_VAL_BE_HRQ_HDR);
+
+			chunk_memcpy(&trash, cookie, cookie_len);
+			chunk_strcat(&trash, "; path=/;");
+			if (!parse_logformat_string(trash.area, curproxy, &rule->cookie.fmt, LOG_OPT_HTTP, cap, errmsg)) {
+				goto err;
+			}
+
+			flags |= REDIRECT_FLAG_COOKIE_FMT;
+		}
+		else { // clear-cookie
+			rule->cookie.str = istalloc(cookie_len+20);
+			if (!isttest(rule->cookie.str))
+				goto out_of_memory;
+			istcpy(&rule->cookie.str, ist2(cookie, cookie_len), cookie_len);
+			istcat(&rule->cookie.str, ist2("; path=/; Max-Age=0;", 20), cookie_len+21);
 		}
 	}
 	rule->type = type;
@@ -469,12 +531,18 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 
  missing_arg:
 	memprintf(errmsg, "missing argument for '%s'", args[cur_arg]);
-	return NULL;
-}
+	goto err;
+ out_of_memory:
+	memprintf(errmsg, "parsing [%s:%d]: out of memory.", file, linenum);
+ err:
+	if (rule)
+		http_free_redirect_rule(rule);
+	else if (cond) {
+		/* rule not yet allocated, but cond already is */
+		free_acl_cond(cond);
+	}
 
-__attribute__((constructor))
-static void __http_rules_init(void)
-{
+	return NULL;
 }
 
 /*

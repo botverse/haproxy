@@ -26,9 +26,9 @@
 
 #ifdef DEBUG_OT
 #  ifdef DEBUG_OT_SYSTIME
-#     define FLT_OT_DBG_FMT(f)      "[% 2d] %ld.%06ld [" FLT_OT_SCOPE "]: " f, tid, now.tv_sec, now.tv_usec
+#     define FLT_OT_DBG_FMT(f)      "[% 2d] %ld.%06ld [" FLT_OT_SCOPE "]: " f, tid, date.tv_sec, date.tv_usec
 #  else
-#     define FLT_OT_DBG_FMT(f)      "[% 2d] %11.6f [" FLT_OT_SCOPE "]: " f, tid, FLT_OT_TV_UDIFF(&(flt_ot_debug.start), &now) / 1e6
+#     define FLT_OT_DBG_FMT(f)      "[% 2d] %11.6f [" FLT_OT_SCOPE "]: " f, tid, FLT_OT_TV_UDIFF(&(flt_ot_debug.start), &date) / 1e6
 #  endif
 #  define FLT_OT_DBG_INDENT         "                                                                                "
 #  define FLT_OT_DBG(l,f, ...)                                                             \
@@ -39,8 +39,12 @@
 	} while (0)
 #  define FLT_OT_FUNC(f, ...)       do { FLT_OT_DBG(1, "%s(" f ") {", __func__, ##__VA_ARGS__); dbg_indent_level += 3; } while (0)
 #  define FLT_OT_RETURN(a)          do { dbg_indent_level -= 3; FLT_OT_DBG(1, "}"); return a; } while (0)
+#  define FLT_OT_RETURN_EX(a,t,f)   do { dbg_indent_level -= 3; { t _r = (a); FLT_OT_DBG(1, "} = " f, _r); return _r; } } while (0)
+#  define FLT_OT_RETURN_INT(a)      FLT_OT_RETURN_EX((a), int, "%d")
+#  define FLT_OT_RETURN_PTR(a)      FLT_OT_RETURN_EX((a), void *, "%p")
 #  define FLT_OT_DBG_IFDEF(a,b)     a
 #  define FLT_OT_DBG_ARGS(a, ...)   a, ##__VA_ARGS__
+#  define FLT_OT_DBG_BUF(a,b)       do { FLT_OT_DBG((a), "%p:{ %zu %p %zu %zu }", (b), (b)->size, (b)->area, (b)->data, (b)->head); } while (0)
 
 struct flt_ot_debug {
 #ifndef DEBUG_OT_SYSTIME
@@ -58,8 +62,12 @@ extern struct flt_ot_debug flt_ot_debug;
 #  define FLT_OT_DBG(...)           while (0)
 #  define FLT_OT_FUNC(...)          while (0)
 #  define FLT_OT_RETURN(a)          return a
+#  define FLT_OT_RETURN_EX(a,t,f)   return a
+#  define FLT_OT_RETURN_INT(a)      return a
+#  define FLT_OT_RETURN_PTR(a)      return a
 #  define FLT_OT_DBG_IFDEF(a,b)     b
 #  define FLT_OT_DBG_ARGS(...)
+#  define FLT_OT_DBG_BUF(a,b)       while (0)
 #endif /* DEBUG_OT */
 
 /*

@@ -26,7 +26,9 @@
 
 #include <haproxy/api.h>
 #include <haproxy/buf.h>
+#include <haproxy/sock.h>
 #include <haproxy/connection-t.h>
+#include <haproxy/stconn-t.h>
 #include <haproxy/fd.h>
 #include <haproxy/list.h>
 #include <haproxy/listener-t.h>
@@ -37,20 +39,22 @@
 #include <haproxy/task-t.h>
 
 extern struct pool_head *pool_head_connection;
-extern struct pool_head *pool_head_connstream;
 extern struct pool_head *pool_head_conn_hash_node;
 extern struct pool_head *pool_head_sockaddr;
-extern struct pool_head *pool_head_authority;
+extern struct pool_head *pool_head_pp_tlv_128;
+extern struct pool_head *pool_head_pp_tlv_256;
+extern struct pool_head *pool_head_uniqueid;
 extern struct xprt_ops *registered_xprt[XPRT_ENTRIES];
 extern struct mux_proto_list mux_proto_list;
 extern struct mux_stopping_data mux_stopping_data[MAX_THREADS];
 
 #define IS_HTX_CONN(conn) ((conn)->mux && ((conn)->mux->flags & MX_FL_HTX))
-#define IS_HTX_CS(cs)     (IS_HTX_CONN((cs)->conn))
 
 /* receive a PROXY protocol header over a connection */
 int conn_recv_proxy(struct connection *conn, int flag);
-int make_proxy_line(char *buf, int buf_len, struct server *srv, struct connection *remote, struct stream *strm);
+int conn_send_proxy(struct connection *conn, unsigned int flag);
+int make_proxy_line(char *buf, int buf_len, struct server *srv, struct connection *remote, struct stream *strm, struct session *sess);
+struct conn_tlv_list *conn_get_tlv(struct connection *conn, int type);
 
 int conn_append_debug_info(struct buffer *buf, const struct connection *conn, const char *pfx);
 
@@ -80,31 +84,41 @@ int conn_install_mux_be(struct connection *conn, void *ctx, struct session *sess
                         const struct mux_ops *force_mux_ops);
 int conn_install_mux_chk(struct connection *conn, void *ctx, struct session *sess);
 
-void conn_delete_from_tree(struct ebmb_node *node);
+void conn_delete_from_tree(struct connection *conn);
 
 void conn_init(struct connection *conn, void *target);
 struct connection *conn_new(void *target);
 void conn_free(struct connection *conn);
+void conn_release(struct connection *conn);
+void conn_set_errno(struct connection *conn, int err);
 struct conn_hash_node *conn_alloc_hash_node(struct connection *conn);
 struct sockaddr_storage *sockaddr_alloc(struct sockaddr_storage **sap, const struct sockaddr_storage *orig, socklen_t len);
 void sockaddr_free(struct sockaddr_storage **sap);
-void cs_free(struct conn_stream *cs);
-struct conn_stream *cs_new(struct connection *conn, void *target);
 
 
 /* connection hash stuff */
 uint64_t conn_calculate_hash(const struct conn_hash_params *params);
-uint64_t conn_hash_prehash(char *buf, size_t size);
-void conn_hash_update(char *buf, size_t *idx,
-                      const void *data, size_t size,
-                      enum conn_hash_params_t *flags,
-                      enum conn_hash_params_t type);
-uint64_t conn_hash_digest(char *buf, size_t bufsize,
-                          enum conn_hash_params_t flags);
+uint64_t conn_hash_prehash(const char *buf, size_t size);
+
+int conn_reverse(struct connection *conn);
+
+const char *conn_err_code_name(struct connection *c);
 const char *conn_err_code_str(struct connection *c);
 int xprt_add_hs(struct connection *conn);
+void register_mux_proto(struct mux_proto_list *list);
+
+static inline void conn_report_term_evt(struct connection *conn, enum term_event_loc loc, unsigned char type);
 
 extern struct idle_conns idle_conns[MAX_THREADS];
+
+/* set conn->err_code to any CO_ER_* code if it was not set yet, otherwise
+ * does nothing.
+ */
+static inline void conn_set_errcode(struct connection *conn, int err_code)
+{
+	if (!conn->err_code)
+		conn->err_code = err_code;
+}
 
 /* returns true if the transport layer is ready */
 static inline int conn_xprt_ready(const struct connection *conn)
@@ -201,6 +215,16 @@ static inline void conn_stop_tracking(struct connection *conn)
 	conn->flags &= ~CO_FL_XPRT_TRACKED;
 }
 
+/* returns the connection's FD if the connection exists, its control is ready,
+ * and the connection has an FD, otherwise -1.
+ */
+static inline int conn_fd(const struct connection *conn)
+{
+	if (!conn || !conn_ctrl_ready(conn) || (conn->flags & CO_FL_FDLESS))
+		return -1;
+	return conn->handle.fd;
+}
+
 /* read shutdown, called from the rcv_buf/rcv_pipe handlers when
  * detecting an end of connection.
  */
@@ -211,6 +235,7 @@ static inline void conn_sock_read0(struct connection *c)
 		/* we don't risk keeping ports unusable if we found the
 		 * zero from the other side.
 		 */
+		BUG_ON(c->flags & CO_FL_FDLESS);
 		HA_ATOMIC_AND(&fdtab[c->handle.fd].state, ~FD_LINGER_RISK);
 	}
 }
@@ -227,9 +252,11 @@ static inline void conn_sock_shutw(struct connection *c, int clean)
 		/* don't perform a clean shutdown if we're going to reset or
 		 * if the shutr was already received.
 		 */
+		BUG_ON(c->flags & CO_FL_FDLESS);
 		if (!(c->flags & CO_FL_SOCK_RD_SH) && clean)
 			shutdown(c->handle.fd, SHUT_WR);
 	}
+	conn_report_term_evt(c, tevt_loc_fd, fd_tevt_type_shutw);
 }
 
 static inline void conn_xprt_shutw(struct connection *c)
@@ -246,52 +273,6 @@ static inline void conn_xprt_shutw_hard(struct connection *c)
 		c->xprt->shutw(c, c->xprt_ctx, 0);
 }
 
-/* shut read */
-static inline void cs_shutr(struct conn_stream *cs, enum cs_shr_mode mode)
-{
-	if (cs->flags & CS_FL_SHR)
-		return;
-
-	/* clean data-layer shutdown */
-	if (cs->conn->mux && cs->conn->mux->shutr)
-		cs->conn->mux->shutr(cs, mode);
-	cs->flags |= (mode == CS_SHR_DRAIN) ? CS_FL_SHRD : CS_FL_SHRR;
-}
-
-/* shut write */
-static inline void cs_shutw(struct conn_stream *cs, enum cs_shw_mode mode)
-{
-	if (cs->flags & CS_FL_SHW)
-		return;
-
-	/* clean data-layer shutdown */
-	if (cs->conn->mux && cs->conn->mux->shutw)
-		cs->conn->mux->shutw(cs, mode);
-	cs->flags |= (mode == CS_SHW_NORMAL) ? CS_FL_SHWN : CS_FL_SHWS;
-}
-
-/* completely close a conn_stream (but do not detach it) */
-static inline void cs_close(struct conn_stream *cs)
-{
-	cs_shutw(cs, CS_SHW_SILENT);
-	cs_shutr(cs, CS_SHR_RESET);
-}
-
-/* completely close a conn_stream after draining possibly pending data (but do not detach it) */
-static inline void cs_drain_and_close(struct conn_stream *cs)
-{
-	cs_shutw(cs, CS_SHW_SILENT);
-	cs_shutr(cs, CS_SHR_DRAIN);
-}
-
-/* sets CS_FL_ERROR or CS_FL_ERR_PENDING on the cs */
-static inline void cs_set_error(struct conn_stream *cs)
-{
-	if (cs->flags & CS_FL_EOS)
-		cs->flags |= CS_FL_ERROR;
-	else
-		cs->flags |= CS_FL_ERR_PENDING;
-}
 
 /* detect sock->data read0 transition */
 static inline int conn_xprt_read0_pending(struct connection *c)
@@ -322,16 +303,6 @@ static inline int conn_prepare(struct connection *conn, const struct protocol *p
 	return ret;
 }
 
-/*
- * Initializes all required fields for a new conn_strema.
- */
-static inline void cs_init(struct conn_stream *cs, struct connection *conn)
-{
-	cs->obj_type = OBJ_TYPE_CS;
-	cs->flags = CS_FL_NONE;
-	cs->conn = conn;
-}
-
 /* returns 0 if the connection is valid and is a frontend connection, otherwise
  * returns 1 indicating it's a backend connection. And uninitialized connection
  * also returns 1 to better handle the usage in the middle of initialization.
@@ -360,22 +331,6 @@ static inline void conn_set_private(struct connection *conn)
 	}
 }
 
-/* Retrieves any valid conn_stream from this connection, preferably the first
- * valid one. The purpose is to be able to figure one other end of a private
- * connection for purposes like source binding or proxy protocol header
- * emission. In such cases, any conn_stream is expected to be valid so the
- * mux is encouraged to return the first one it finds. If the connection has
- * no mux or the mux has no get_first_cs() method or the mux has no valid
- * conn_stream, NULL is returned. The output pointer is purposely marked
- * const to discourage the caller from modifying anything there.
- */
-static inline const struct conn_stream *cs_get_first(const struct connection *conn)
-{
-	if (!conn || !conn->mux || !conn->mux->get_first_cs)
-		return NULL;
-	return conn->mux->get_first_cs(conn);
-}
-
 static inline void conn_force_unsubscribe(struct connection *conn)
 {
 	if (!conn->subs)
@@ -384,46 +339,16 @@ static inline void conn_force_unsubscribe(struct connection *conn)
 	conn->subs = NULL;
 }
 
-/* Release a conn_stream */
-static inline void cs_destroy(struct conn_stream *cs)
-{
-	if (cs->conn->mux)
-		cs->conn->mux->detach(cs);
-	else {
-		/* It's too early to have a mux, let's just destroy
-		 * the connection
-		 */
-		struct connection *conn = cs->conn;
-
-		conn_stop_tracking(conn);
-		conn_full_close(conn);
-		if (conn->destroy_cb)
-			conn->destroy_cb(conn);
-		conn_free(conn);
-	}
-	cs_free(cs);
-}
-
-/* Returns the conn from a cs. If cs is NULL, returns NULL */
-static inline struct connection *cs_conn(const struct conn_stream *cs)
-{
-	return cs ? cs->conn : NULL;
-}
-
 /* Returns the source address of the connection or NULL if not set */
 static inline const struct sockaddr_storage *conn_src(struct connection *conn)
 {
-	if (conn->flags & CO_FL_ADDR_FROM_SET)
-		return conn->src;
-	return NULL;
+	return conn->src;
 }
 
 /* Returns the destination address of the connection or NULL if not set */
 static inline const struct sockaddr_storage *conn_dst(struct connection *conn)
 {
-	if (conn->flags & CO_FL_ADDR_TO_SET)
-		return conn->dst;
-	return NULL;
+	return conn->dst;
 }
 
 /* Retrieves the connection's original source address. Returns non-zero on
@@ -432,20 +357,35 @@ static inline const struct sockaddr_storage *conn_dst(struct connection *conn)
  */
 static inline int conn_get_src(struct connection *conn)
 {
-	if (conn->flags & CO_FL_ADDR_FROM_SET)
+	if (conn->src)
 		return 1;
 
-	if (!conn_ctrl_ready(conn) || !conn->ctrl->fam->get_src)
-		return 0;
+	if (!conn_ctrl_ready(conn))
+		goto fail;
 
 	if (!sockaddr_alloc(&conn->src, NULL, 0))
-		return 0;
+		goto fail;
 
-	if (conn->ctrl->fam->get_src(conn->handle.fd, (struct sockaddr *)conn->src,
+	/* some stream protocols may provide their own get_src/dst functions */
+	if (conn->ctrl->get_src &&
+	    conn->ctrl->get_src(conn, (struct sockaddr *)conn->src, sizeof(*conn->src)) != -1)
+		goto done;
+
+	if (conn->ctrl->proto_type != PROTO_TYPE_STREAM)
+		goto fail;
+
+	/* most other socket-based stream protocols will use their socket family's functions */
+	if (conn->ctrl->fam->get_src && !(conn->flags & CO_FL_FDLESS) &&
+	    conn->ctrl->fam->get_src(conn->handle.fd, (struct sockaddr *)conn->src,
 	                        sizeof(*conn->src),
-	                        obj_type(conn->target) != OBJ_TYPE_LISTENER) == -1)
-		return 0;
-	conn->flags |= CO_FL_ADDR_FROM_SET;
+	                        obj_type(conn->target) != OBJ_TYPE_LISTENER) != -1)
+		goto done;
+
+	/* no other means */
+ fail:
+	sockaddr_free(&conn->src);
+	return 0;
+ done:
 	return 1;
 }
 
@@ -455,20 +395,35 @@ static inline int conn_get_src(struct connection *conn)
  */
 static inline int conn_get_dst(struct connection *conn)
 {
-	if (conn->flags & CO_FL_ADDR_TO_SET)
+	if (conn->dst)
 		return 1;
 
-	if (!conn_ctrl_ready(conn) || !conn->ctrl->fam->get_dst)
-		return 0;
+	if (!conn_ctrl_ready(conn))
+		goto fail;
 
 	if (!sockaddr_alloc(&conn->dst, NULL, 0))
-		return 0;
+		goto fail;
 
-	if (conn->ctrl->fam->get_dst(conn->handle.fd, (struct sockaddr *)conn->dst,
+	/* some stream protocols may provide their own get_src/dst functions */
+	if (conn->ctrl->get_dst &&
+	    conn->ctrl->get_dst(conn, (struct sockaddr *)conn->dst, sizeof(*conn->dst)) != -1)
+		goto done;
+
+	if (conn->ctrl->proto_type != PROTO_TYPE_STREAM)
+		goto fail;
+
+	/* most other socket-based stream protocols will use their socket family's functions */
+	if (conn->ctrl->fam->get_dst && !(conn->flags & CO_FL_FDLESS) &&
+	    conn->ctrl->fam->get_dst(conn->handle.fd, (struct sockaddr *)conn->dst,
 	                        sizeof(*conn->dst),
-	                        obj_type(conn->target) != OBJ_TYPE_LISTENER) == -1)
-		return 0;
-	conn->flags |= CO_FL_ADDR_TO_SET;
+	                        obj_type(conn->target) != OBJ_TYPE_LISTENER) != -1)
+		goto done;
+
+	/* no other means */
+ fail:
+	sockaddr_free(&conn->dst);
+	return 0;
+ done:
 	return 1;
 }
 
@@ -478,22 +433,10 @@ static inline int conn_get_dst(struct connection *conn)
  */
 static inline void conn_set_tos(const struct connection *conn, int tos)
 {
-	if (!conn || !conn_ctrl_ready(conn))
+	if (!conn || !conn_ctrl_ready(conn) || (conn->flags & CO_FL_FDLESS))
 		return;
 
-#ifdef IP_TOS
-	if (conn->src->ss_family == AF_INET)
-		setsockopt(conn->handle.fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
-#endif
-#ifdef IPV6_TCLASS
-	if (conn->src->ss_family == AF_INET6) {
-		if (IN6_IS_ADDR_V4MAPPED(&((struct sockaddr_in6 *)conn->src)->sin6_addr))
-			/* v4-mapped addresses need IP_TOS */
-			setsockopt(conn->handle.fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
-		else
-			setsockopt(conn->handle.fd, IPPROTO_IPV6, IPV6_TCLASS, &tos, sizeof(tos));
-	}
-#endif
+	sock_set_tos(conn->handle.fd, conn->src, tos);
 }
 
 /* Sets the netfilter mark on the connection's socket. The connection is tested
@@ -501,16 +444,10 @@ static inline void conn_set_tos(const struct connection *conn, int tos)
  */
 static inline void conn_set_mark(const struct connection *conn, int mark)
 {
-	if (!conn || !conn_ctrl_ready(conn))
+	if (!conn || !conn_ctrl_ready(conn) || (conn->flags & CO_FL_FDLESS))
 		return;
 
-#if defined(SO_MARK)
-	setsockopt(conn->handle.fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
-#elif defined(SO_USER_COOKIE)
-	setsockopt(conn->handle.fd, SOL_SOCKET, SO_USER_COOKIE, &mark, sizeof(mark));
-#elif defined(SO_RTABLE)
-	setsockopt(conn->handle.fd, SOL_SOCKET, SO_RTABLE, &mark, sizeof(mark));
-#endif
+	sock_set_mark(conn->handle.fd, conn->ctrl->fam->sock_family, mark);
 }
 
 /* Sets adjust the TCP quick-ack feature on the connection's socket. The
@@ -518,19 +455,12 @@ static inline void conn_set_mark(const struct connection *conn, int mark)
  */
 static inline void conn_set_quickack(const struct connection *conn, int value)
 {
-	if (!conn || !conn_ctrl_ready(conn))
+	if (!conn || !conn_ctrl_ready(conn) || (conn->flags & CO_FL_FDLESS))
 		return;
 
 #ifdef TCP_QUICKACK
 	setsockopt(conn->handle.fd, IPPROTO_TCP, TCP_QUICKACK, &value, sizeof(value));
 #endif
-}
-
-/* Attaches a conn_stream to a data layer and sets the relevant callbacks */
-static inline void cs_attach(struct conn_stream *cs, void *data, const struct data_cb *data_cb)
-{
-	cs->data_cb = data_cb;
-	cs->data = data;
 }
 
 static inline struct wait_event *wl_set_waitcb(struct wait_event *wl, struct task *(*cb)(struct task *, void *, unsigned int), void *ctx)
@@ -560,6 +490,24 @@ static inline int conn_install_mux(struct connection *conn, const struct mux_ops
 	return ret;
 }
 
+/* Retrieves any valid stream connector from this connection, preferably the first
+ * valid one. The purpose is to be able to figure one other end of a private
+ * connection for purposes like source binding or proxy protocol header
+ * emission. In such cases, any stream connector is expected to be valid so the
+ * mux is encouraged to return the first one it finds. If the connection has
+ * no mux or the mux has no get_first_sc() method or the mux has no valid
+ * stream connector, NULL is returned. The output pointer is purposely marked
+ * const to discourage the caller from modifying anything there.
+ */
+static inline struct stconn *conn_get_first_sc(const struct connection *conn)
+{
+	BUG_ON(!conn || !conn->mux);
+
+	if (!conn->mux->get_first_sc)
+		return NULL;
+	return conn->mux->get_first_sc(conn);
+}
+
 int conn_update_alpn(struct connection *conn, const struct ist alpn, int force);
 
 static inline const char *conn_get_ctrl_name(const struct connection *conn)
@@ -581,13 +529,6 @@ static inline const char *conn_get_mux_name(const struct connection *conn)
 	if (!conn || !conn->mux)
 		return "NONE";
 	return conn->mux->name;
-}
-
-static inline const char *cs_get_data_name(const struct conn_stream *cs)
-{
-	if (!cs || !cs->data_cb)
-		return "NONE";
-	return cs->data_cb->name;
 }
 
 /* registers pointer to transport layer <id> (XPRT_*) */
@@ -632,12 +573,6 @@ static inline int conn_get_alpn(const struct connection *conn, const char **str,
 	return conn->xprt->get_alpn(conn, conn->xprt_ctx, str, len);
 }
 
-/* registers proto mux list <list>. Modifies the list element! */
-static inline void register_mux_proto(struct mux_proto_list *list)
-{
-	LIST_APPEND(&mux_proto_list.list, &list->list);
-}
-
 /* unregisters proto mux list <list> */
 static inline void unregister_mux_proto(struct mux_proto_list *list)
 {
@@ -662,6 +597,10 @@ void list_mux_proto(FILE *out);
  * HTTP). <mux_proto> can be empty. Will fall back to the first compatible mux
  * with exactly the same <proto_mode> or with an empty name. May return
  * null if the code improperly registered the default mux to use as a fallback.
+ *
+ * <proto_mode> expects PROTO_MODE_* value only: PROXY_MODE_* values should
+ * never be used directly here (but you may use conn_pr_mode_to_proto_mode()
+ * to map proxy mode to corresponding proto mode before calling the function).
  */
 static inline const struct mux_proto_list *conn_get_best_mux_entry(
         const struct ist mux_proto,
@@ -723,15 +662,153 @@ static inline struct proxy *conn_get_proxy(const struct connection *conn)
 	return objt_proxy(conn->target);
 }
 
+/* unconditionally retrieves the ssl_sock_ctx for this connection. Prefer using
+ * the standard form conn_get_ssl_sock_ctx() which checks the transport layer
+ * and the availability of the method.
+ */
+static inline struct ssl_sock_ctx *__conn_get_ssl_sock_ctx(struct connection *conn)
+{
+	return conn->xprt->get_ssl_sock_ctx(conn);
+}
+
+/* retrieves the ssl_sock_ctx for this connection otherwise NULL */
+static inline struct ssl_sock_ctx *conn_get_ssl_sock_ctx(struct connection *conn)
+{
+	if (!conn || !conn->xprt || !conn->xprt->get_ssl_sock_ctx)
+		return NULL;
+	return conn->xprt->get_ssl_sock_ctx(conn);
+}
 
 /* boolean, returns true if connection is over SSL */
-static inline
-int conn_is_ssl(struct connection *conn)
+static inline int conn_is_ssl(struct connection *conn)
 {
-	if (!conn || conn->xprt != xprt_get(XPRT_SSL) || !conn->xprt_ctx)
-		return 0;
-	else
-		return 1;
+	return !!conn_get_ssl_sock_ctx(conn);
+}
+
+/* Returns true if connection must be reversed. */
+static inline int conn_is_reverse(const struct connection *conn)
+{
+	return !!(conn->reverse.target);
+}
+
+/* Returns true if connection must be actively reversed or waiting to be accepted. */
+static inline int conn_reverse_in_preconnect(const struct connection *conn)
+{
+	return conn_is_back(conn) ? !!(conn->reverse.target) :
+	                            !!(conn->flags & CO_FL_ACT_REVERSING);
+}
+
+/* Initialize <conn> as a reverse connection to <target>. */
+static inline void conn_set_reverse(struct connection *conn, enum obj_type *target)
+{
+	/* Ensure the correct target type is used depending on the connection side before reverse. */
+	BUG_ON((!conn_is_back(conn) && !objt_server(target)) ||
+	       (conn_is_back(conn) && !objt_listener(target)));
+
+	conn->reverse.target = target;
+}
+
+/* Returns the listener instance for connection used for active reverse. */
+static inline struct listener *conn_active_reverse_listener(const struct connection *conn)
+{
+	return conn_is_back(conn) ? __objt_listener(conn->reverse.target) :
+	                            __objt_listener(conn->target);
+}
+
+/*
+ * Prepare TLV argument for redirecting fetches.
+ * Note that it is not possible to use an argument check function
+ * as that would require us to allow arguments for functions
+ * that do not need it. Alternatively, the sample logic could be
+ * adjusted to perform checks for no arguments and allocate
+ * in the check function. However, this does not seem worth the trouble.
+ */
+static inline void set_tlv_arg(int tlv_type, struct arg *tlv_arg)
+{
+	tlv_arg->type = ARGT_SINT;
+	tlv_arg->data.sint = tlv_type;
+}
+
+/*
+ * Map proxy mode (PR_MODE_*) to equivalent proto_proxy_mode (PROTO_MODE_*)
+ */
+static inline int conn_pr_mode_to_proto_mode(int proxy_mode)
+{
+	int mode;
+
+	mode = ((proxy_mode == PR_MODE_HTTP) ? PROTO_MODE_HTTP :
+		(proxy_mode == PR_MODE_SPOP) ? PROTO_MODE_SPOP :
+		PROTO_MODE_TCP);
+
+	return mode;
+}
+
+/* Must be used to report add an event in <_evt> termination events log.
+ * For now, it only handles 32-bits integers.
+ */
+#define tevt_report_event(_evts, loc, type) ({			\
+								\
+	unsigned int _evt = ((loc) << 4) | (type);		\
+								\
+	if (!((_evts) & 0xff000000) &&				\
+	    (unsigned char)_evt != (unsigned char)(_evts)) {	\
+		(_evts) <<= 8;					\
+		(_evts) |= (loc) << 4;				\
+		(_evts) |= (type);				\
+	}							\
+	(_evts);						\
+})
+
+/* Function to convert a termination events log to a string */
+static THREAD_LOCAL char tevt_evts_str[9];
+static inline const char *tevt_evts2str(uint32_t evts)
+{
+	uint32_t evt_msk = 0xff000000;
+	unsigned int evt_bits = 24;
+	int idx = 0;
+
+	/* no events: do nothing */
+	if (!evts)
+		goto end;
+
+	/* -1 means the feature is not supported for the location or the entity does not exist. print a dash */
+	if (evts == UINT_MAX) {
+		tevt_evts_str[idx++] = '-';
+		goto end;
+	}
+
+	for (; evt_msk; evt_msk >>= 8, evt_bits -= 8) {
+		unsigned char evt = (evts & evt_msk) >> evt_bits;
+		unsigned int is_back;
+
+		if (!evt)
+			continue;
+
+		/* Backend location are displayed in captial letter */
+		is_back = !!((evt >> 4) & 0x8);
+		switch ((enum term_event_loc)((evt >> 4) & ~0x8)) {
+			case tevt_loc_fd:   tevt_evts_str[idx++] = (is_back ? 'F' : 'f'); break;
+			case tevt_loc_hs:   tevt_evts_str[idx++] = (is_back ? 'H' : 'h'); break;
+			case tevt_loc_xprt: tevt_evts_str[idx++] = (is_back ? 'X' : 'x'); break;
+			case tevt_loc_muxc: tevt_evts_str[idx++] = (is_back ? 'M' : 'm'); break;
+			case tevt_loc_se:   tevt_evts_str[idx++] = (is_back ? 'E' : 'e'); break;
+			case tevt_loc_strm: tevt_evts_str[idx++] = (is_back ? 'S' : 's'); break;
+			default:            tevt_evts_str[idx++] = '-';
+		}
+
+		tevt_evts_str[idx++] = hextab[evt & 0xf];
+	}
+  end:
+	tevt_evts_str[idx] = '\0';
+	return tevt_evts_str;
+}
+
+/* Report a connection event. <loc> may be "tevt_loc_fd", "tevt_loc_hs" or "tevt_loc_xprt" */
+static inline void conn_report_term_evt(struct connection *conn, enum term_event_loc loc, unsigned char type)
+{
+	if (conn_is_back(conn))
+		loc |= 0x08;
+	conn->term_evts_log = tevt_report_event(conn->term_evts_log, loc, type);
 }
 
 #endif /* _HAPROXY_CONNECTION_H */

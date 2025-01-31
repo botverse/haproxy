@@ -30,6 +30,7 @@
 #include <haproxy/pool-t.h>
 #include <haproxy/queue.h>
 #include <haproxy/session.h>
+#include <haproxy/stconn.h>
 #include <haproxy/stick_table.h>
 #include <haproxy/stream-t.h>
 #include <haproxy/task-t.h>
@@ -43,7 +44,7 @@ extern struct trace_source trace_strm;
 #define  STRM_EV_STRM_ERR     (1ULL <<  2)
 #define  STRM_EV_STRM_ANA     (1ULL <<  3)
 #define  STRM_EV_STRM_PROC    (1ULL <<  4)
-#define  STRM_EV_SI_ST        (1ULL <<  5)
+#define  STRM_EV_CS_ST        (1ULL <<  5)
 #define  STRM_EV_HTTP_ANA     (1ULL <<  6)
 #define  STRM_EV_HTTP_ERR     (1ULL <<  7)
 #define  STRM_EV_TCP_ANA      (1ULL <<  8)
@@ -58,22 +59,22 @@ extern struct pool_head *pool_head_uniqueid;
 
 extern struct data_cb sess_conn_cb;
 
-struct stream *stream_new(struct session *sess, enum obj_type *origin, struct buffer *input);
-int stream_create_from_cs(struct conn_stream *cs, struct buffer *input);
-int stream_upgrade_from_cs(struct conn_stream *cs, struct buffer *input);
+struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer *input);
+void stream_free(struct stream *s);
+int stream_upgrade_from_sc(struct stconn *sc, struct buffer *input);
 int stream_set_http_mode(struct stream *s, const struct mux_proto_list *mux_proto);
 
-/* kill a stream and set the termination flags to <why> (one of SF_ERR_*) */
-void stream_shutdown(struct stream *stream, int why);
-void stream_dump(struct buffer *buf, const struct stream *s, const char *pfx, char eol);
+/* shutdown the stream from itself */
+void stream_shutdown_self(struct stream *stream, int why);
 void stream_dump_and_crash(enum obj_type *obj, int rate);
+void strm_dump_to_buffer(struct buffer *buf, const struct stream *strm, const char *pfx, uint32_t anon_key);
 
-struct ist stream_generate_unique_id(struct stream *strm, struct list *format);
+struct ist stream_generate_unique_id(struct stream *strm, struct lf_expr *format);
 
 void stream_process_counters(struct stream *s);
 void sess_change_server(struct stream *strm, struct server *newsrv);
 struct task *process_stream(struct task *t, void *context, unsigned int state);
-void default_srv_error(struct stream *s, struct stream_interface *si);
+void default_srv_error(struct stream *s, struct stconn *sc);
 
 /* Update the stream's backend and server time stats */
 void stream_update_time_stats(struct stream *s);
@@ -115,7 +116,10 @@ static inline void stream_store_counters(struct stream *s)
 	int i;
 	struct stksess *ts;
 
-	for (i = 0; i < MAX_SESS_STKCTR; i++) {
+	if (unlikely(!s->stkctr)) // pool not allocated yet
+		return;
+
+	for (i = 0; i < global.tune.nb_stk_ctr; i++) {
 		ts = stkctr_entry(&s->stkctr[i]);
 		if (!ts)
 			continue;
@@ -136,7 +140,7 @@ static inline void stream_store_counters(struct stream *s)
 			stktable_touch_local(s->stkctr[i].table, ts, 0);
 		}
 		stkctr_set_entry(&s->stkctr[i], NULL);
-		stksess_kill_if_expired(s->stkctr[i].table, ts, 1);
+		stksess_kill_if_expired(s->stkctr[i].table, ts);
 	}
 }
 
@@ -151,7 +155,10 @@ static inline void stream_stop_content_counters(struct stream *s)
 	void *ptr;
 	int i;
 
-	for (i = 0; i < MAX_SESS_STKCTR; i++) {
+	if (unlikely(!s->stkctr)) // pool not allocated yet
+		return;
+
+	for (i = 0; i < global.tune.nb_stk_ctr; i++) {
 		ts = stkctr_entry(&s->stkctr[i]);
 		if (!ts)
 			continue;
@@ -175,7 +182,7 @@ static inline void stream_stop_content_counters(struct stream *s)
 			stktable_touch_local(s->stkctr[i].table, ts, 0);
 		}
 		stkctr_set_entry(&s->stkctr[i], NULL);
-		stksess_kill_if_expired(s->stkctr[i].table, ts, 1);
+		stksess_kill_if_expired(s->stkctr[i].table, ts);
 	}
 }
 
@@ -230,20 +237,26 @@ static inline void stream_inc_http_req_ctr(struct stream *s)
 {
 	int i;
 
-	for (i = 0; i < MAX_SESS_STKCTR; i++) {
+	if (unlikely(!s->stkctr)) // pool not allocated yet
+		return;
+
+	for (i = 0; i < global.tune.nb_stk_ctr; i++) {
 		if (!stkctr_inc_http_req_ctr(&s->stkctr[i]))
 			stkctr_inc_http_req_ctr(&s->sess->stkctr[i]);
 	}
 }
 
 /* Increase the number of cumulated HTTP requests in the backend's tracked
- * counters. We don't look up the session since it cannot happen in the bakcend.
+ * counters. We don't look up the session since it cannot happen in the backend.
  */
 static inline void stream_inc_be_http_req_ctr(struct stream *s)
 {
 	int i;
 
-	for (i = 0; i < MAX_SESS_STKCTR; i++) {
+	if (unlikely(!s->stkctr)) // pool not allocated yet
+		return;
+
+	for (i = 0; i < global.tune.nb_stk_ctr; i++) {
 		if (!stkctr_entry(&s->stkctr[i]) || !(stkctr_flags(&s->stkctr[i]) & STKCTR_TRACK_BACKEND))
 			continue;
 
@@ -261,7 +274,10 @@ static inline void stream_inc_http_err_ctr(struct stream *s)
 {
 	int i;
 
-	for (i = 0; i < MAX_SESS_STKCTR; i++) {
+	if (unlikely(!s->stkctr)) // pool not allocated yet
+		return;
+
+	for (i = 0; i < global.tune.nb_stk_ctr; i++) {
 		if (!stkctr_inc_http_err_ctr(&s->stkctr[i]))
 			stkctr_inc_http_err_ctr(&s->sess->stkctr[i]);
 	}
@@ -276,7 +292,10 @@ static inline void stream_inc_http_fail_ctr(struct stream *s)
 {
 	int i;
 
-	for (i = 0; i < MAX_SESS_STKCTR; i++) {
+	if (unlikely(!s->stkctr)) // pool not allocated yet
+		return;
+
+	for (i = 0; i < global.tune.nb_stk_ctr; i++) {
 		if (!stkctr_inc_http_fail_ctr(&s->stkctr[i]))
 			stkctr_inc_http_fail_ctr(&s->sess->stkctr[i]);
 	}
@@ -313,8 +332,6 @@ static inline void stream_init_srv_conn(struct stream *strm)
 
 static inline void stream_choose_redispatch(struct stream *s)
 {
-	struct stream_interface *si = &s->si[1];
-
 	/* If the "redispatch" option is set on the backend, we are allowed to
 	 * retry on another server. By default this redispatch occurs on the
 	 * last retry, but if configured we allow redispatches to occur on
@@ -331,29 +348,95 @@ static inline void stream_choose_redispatch(struct stream *s)
 	    (s->be->options & PR_O_REDISP) && !(s->flags & SF_FORCE_PRST) &&
 	    ((__objt_server(s->target)->cur_state < SRV_ST_RUNNING) ||
 	     (((s->be->redispatch_after > 0) &&
-	       ((s->be->conn_retries - si->conn_retries) %
-	        s->be->redispatch_after == 0)) ||
+	       (s->conn_retries % s->be->redispatch_after == 0)) ||
 	      ((s->be->redispatch_after < 0) &&
-	       ((s->be->conn_retries - si->conn_retries) %
-	        (s->be->conn_retries + 1 + s->be->redispatch_after) == 0))) ||
+	       (s->conn_retries % (s->max_retries + 1 + s->be->redispatch_after) == 0))) ||
 	     (!(s->flags & SF_DIRECT) && s->be->srv_act > 1 &&
-	      ((s->be->lbprm.algo & BE_LB_KIND) == BE_LB_KIND_RR)))) {
+	      ((s->be->lbprm.algo & BE_LB_KIND) != BE_LB_KIND_HI)))) {
 		sess_change_server(s, NULL);
 		if (may_dequeue_tasks(objt_server(s->target), s->be))
 			process_srv_queue(objt_server(s->target));
 
-		s->flags &= ~(SF_DIRECT | SF_ASSIGNED | SF_ADDR_SET);
-		si->state = SI_ST_REQ;
+		sockaddr_free(&s->scb->dst);
+		s->flags &= ~(SF_DIRECT | SF_ASSIGNED);
+		s->scb->state = SC_ST_REQ;
 	} else {
 		if (objt_server(s->target))
 			_HA_ATOMIC_INC(&__objt_server(s->target)->counters.retries);
 		_HA_ATOMIC_INC(&s->be->be_counters.retries);
-		si->state = SI_ST_ASS;
+		s->scb->state = SC_ST_ASS;
 	}
 
 }
 
+/*
+ * This function only has to be called once after a wakeup event in case of
+ * suspected timeout. It controls the stream connection timeout and sets
+ * si->flags accordingly. It does NOT close anything, as this timeout may
+ * be used for any purpose. It returns 1 if the timeout fired, otherwise
+ * zero.
+ */
+static inline int stream_check_conn_timeout(struct stream *s)
+{
+	if (tick_is_expired(s->conn_exp, now_ms)) {
+		s->flags |= SF_CONN_EXP;
+		return 1;
+	}
+	return 0;
+}
+
+/* Wake a stream up for shutdown by sending it an event. The stream must be
+ * locked one way or another so that it cannot leave (i.e. when inspecting a
+ * locked list or under thread isolation). Process_stream() will recognize the
+ * message and complete the job. <why> only supports SF_ERR_DOWN (mapped to
+ * STRM_EVT_SHUT_SRV_DOWN), SF_ERR_KILLED (mapped to STRM_EVT_KILLED) and
+ * SF_ERR_UP (mapped to STRM_EVT_SHUT_SRV_UP). Other values will just be
+ * ignored. The stream is woken up with TASK_WOKEN_OTHER reason. The stream
+ * handler will first call function stream_shutdown_self() on wakeup to complete
+ * the notification.
+ */
+static inline void stream_shutdown(struct stream *s, int why)
+{
+	HA_ATOMIC_OR(&s->new_events, ((why == SF_ERR_DOWN) ? STRM_EVT_SHUT_SRV_DOWN :
+				      (why == SF_ERR_KILLED) ? STRM_EVT_KILLED :
+				      (why == SF_ERR_UP) ? STRM_EVT_SHUT_SRV_UP :
+				      0));
+	task_wakeup(s->task, TASK_WOKEN_OTHER);
+}
+
+/* Map task states to stream events. TASK_WOKEN_* are mapped on
+ * STRM_EVT_*. Not all states/flags are mapped, only those explicitly used by
+ * the stream.
+ */
+static inline unsigned int stream_map_task_state(unsigned int state)
+{
+	return ((state & TASK_WOKEN_TIMER) ? STRM_EVT_TIMER : 0)         |
+		((state & TASK_WOKEN_MSG)  ? STRM_EVT_MSG : 0)           |
+		((state & TASK_F_UEVT1)    ? STRM_EVT_SHUT_SRV_DOWN : 0) |
+		((state & TASK_F_UEVT3)    ? STRM_EVT_SHUT_SRV_UP : 0)   |
+		((state & TASK_F_UEVT2)    ? STRM_EVT_KILLED : 0)        |
+		0;
+}
+
+static inline void stream_report_term_evt(struct stconn *sc, enum strm_term_event_type type)
+{
+	struct stream *s = sc_strm(sc);
+	enum term_event_loc loc = tevt_loc_strm;
+
+	if (!s)
+		return;
+
+	if (sc->flags & SC_FL_ISBACK)
+		loc += 8;
+	s->term_evts_log = tevt_report_event(s->term_evts_log, loc, type);
+	sc->term_evts_log = tevt_report_event(sc->term_evts_log, loc, type);
+}
+
+
 int stream_set_timeout(struct stream *s, enum act_timeout_name name, int timeout);
+void stream_retnclose(struct stream *s, const struct buffer *msg);
+void sess_set_term_flags(struct stream *s);
+void stream_abort(struct stream *s);
 
 void service_keywords_register(struct action_kw_list *kw_list);
 struct action_kw *service_find(const char *kw);

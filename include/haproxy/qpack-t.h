@@ -2,7 +2,7 @@
  * include/haproxy/qpack-t.h
  * This file contains types for QPACK
  *
- * Copyright 2021 HAProxy Technologies, Frédéric Lécaille <flecaille@haproxy.com>
+ * Copyright 2021 HAProxy Technologies, Frederic Lecaille <flecaille@haproxy.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -42,6 +42,13 @@
 #define QPACK_DEC_INST_ICINC    0x00 // Insert Count Increment
 #define QPACK_DEC_INST_SCCL     0x40 // Stream Cancellation
 #define QPACK_DEC_INST_SACK     0x80 // Section Acknowledgment
+
+/* RFC 9204 6. Error Handling */
+enum qpack_err {
+	QPACK_ERR_DECOMPRESSION_FAILED = 0x200,
+	QPACK_ERR_ENCODER_STREAM_ERROR = 0x201,
+	QPACK_ERR_DECODER_STREAM_ERROR = 0x202,
+};
 
 #endif /* USE_QUIC */
 #endif /* _HAPROXY_QPACK_T_H */

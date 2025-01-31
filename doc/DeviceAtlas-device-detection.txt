@@ -3,13 +3,20 @@ DeviceAtlas Device Detection
 
 In order to add DeviceAtlas Device Detection support, you would need to download
 the API source code from https://deviceatlas.com/deviceatlas-haproxy-module.
-The build supports the USE_PCRE and USE_PCRE2 options. Once extracted :
+Once extracted :
 
-    $ make TARGET=<target> USE_PCRE=1 (or USE_PCRE2=1) USE_DEVICEATLAS=1 DEVICEATLAS_SRC=<path to the API root folder>
+    $ make TARGET=<target> USE_DEVICEATLAS=1 DEVICEATLAS_SRC=<path to the API root folder>
 
 Optionally DEVICEATLAS_INC and DEVICEATLAS_LIB may be set to override the path
 to the include files and libraries respectively if they're not in the source
-directory.
+directory. Also, in the case the api cache support is not needed and/or a C++ toolchain
+ could not be used, DEVICEATLAS_NOCACHE is available.
+
+    $ make TARGET=<target> USE_DEVICEATLAS=1 DEVICEATLAS_SRC=<path to the API root folder> DEVICEATLAS_NOCACHE=1
+
+However, if the API had been installed beforehand, DEVICEATLAS_SRC
+can be omitted. Note that the DeviceAtlas C API version supported is from the 3.x
+releases series (3.2.1 minimum recommended).
 
 For HAProxy developers who need to verify that their changes didn't accidentally
 break the DeviceAtlas code, it is possible to build a dummy library provided in
@@ -18,7 +25,7 @@ full library. This will not provide the full functionalities, it will just allow
 haproxy to start with a deviceatlas configuration, which generally is enough to
 validate API changes :
 
-    $ make TARGET=<target> USE_PCRE=1 USE_DEVICEATLAS=1 DEVICEATLAS_SRC=$PWD/addons/deviceatlas/dummy
+    $ make TARGET=<target> USE_DEVICEATLAS=1 DEVICEATLAS_SRC=$PWD/addons/deviceatlas/dummy
 
 These are supported DeviceAtlas directives (see doc/configuration.txt) :
   - deviceatlas-json-file <path to the DeviceAtlas JSON data file>.
@@ -26,6 +33,7 @@ These are supported DeviceAtlas directives (see doc/configuration.txt) :
     the API, 0 by default).
   - deviceatlas-property-separator <character> (character used to separate the
     properties produced by the API, | by default).
+  - deviceatlas-cache-size <number> (number of cache entries, 0 by default).
 
 Sample configuration :
 
@@ -62,5 +70,9 @@ Single HTTP header
 
     acl device_type_tablet req.fhdr(User-Agent),da-csv-conv(primaryHardwareType) "Tablet"
 
+Note that the JSON download scheduler is now part of the API's package, it is recommended
+to read its documentation. Note it needs to be started before HAProxy.
 
-Please find more information about DeviceAtlas and the detection methods at https://deviceatlas.com/resources .
+
+Please find more information about DeviceAtlas and the detection methods at
+https://deviceatlas.com/resources .

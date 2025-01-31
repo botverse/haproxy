@@ -26,6 +26,7 @@
 
 #include <lua.h>
 #include <lauxlib.h>
+#include <stdint.h>
 
 #include <import/ebtree-t.h>
 
@@ -34,6 +35,8 @@
 #include <haproxy/server-t.h>
 #include <haproxy/stick_table-t.h>
 #include <haproxy/xref-t.h>
+#include <haproxy/event_hdl-t.h>
+#include <haproxy/pattern-t.h>
 
 #define CLASS_CORE         "Core"
 #define CLASS_TXN          "TXN"
@@ -50,8 +53,13 @@
 #define CLASS_PROXY        "Proxy"
 #define CLASS_SERVER       "Server"
 #define CLASS_LISTENER     "Listener"
+#define CLASS_EVENT_SUB    "EventSub"
+#define CLASS_PATREF       "Patref"
 #define CLASS_REGEX        "Regex"
 #define CLASS_STKTABLE     "StickTable"
+#define CLASS_CERTCACHE    "CertCache"
+#define CLASS_PROXY_LIST   "ProxyList"
+#define CLASS_SERVER_LIST  "ServerList"
 
 struct stream;
 
@@ -61,6 +69,7 @@ struct stream;
 #define HLUA_WAKEREQWR 0x00000008
 #define HLUA_EXIT      0x00000010
 #define HLUA_NOYIELD   0x00000020
+#define HLUA_BUSY      0x00000040
 
 #define HLUA_F_AS_STRING    0x01
 #define HLUA_F_MAY_USE_HTTP 0x02
@@ -87,11 +96,19 @@ enum hlua_exec {
 	HLUA_E_AGAIN,  /* LUA yield, must resume the stack execution later, when
 	                  the associatedtask is waked. */
 	HLUA_E_ETMOUT, /* Execution timeout */
+	HLUA_E_BTMOUT, /* Burst timeout */
 	HLUA_E_NOMEM,  /* Out of memory error */
 	HLUA_E_YIELD,  /* LUA code try to yield, and this is not allowed */
 	HLUA_E_ERRMSG, /* LUA stack execution failed with a string error message
 	                  in the top of stack. */
 	HLUA_E_ERR,    /* LUA stack execution failed without error message. */
+};
+
+struct hlua_timer {
+	uint32_t start;      /* cpu time in ms when the timer was started */
+	uint32_t burst;      /* execution time for the current call in ms */
+	uint32_t cumulative; /* cumulative execution time for the coroutine in ms */
+	uint32_t max;        /* max (cumulative) execution time for the coroutine in ms */
 };
 
 struct hlua {
@@ -103,13 +120,12 @@ struct hlua {
 	             -1 if the memory context is not used. */
 	int nargs; /* The number of arguments in the stack at the start of execution. */
 	unsigned int flags; /* The current execution flags. */
-	int wake_time; /* The lua wants to be waked at this time, or before. */
-	unsigned int max_time; /* The max amount of execution time for an Lua process, in ms. */
-	unsigned int start_time; /* The ms time when the Lua starts the last execution. */
-	unsigned int run_time; /* Lua total execution time in ms. */
+	int wake_time; /* The lua wants to be waked at this time, or before. (ticks) */
+	struct hlua_timer timer; /* lua multipurpose timer */
 	struct task *task; /* The task associated with the lua stack execution.
 	                      We must wake this task to continue the task execution */
 	struct list com; /* The list head of the signals attached to this task. */
+	struct mt_list hc_list;  /* list of httpclient associated to this lua task */
 	struct ebpt_node node;
 	int gc_count;  /* number of items which need a GC */
 };
@@ -197,6 +213,47 @@ struct hlua_httpclient {
 	struct httpclient *hc; /* ptr to the httpclient instance */
 	size_t sent; /* payload sent */
 	luaL_Buffer b; /* buffer used to prepare strings. */
+	struct mt_list by_hlua; /* linked in the current hlua task */
+};
+
+struct hlua_proxy_list {
+	char capabilities;
+};
+
+struct hlua_proxy_list_iterator_context {
+	struct proxy *next;
+	char capabilities;
+};
+
+struct hlua_server_list {
+	struct proxy *px;
+};
+
+struct hlua_server_list_iterator_context {
+	struct watcher srv_watch; /* watcher to automatically update next pointer
+	                           * on server deletion
+	                           */
+	struct server *next;      /* next server in list */
+	struct proxy *px;         /* to retrieve first server */
+};
+
+#define HLUA_PATREF_FL_NONE    0x00
+#define HLUA_PATREF_FL_GEN     0x01 /* patref update backed by specific subset, check curr_gen */
+
+/* pat_ref struct wrapper for lua */
+struct hlua_patref {
+	/* no need for lock-protecting the struct, it is not meant to
+	 * be used by parallel lua contexts
+	 */
+	struct pat_ref *ptr;
+	uint16_t flags; /* HLUA_PATREF_FL_* */
+	unsigned int curr_gen; /* relevant if HLUA_PATREF_FL_GEN is set */
+};
+
+struct hlua_patref_iterator_context {
+	struct hlua_patref *ref;
+	struct bref bref;       /* back-reference from the pat_ref_elt being accessed
+	                         * during listing */
 };
 
 #else /* USE_LUA */

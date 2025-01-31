@@ -33,6 +33,28 @@
 #include <haproxy/api.h>
 #include <haproxy/buf-t.h>
 
+size_t b_getblk_ofs(const struct buffer *buf, char *blk, size_t len, size_t offset);
+size_t b_getblk(const struct buffer *buf, char *blk, size_t len, size_t offset);
+size_t b_getdelim(const struct buffer *buf, size_t offset, size_t count,
+                  char *str, size_t len, const char *delim, char escape);
+size_t b_getline(const struct buffer *buf, size_t offset, size_t count,
+                 char *str, size_t len);
+void b_slow_realign(struct buffer *b, char *swap, size_t output);
+void b_slow_realign_ofs(struct buffer *b, char *swap, size_t ofs);
+size_t b_putblk_ofs(struct buffer *buf, char *blk, size_t len, size_t offset);
+void __b_putblk(struct buffer *b, const char *blk, size_t len);
+size_t b_xfer(struct buffer *dst, struct buffer *src, size_t count);
+size_t b_ncat(struct buffer *dst, const struct buffer *src, size_t count);
+void b_move(const struct buffer *b, size_t src, size_t len, ssize_t shift);
+int b_rep_blk(struct buffer *b, char *pos, char *end, const char *blk, size_t len);
+int b_insert_blk(struct buffer *b, size_t off, const char *blk, size_t len);
+void __b_put_varint(struct buffer *b, uint64_t v);
+int b_put_varint(struct buffer *b, uint64_t v);
+int b_get_varint(struct buffer *b, uint64_t *vptr);
+
+void bl_deinit(struct bl_elem *head);
+uint32_t bl_get(struct bl_elem *head, uint32_t idx);
+
 /***************************************************************************/
 /* Functions used to compute offsets and pointers. Most of them exist in   */
 /* both wrapping-safe and unchecked ("__" prefix) variants. Some returning */
@@ -81,6 +103,7 @@ static inline size_t b_data(const struct buffer *b)
 /* b_room() : returns the amount of room left in the buffer */
 static inline size_t b_room(const struct buffer *b)
 {
+	BUG_ON_HOT(b->data > b->size);
 	return b->size - b_data(b);
 }
 
@@ -90,6 +113,27 @@ static inline size_t b_full(const struct buffer *b)
 	return !b_room(b);
 }
 
+/* b_add_ofs() : return new offset within buffer after applying wrapping. Only
+ * offsets resulting from initial positions added to counts within buffer size
+ * limits are handled.
+ */
+static inline size_t b_add_ofs(const struct buffer *b, size_t ofs, size_t count)
+{
+	ofs += count;
+	if (ofs >= b->size)
+		ofs -= b->size;
+	return ofs;
+}
+
+/* b_rel_ofs() : take an absolute offset in the buffer, and return it relative
+ * to the buffer's head for use with b_peek().
+ */
+static inline size_t b_rel_ofs(const struct buffer *b, size_t ofs)
+{
+	if (ofs < b->head)
+		ofs += b->size;
+	return ofs - b->head;
+}
 
 /* b_stop() : returns the pointer to the byte following the end of the buffer,
  * which may be out of the buffer if the buffer ends on the last byte of the
@@ -139,8 +183,9 @@ static inline size_t b_peek_ofs(const struct buffer *b, size_t ofs)
 {
 	size_t ret = __b_peek_ofs(b, ofs);
 
-	if (ret >= b->size)
-		ret -= b->size;
+	if (likely(!__builtin_constant_p(ofs) || ofs))
+		if (ret >= b->size)
+			ret -= b->size;
 
 	return ret;
 }
@@ -210,6 +255,7 @@ static inline char *b_tail(const struct buffer *b)
 static inline size_t b_next_ofs(const struct buffer *b, size_t o)
 {
 	o++;
+	BUG_ON_HOT(o > b->size);
 	if (o == b->size)
 		o = 0;
 	return o;
@@ -218,6 +264,7 @@ static inline size_t b_next_ofs(const struct buffer *b, size_t o)
 static inline char *b_next(const struct buffer *b, const char *p)
 {
 	p++;
+	BUG_ON_HOT(p > b_wrap(b));
 	if (p == b_wrap(b))
 		p = b_orig(b);
 	return (char *)p;
@@ -232,6 +279,7 @@ static inline size_t b_dist(const struct buffer *b, const char *from, const char
 {
 	ssize_t dist = to - from;
 
+	BUG_ON_HOT((dist > 0 && dist > b_size(b)) || (dist < 0 && -dist > b_size(b)));
 	dist += dist < 0 ? b_size(b) : 0;
 	return dist;
 }
@@ -241,6 +289,7 @@ static inline size_t b_dist(const struct buffer *b, const char *from, const char
  */
 static inline int b_almost_full(const struct buffer *b)
 {
+	BUG_ON_HOT(b->data > b->size);
 	return b_data(b) >= b_size(b) * 3 / 4;
 }
 
@@ -259,6 +308,7 @@ static inline int b_almost_full(const struct buffer *b)
  */
 static inline int b_space_wraps(const struct buffer *b)
 {
+	BUG_ON_HOT(b->data > b->size);
 	if ((ssize_t)__b_head_ofs(b) <= 0)
 		return 0;
 	if (__b_tail_ofs(b) >= b_size(b))
@@ -297,6 +347,8 @@ static inline size_t b_contig_space(const struct buffer *b)
 {
 	size_t left, right;
 
+	BUG_ON_HOT(b->data > b->size);
+
 	right = b_head_ofs(b);
 	left  = right + b_data(b);
 
@@ -304,66 +356,6 @@ static inline size_t b_contig_space(const struct buffer *b)
 	if ((ssize_t)left <= 0)
 		left += right;
 	return left;
-}
-
-/* b_getblk() : gets one full block of data at once from a buffer, starting
- * from offset <offset> after the buffer's head, and limited to no more than
- * <len> bytes. The caller is responsible for ensuring that neither <offset>
- * nor <offset>+<len> exceed the total number of bytes available in the buffer.
- * Return values :
- *   >0 : number of bytes read, equal to requested size.
- *   =0 : not enough data available. <blk> is left undefined.
- * The buffer is left unaffected.
- */
-static inline size_t b_getblk(const struct buffer *buf, char *blk, size_t len, size_t offset)
-{
-	size_t firstblock;
-
-	if (len + offset > b_data(buf))
-		return 0;
-
-	firstblock = b_wrap(buf) - b_head(buf);
-	if (firstblock > offset) {
-		if (firstblock >= len + offset) {
-			memcpy(blk, b_head(buf) + offset, len);
-			return len;
-		}
-
-		memcpy(blk, b_head(buf) + offset, firstblock - offset);
-		memcpy(blk + firstblock - offset, b_orig(buf), len - firstblock + offset);
-		return len;
-	}
-
-	memcpy(blk, b_orig(buf) + offset - firstblock, len);
-	return len;
-}
-
-/* b_getblk_nc() : gets one or two blocks of data at once from a buffer,
- * starting from offset <ofs> after the beginning of its output, and limited to
- * no more than <max> bytes. The caller is responsible for ensuring that
- * neither <ofs> nor <ofs>+<max> exceed the total number of bytes available in
- * the buffer. Return values :
- *   >0 : number of blocks filled (1 or 2). blk1 is always filled before blk2.
- *   =0 : not enough data available. <blk*> are left undefined.
- * The buffer is left unaffected. Unused buffers are left in an undefined state.
- */
-static inline size_t b_getblk_nc(const struct buffer *buf, const char **blk1, size_t *len1, const char **blk2, size_t *len2, size_t ofs, size_t max)
-{
-	size_t l1;
-
-	if (!max)
-		return 0;
-
-	*blk1 = b_peek(buf, ofs);
-	l1 = b_wrap(buf) - *blk1;
-	if (l1 < max) {
-		*len1 = l1;
-		*len2 = max - l1;
-		*blk2 = b_orig(buf);
-		return 2;
-	}
-	*len1 = max;
-	return 1;
 }
 
 
@@ -393,18 +385,21 @@ static inline struct buffer b_make(char *area, size_t size, size_t head, size_t 
 /* b_sub() : decreases the buffer length by <count> */
 static inline void b_sub(struct buffer *b, size_t count)
 {
+	BUG_ON_HOT(b->data < count);
 	b->data -= count;
 }
 
 /* b_add() : increase the buffer length by <count> */
 static inline void b_add(struct buffer *b, size_t count)
 {
+	BUG_ON_HOT(b->data + count > b->size);
 	b->data += count;
 }
 
 /* b_set_data() : sets the buffer's length */
 static inline void b_set_data(struct buffer *b, size_t len)
 {
+	BUG_ON_HOT(len > b->size);
 	b->data = len;
 }
 
@@ -414,6 +409,7 @@ static inline void b_set_data(struct buffer *b, size_t len)
  */
 static inline void b_del(struct buffer *b, size_t del)
 {
+	BUG_ON_HOT(b->data < del);
 	b->data -= del;
 	b->head += del;
 	if (b->head >= b->size)
@@ -427,79 +423,6 @@ static inline void b_realign_if_empty(struct buffer *b)
 		b->head = 0;
 }
 
-/* b_slow_realign() : this function realigns a possibly wrapping buffer so that
- * the part remaining to be parsed is contiguous and starts at the beginning of
- * the buffer and the already parsed output part ends at the end of the buffer.
- * This provides the best conditions since it allows the largest inputs to be
- * processed at once and ensures that once the output data leaves, the whole
- * buffer is available at once. The number of output bytes supposedly present
- * at the beginning of the buffer and which need to be moved to the end must be
- * passed in <output>. A temporary swap area at least as large as b->size must
- * be provided in <swap>. It's up to the caller to ensure <output> is no larger
- * than the difference between the whole buffer's length and its input.
- */
-static inline void b_slow_realign(struct buffer *b, char *swap, size_t output)
-{
-	size_t block1 = output;
-	size_t block2 = 0;
-
-	/* process output data in two steps to cover wrapping */
-	if (block1 > b_size(b) - b_head_ofs(b)) {
-		block2 = b_size(b) - b_head_ofs(b);
-		block1 -= block2;
-	}
-	memcpy(swap + b_size(b) - output, b_head(b), block1);
-	memcpy(swap + b_size(b) - block2, b_orig(b), block2);
-
-	/* process input data in two steps to cover wrapping */
-	block1 = b_data(b) - output;
-	block2 = 0;
-
-	if (block1 > b_tail_ofs(b)) {
-		block2 = b_tail_ofs(b);
-		block1 = block1 - block2;
-	}
-	memcpy(swap, b_peek(b, output), block1);
-	memcpy(swap + block1, b_orig(b), block2);
-
-	/* reinject changes into the buffer */
-	memcpy(b_orig(b), swap, b_data(b) - output);
-	memcpy(b_wrap(b) - output, swap + b_size(b) - output, output);
-
-	b->head = (output ? b_size(b) - output : 0);
-}
-
-/* b_slow_realign_ofs() : this function realigns a possibly wrapping buffer
- * setting its new head at <ofs>. Depending of the <ofs> value, the resulting
- * buffer may also wrap. A temporary swap area at least as large as b->size must
- * be provided in <swap>. It's up to the caller to ensuze <ofs> is not larger
- * than b->size.
- */
-static inline void b_slow_realign_ofs(struct buffer *b, char *swap, size_t ofs)
-{
-	size_t block1 = b_data(b);
-	size_t block2 = 0;
-
-	if (__b_tail_ofs(b) >= b_size(b)) {
-		block2 = b_tail_ofs(b);
-		block1 -= block2;
-	}
-	memcpy(swap, b_head(b), block1);
-	memcpy(swap + block1, b_orig(b), block2);
-
-	block1 = b_data(b);
-	block2 = 0;
-	if (block1 > b_size(b) - ofs) {
-		block1 = b_size(b) - ofs;
-		block2 = b_data(b) - block1;
-	}
-	memcpy(b_orig(b) + ofs, swap, block1);
-	memcpy(b_orig(b), swap + block1, block2);
-
-	b->head = ofs;
-}
-
-
 /* b_putchar() : tries to append char <c> at the end of buffer <b>. Supports
  * wrapping. Data are truncated if buffer is full.
  */
@@ -509,24 +432,6 @@ static inline void b_putchr(struct buffer *b, char c)
 		return;
 	*b_tail(b) = c;
 	b->data++;
-}
-
-/* __b_putblk() : tries to append <len> bytes from block <blk> to the end of
- * buffer <b> without checking for free space (it's up to the caller to do it).
- * Supports wrapping. It must not be called with len == 0.
- */
-static inline void __b_putblk(struct buffer *b, const char *blk, size_t len)
-{
-	size_t half = b_contig_space(b);
-
-	if (half > len)
-		half = len;
-
-	memcpy(b_tail(b), blk, half);
-
-	if (len > half)
-		memcpy(b_peek(b, b_data(b) + half), blk + half, len - half);
-	b->data += len;
 }
 
 /* b_putblk() : tries to append block <blk> at the end of buffer <b>. Supports
@@ -542,321 +447,50 @@ static inline size_t b_putblk(struct buffer *b, const char *blk, size_t len)
 	return len;
 }
 
-/* b_xfer() : transfers at most <count> bytes from buffer <src> to buffer <dst>
- * and returns the number of bytes copied. The bytes are removed from <src> and
- * added to <dst>. The caller is responsible for ensuring that <count> is not
- * larger than b_room(dst). Whenever possible (if the destination is empty and
- * at least as much as the source was requested), the buffers are simply
- * swapped instead of copied.
- */
-static inline size_t b_xfer(struct buffer *dst, struct buffer *src, size_t count)
-{
-	size_t ret, block1, block2;
-
-	ret = 0;
-	if (!count)
-		goto leave;
-
-	ret = b_data(src);
-	if (!ret)
-		goto leave;
-
-	if (ret > count)
-		ret = count;
-	else if (!b_data(dst)) {
-		/* zero copy is possible by just swapping buffers */
-		struct buffer tmp = *dst;
-		*dst = *src;
-		*src = tmp;
-		goto leave;
-	}
-
-	block1 = b_contig_data(src, 0);
-	if (block1 > ret)
-		block1 = ret;
-	block2 = ret - block1;
-
-	if (block1)
-		__b_putblk(dst, b_head(src), block1);
-
-	if (block2)
-		__b_putblk(dst, b_peek(src, block1), block2);
-
-	b_del(src, ret);
- leave:
-	return ret;
-}
-
 /* b_force_xfer() : same as b_xfer() but without zero copy.
  * The caller is responsible for ensuring that <count> is not
  * larger than b_room(dst).
  */
 static inline size_t b_force_xfer(struct buffer *dst, struct buffer *src, size_t count)
 {
-	size_t ret, block1, block2;
+	size_t ret;
 
-	ret = 0;
-	if (!count)
-		goto leave;
-
-	ret = b_data(src);
-	if (!ret)
-		goto leave;
-
-	if (ret > count)
-		ret = count;
-	block1 = b_contig_data(src, 0);
-	if (block1 > ret)
-		block1 = ret;
-	block2 = ret - block1;
-
-	if (block1)
-		__b_putblk(dst, b_head(src), block1);
-
-	if (block2)
-		__b_putblk(dst, b_peek(src, block1), block2);
-
+	ret = b_ncat(dst, src, count);
 	b_del(src, ret);
- leave:
+
 	return ret;
 }
-/* Moves <len> bytes from absolute position <src> of buffer <b> by <shift>
- * bytes, while supporting wrapping of both the source and the destination.
- * The position is relative to the buffer's origin and may overlap with the
- * target position. The <shift>'s absolute value must be strictly lower than
- * the buffer's size. The main purpose is to aggregate data block during
- * parsing while removing unused delimiters. The buffer's length is not
- * modified, and the caller must take care of size adjustments and holes by
- * itself.
+
+/* b_getblk_nc() : gets one or two blocks of data at once from a buffer,
+ * starting from offset <ofs> after the beginning of its output, and limited to
+ * no more than <max> bytes. The caller is responsible for ensuring that
+ * neither <ofs> nor <ofs>+<max> exceed the total number of bytes available in
+ * the buffer. Return values :
+ *   >0 : number of blocks filled (1 or 2). blk1 is always filled before blk2.
+ *   =0 : not enough data available. <blk*> are left undefined.
+ * The buffer is left unaffected. Unused buffers are left in an undefined state.
  */
-static inline void b_move(const struct buffer *b, size_t src, size_t len, ssize_t shift)
+static inline size_t b_getblk_nc(const struct buffer *buf, const char **blk1, size_t *len1, const char **blk2, size_t *len2, size_t ofs, size_t max)
 {
-	char  *orig = b_orig(b);
-	size_t size = b_size(b);
-	size_t dst  = src + size + shift;
-	size_t cnt;
+	size_t l1;
 
-	if (dst >= size)
-		dst -= size;
+	BUG_ON_HOT(buf->data > buf->size);
+	BUG_ON_HOT(ofs > buf->data);
+	BUG_ON_HOT(ofs + max > buf->data);
 
-	if (shift < 0) {
-		/* copy from left to right */
-		for (; (cnt = len); len -= cnt) {
-			if (cnt > size - src)
-				cnt = size - src;
-			if (cnt > size - dst)
-				cnt = size - dst;
-
-			memmove(orig + dst, orig + src, cnt);
-			dst += cnt;
-			src += cnt;
-			if (dst >= size)
-				dst -= size;
-			if (src >= size)
-				src -= size;
-		}
-	}
-	else if (shift > 0) {
-		/* copy from right to left */
-		for (; (cnt = len); len -= cnt) {
-			size_t src_end = src + len;
-			size_t dst_end = dst + len;
-
-			if (dst_end > size)
-				dst_end -= size;
-			if (src_end > size)
-				src_end -= size;
-
-			if (cnt > dst_end)
-				cnt = dst_end;
-			if (cnt > src_end)
-				cnt = src_end;
-
-			memmove(orig + dst_end - cnt, orig + src_end - cnt, cnt);
-		}
-	}
-}
-
-/* b_rep_blk() : writes the block <blk> at position <pos> which must be in
- * buffer <b>, and moves the part between <end> and the buffer's tail just
- * after the end of the copy of <blk>. This effectively replaces the part
- * located between <pos> and <end> with a copy of <blk> of length <len>. The
- * buffer's length is automatically updated. This is used to replace a block
- * with another one inside a buffer. The shift value (positive or negative) is
- * returned. If there's no space left, the move is not done. If <len> is null,
- * the <blk> pointer is allowed to be null, in order to erase a block.
- */
-static inline int b_rep_blk(struct buffer *b, char *pos, char *end, const char *blk, size_t len)
-{
-	int delta;
-
-	delta = len - (end - pos);
-
-	if (__b_tail(b) + delta > b_wrap(b))
-		return 0;  /* no space left */
-
-	if (b_data(b) &&
-	    b_tail(b) + delta > b_head(b) &&
-	    b_head(b) >= b_tail(b))
-		return 0;  /* no space left before wrapping data */
-
-	/* first, protect the end of the buffer */
-	memmove(end + delta, end, b_tail(b) - end);
-
-	/* now, copy blk over pos */
-	if (len)
-		memcpy(pos, blk, len);
-
-	b_add(b, delta);
-	b_realign_if_empty(b);
-
-	return delta;
-}
-
-/* b_insert_blk(): inserts the block <blk> at the absolute offset <off> moving
- * data between this offset and the buffer's tail just after the end of the copy
- * of <blk>. The buffer's length is automatically updated. It Supports
- * wrapping. If there are not enough space to perform the copy, 0 is
- * returned. Otherwise, the number of bytes copied is returned
-*/
-static inline int b_insert_blk(struct buffer *b, size_t off, const char *blk, size_t len)
-{
-	size_t pos;
-
-	if (!len || len > b_room(b))
-		return 0; /* nothing to copy or not enough space left */
-
-	pos = b_peek_ofs(b, off);
-	if (pos == b_tail_ofs(b))
-		__b_putblk(b, blk, len);
-	else {
-		size_t delta = b_data(b) - off;
-
-		/* first, protect the end of the buffer */
-		b_move(b, pos, delta, len);
-
-		/* change the amount of data in the buffer during the copy */
-		b_sub(b, delta);
-		__b_putblk(b, blk, len);
-		b_add(b, delta);
-	}
-	return len;
-}
-
-/* __b_put_varint(): encode 64-bit value <v> as a varint into buffer <b>. The
- * caller must have checked that the encoded value fits in the buffer so that
- * there are no length checks. Wrapping is supported. You don't want to use
- * this function but b_put_varint() instead.
- */
-static inline void __b_put_varint(struct buffer *b, uint64_t v)
-{
-	size_t data = b->data;
-	size_t size = b_size(b);
-	char  *wrap = b_wrap(b);
-	char  *tail = b_tail(b);
-
-	if (v >= 0xF0) {
-		/* more than one byte, first write the 4 least significant
-		 * bits, then follow with 7 bits per byte.
-		 */
-		*tail = v | 0xF0;
-		v = (v - 0xF0) >> 4;
-
-		while (1) {
-			if (++tail == wrap)
-				tail -= size;
-			data++;
-			if (v < 0x80)
-				break;
-			*tail = v | 0x80;
-			v = (v - 0x80) >> 7;
-		}
-	}
-
-	/* last byte */
-	*tail = v;
-	data++;
-	b->data = data;
-}
-
-/* b_put_varint(): try to encode value <v> as a varint into buffer <b>. Returns
- * the number of bytes written in case of success, or 0 if there is not enough
- * room. Wrapping is supported. No partial writes will be performed.
- */
-static inline int b_put_varint(struct buffer *b, uint64_t v)
-{
-	size_t data = b->data;
-	size_t size = b_size(b);
-	char  *wrap = b_wrap(b);
-	char  *tail = b_tail(b);
-
-	if (data != size && v >= 0xF0) {
-		/* more than one byte, first write the 4 least significant
-		 * bits, then follow with 7 bits per byte.
-		 */
-		*tail = v | 0xF0;
-		v = (v - 0xF0) >> 4;
-
-		while (1) {
-			if (++tail == wrap)
-				tail -= size;
-			data++;
-			if (data == size || v < 0x80)
-				break;
-			*tail = v | 0x80;
-			v = (v - 0x80) >> 7;
-		}
-	}
-
-	/* last byte */
-	if (data == size)
+	if (!max)
 		return 0;
 
-	*tail = v;
-	data++;
-
-	size = data - b->data;
-	b->data = data;
-	return size;
-}
-
-/* b_get_varint(): try to decode a varint from buffer <b> into value <vptr>.
- * Returns the number of bytes read in case of success, or 0 if there were not
- * enough bytes. Wrapping is supported. No partial reads will be performed.
- */
-static inline int b_get_varint(struct buffer *b, uint64_t *vptr)
-{
-	const uint8_t *head = (const uint8_t *)b_head(b);
-	const uint8_t *wrap = (const uint8_t *)b_wrap(b);
-	size_t data = b->data;
-	size_t size = b_size(b);
-	uint64_t v = 0;
-	int bits = 0;
-
-	if (data != 0 && (*head >= 0xF0)) {
-		v = *head;
-		bits += 4;
-		while (1) {
-			if (++head == wrap)
-				head -= size;
-			data--;
-			if (!data || !(*head & 0x80))
-				break;
-			v += (uint64_t)*head << bits;
-			bits += 7;
-		}
+	*blk1 = b_peek(buf, ofs);
+	l1 = b_wrap(buf) - *blk1;
+	if (l1 < max) {
+		*len1 = l1;
+		*len2 = max - l1;
+		*blk2 = b_orig(buf);
+		return 2;
 	}
-
-	/* last byte */
-	if (!data)
-		return 0;
-
-	v += (uint64_t)*head << bits;
-	*vptr = v;
-	data--;
-	size = b->data - data;
-	b_del(b, size);
-	return size;
+	*len1 = max;
+	return 1;
 }
 
 /* b_peek_varint(): try to decode a varint from buffer <b> at offset <ofs>
@@ -874,6 +508,8 @@ static inline int b_peek_varint(struct buffer *b, size_t ofs, uint64_t *vptr)
 	size_t size = b_size(b);
 	uint64_t v = 0;
 	int bits = 0;
+
+	BUG_ON_HOT(ofs > b_data(b));
 
 	if (data != 0 && (*head >= 0xF0)) {
 		v = *head;
@@ -947,7 +583,7 @@ static inline void br_init(struct buffer *r, size_t size)
 /* Returns number of elements in the ring, root included */
 static inline unsigned int br_size(const struct buffer *r)
 {
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	return r->size;
 }
@@ -955,15 +591,34 @@ static inline unsigned int br_size(const struct buffer *r)
 /* Returns true if no more buffers may be added */
 static inline unsigned int br_full(const struct buffer *r)
 {
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	return r->data + 1 == r->head || r->data + 1 == r->head - 1 + r->size;
+}
+
+/* Returns the number of buffers present */
+static inline unsigned int br_count(const struct buffer *r)
+{
+	BUG_ON_HOT(r->area != BUF_RING.area);
+
+	if (r->data >= r->head)
+		return r->data - r->head + 1;
+	else
+		return r->data + r->size - r->head;
+}
+
+/* Returns true if a single buffer is assigned */
+static inline unsigned int br_single(const struct buffer *r)
+{
+	BUG_ON_HOT(r->area != BUF_RING.area);
+
+	return r->data == r->head;
 }
 
 /* Returns the index of the ring's head buffer */
 static inline unsigned int br_head_idx(const struct buffer *r)
 {
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	return r->head;
 }
@@ -971,7 +626,7 @@ static inline unsigned int br_head_idx(const struct buffer *r)
 /* Returns the index of the ring's tail buffer */
 static inline unsigned int br_tail_idx(const struct buffer *r)
 {
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	return r->data;
 }
@@ -979,7 +634,7 @@ static inline unsigned int br_tail_idx(const struct buffer *r)
 /* Returns a pointer to the ring's head buffer */
 static inline struct buffer *br_head(struct buffer *r)
 {
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	return r + br_head_idx(r);
 }
@@ -987,7 +642,7 @@ static inline struct buffer *br_head(struct buffer *r)
 /* Returns a pointer to the ring's tail buffer */
 static inline struct buffer *br_tail(struct buffer *r)
 {
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	return r + br_tail_idx(r);
 }
@@ -995,7 +650,7 @@ static inline struct buffer *br_tail(struct buffer *r)
 /* Returns the amount of data of the ring's HEAD buffer */
 static inline unsigned int br_data(const struct buffer *r)
 {
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	return b_data(r + br_head_idx(r));
 }
@@ -1003,7 +658,7 @@ static inline unsigned int br_data(const struct buffer *r)
 /* Returns non-zero if the ring is non-full or its tail has some room */
 static inline unsigned int br_has_room(const struct buffer *r)
 {
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	if (!br_full(r))
 		return 1;
@@ -1019,7 +674,7 @@ static inline struct buffer *br_tail_add(struct buffer *r)
 {
 	struct buffer *b;
 
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	b = br_tail(r);
 	if (!b_size(b))
@@ -1048,7 +703,7 @@ static inline struct buffer *br_head_pick(struct buffer *r)
 {
 	struct buffer *b;
 
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	b = br_head(r);
 	if (r->head != r->data) {
@@ -1066,7 +721,7 @@ static inline struct buffer *br_head_pick(struct buffer *r)
  */
 static inline struct buffer *br_del_head(struct buffer *r)
 {
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	if (r->head != r->data) {
 		r->head++;
@@ -1074,6 +729,79 @@ static inline struct buffer *br_del_head(struct buffer *r)
 			r->head = 1;
 	}
 	return br_head(r);
+}
+
+/*
+ * Buffer list management.
+ */
+
+/* Returns the number of users of at least one entry */
+static inline uint32_t bl_users(const struct bl_elem *head)
+{
+	return head->buf.head;
+}
+
+/* Returns the number of allocatable cells */
+static inline uint32_t bl_size(const struct bl_elem *head)
+{
+	return head->buf.size - 1;
+}
+
+/* Returns the number of cells currently in use */
+static inline uint32_t bl_used(const struct bl_elem *head)
+{
+	return head->buf.data;
+}
+
+/* Returns the number of cells still available */
+static inline uint32_t bl_avail(const struct bl_elem *head)
+{
+	return bl_size(head) - bl_used(head);
+}
+
+/* Initializes an array of <nbelem> elements of type bl_elem (one less will be
+ * allocatable). The initialized array is returned on success, otherwise NULL
+ * on allocation failure.
+ */
+static inline void bl_init(struct bl_elem *head, uint32_t nbelem)
+{
+	BUG_ON_HOT(nbelem < 2);
+	memset(head, 0, nbelem * sizeof(*head));
+	head->buf.size = nbelem;
+	head->next = 1;
+}
+
+/* Puts the cell at index <idx> back into the list <head>. It must have been
+ * freed from its buffer before calling this, and must correspond to the head
+ * of the caller. It returns the new head for the caller (the next cell
+ * immediately after the current one), or zero if the list is empty, in which
+ * case the caller is considered as no longer belonging to the list.
+ */
+static inline uint32_t bl_put(struct bl_elem *head, uint32_t idx)
+{
+	uint32_t n;
+
+	BUG_ON_HOT(!idx || idx >= head->buf.size);
+	n = head[idx].next;
+
+	/* if the element was the last one (head[idx].next == ~0) then the
+	 * chain is entirely gone and the caller is no longer in the list.
+	 */
+	if (n == ~0) {
+		BUG_ON_HOT(!head->buf.head);
+		head->buf.head--; // #users
+		n = 0;            // no next
+	}
+
+	/* If the free list was empty (next==0), this element becomes both the
+	 * first and the last one, otherwise it inserts itself before the
+	 * previous first free element.
+	 */
+	head[idx].next = head->next ? head->next : ~0U;
+	head->next = idx;
+	BUG_ON_HOT(!head->buf.data);
+	head->buf.data--; // one less allocated
+	return n;
 }
 
 #endif /* _HAPROXY_BUF_H */

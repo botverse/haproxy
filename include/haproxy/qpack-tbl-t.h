@@ -1,7 +1,7 @@
 /*
  * QPACK header table management (draft-ietf-quic-qpack-20) - type definitions
  *
- * Copyright 2020 HAProxy Technologies, Frédéric Lécaille <flecaille@haproxy.com>
+ * Copyright 2020 HAProxy Technologies, Frederic Lecaille <flecaille@haproxy.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -25,6 +25,8 @@
  */
 #ifndef _HAPROXY_QPACK_TBL_T_H
 #define _HAPROXY_QPACK_TBL_T_H
+
+#include <inttypes.h>
 
 /*
  * Gcc before 3.0 needs [0] to declare a variable-size array

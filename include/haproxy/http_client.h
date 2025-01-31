@@ -1,13 +1,20 @@
 #ifndef _HAPROXY_HTTPCLIENT_H
 #define _HAPROXY_HTTPCLIENT_H
 
+#include <haproxy/buf.h>
 #include <haproxy/http_client-t.h>
 
 void httpclient_destroy(struct httpclient *hc);
 void httpclient_stop_and_destroy(struct httpclient *hc);
+
+struct proxy *httpclient_create_proxy(const char *id);
 struct httpclient *httpclient_new(void *caller, enum http_meth_t meth, struct ist url);
+struct httpclient *httpclient_new_from_proxy(struct proxy *px, void *caller, enum http_meth_t meth, struct ist url);
+int httpclient_set_proxy(struct httpclient *hc, struct proxy *px);
 
 struct appctx *httpclient_start(struct httpclient *hc);
+int httpclient_set_dst(struct httpclient *hc, const char *dst);
+void httpclient_set_timeout(struct httpclient *hc, int timeout);
 int httpclient_res_xfer(struct httpclient *hc, struct buffer *dst);
 int httpclient_req_gen(struct httpclient *hc, const struct ist url, enum http_meth_t meth, const struct http_hdr *hdrs, const struct ist payload);
 int httpclient_req_xfer(struct httpclient *hc, struct ist src, int end);

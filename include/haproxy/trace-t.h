@@ -38,41 +38,53 @@
  */
 
 /* for use only in macro definitions above */
-#define TRC_ARG_PRIV  (0)
-#define TRC_ARG_CONN  (1 << 0)
-#define TRC_ARG_SESS  (1 << 1)
-#define TRC_ARG_STRM  (1 << 2)
-#define TRC_ARG_CHK   (1 << 3)
+#define TRC_ARG_PRIV   (0)
+#define TRC_ARG_CONN   (1 << 0)
+#define TRC_ARG_SESS   (1 << 1)
+#define TRC_ARG_STRM   (1 << 2)
+#define TRC_ARG_CHK    (1 << 3)
+#define TRC_ARG_QCON   (1 << 4)
+#define TRC_ARG_APPCTX (1 << 5)
 
-#define TRC_ARG1_PRIV (TRC_ARG_PRIV << 0)
-#define TRC_ARG1_CONN (TRC_ARG_CONN << 0)
-#define TRC_ARG1_SESS (TRC_ARG_SESS << 0)
-#define TRC_ARG1_STRM (TRC_ARG_STRM << 0)
-#define TRC_ARG1_CHK  (TRC_ARG_CHK  << 0)
+#define TRC_ARG1_PRIV   (TRC_ARG_PRIV << 0)
+#define TRC_ARG1_CONN   (TRC_ARG_CONN << 0)
+#define TRC_ARG1_SESS   (TRC_ARG_SESS << 0)
+#define TRC_ARG1_STRM   (TRC_ARG_STRM << 0)
+#define TRC_ARG1_CHK    (TRC_ARG_CHK  << 0)
+#define TRC_ARG1_QCON   (TRC_ARG_QCON << 0)
+#define TRC_ARG1_APPCTX (TRC_ARG_APPCTX << 0)
 
-#define TRC_ARG2_PRIV (TRC_ARG_PRIV << 8)
-#define TRC_ARG2_CONN (TRC_ARG_CONN << 8)
-#define TRC_ARG2_SESS (TRC_ARG_SESS << 8)
-#define TRC_ARG2_STRM (TRC_ARG_STRM << 8)
-#define TRC_ARG2_CHK  (TRC_ARG_CHK  << 8)
+#define TRC_ARG2_PRIV   (TRC_ARG_PRIV << 8)
+#define TRC_ARG2_CONN   (TRC_ARG_CONN << 8)
+#define TRC_ARG2_SESS   (TRC_ARG_SESS << 8)
+#define TRC_ARG2_STRM   (TRC_ARG_STRM << 8)
+#define TRC_ARG2_CHK    (TRC_ARG_CHK  << 8)
+#define TRC_ARG2_QCON   (TRC_ARG_QCON << 8)
+#define TRC_ARG2_APPCTX (TRC_ARG_APPCTX << 8)
 
-#define TRC_ARG3_PRIV (TRC_ARG_PRIV << 16)
-#define TRC_ARG3_CONN (TRC_ARG_CONN << 16)
-#define TRC_ARG3_SESS (TRC_ARG_SESS << 16)
-#define TRC_ARG3_STRM (TRC_ARG_STRM << 16)
-#define TRC_ARG3_CHK  (TRC_ARG_CHK  << 16)
+#define TRC_ARG3_PRIV   (TRC_ARG_PRIV << 16)
+#define TRC_ARG3_CONN   (TRC_ARG_CONN << 16)
+#define TRC_ARG3_SESS   (TRC_ARG_SESS << 16)
+#define TRC_ARG3_STRM   (TRC_ARG_STRM << 16)
+#define TRC_ARG3_CHK    (TRC_ARG_CHK  << 16)
+#define TRC_ARG3_QCON   (TRC_ARG_QCON << 16)
+#define TRC_ARG3_APPCTX (TRC_ARG_APPCTX << 16)
 
-#define TRC_ARG4_PRIV (TRC_ARG_PRIV << 24)
-#define TRC_ARG4_CONN (TRC_ARG_CONN << 24)
-#define TRC_ARG4_SESS (TRC_ARG_SESS << 24)
-#define TRC_ARG4_STRM (TRC_ARG_STRM << 24)
-#define TRC_ARG4_CHK  (TRC_ARG_CHK  << 24)
+#define TRC_ARG4_PRIV   (TRC_ARG_PRIV << 24)
+#define TRC_ARG4_CONN   (TRC_ARG_CONN << 24)
+#define TRC_ARG4_SESS   (TRC_ARG_SESS << 24)
+#define TRC_ARG4_STRM   (TRC_ARG_STRM << 24)
+#define TRC_ARG4_CHK    (TRC_ARG_CHK  << 24)
+#define TRC_ARG4_QCON   (TRC_ARG_QCON << 24)
+#define TRC_ARG4_APPCTX (TRC_ARG_APPCTX << 24)
 
 /* usable to detect the presence of any arg of the desired type */
-#define TRC_ARGS_CONN (TRC_ARG_CONN * 0x01010101U)
-#define TRC_ARGS_SESS (TRC_ARG_SESS * 0x01010101U)
-#define TRC_ARGS_STRM (TRC_ARG_STRM * 0x01010101U)
-#define TRC_ARGS_CHK  (TRC_ARG_CHK  * 0x01010101U)
+#define TRC_ARGS_CONN   (TRC_ARG_CONN * 0x01010101U)
+#define TRC_ARGS_SESS   (TRC_ARG_SESS * 0x01010101U)
+#define TRC_ARGS_STRM   (TRC_ARG_STRM * 0x01010101U)
+#define TRC_ARGS_CHK    (TRC_ARG_CHK  * 0x01010101U)
+#define TRC_ARGS_QCON   (TRC_ARG_QCON * 0x01010101U)
+#define TRC_ARGS_APPCTX (TRC_ARG_APPCTX * 0x01010101U)
 
 
 enum trace_state {
@@ -104,6 +116,8 @@ enum trace_lockon {
 	TRACE_LOCKON_SESSION,     // lock on the session that started the trace
 	TRACE_LOCKON_STREAM,      // lock on the stream that started the trace
 	TRACE_LOCKON_CHECK,       // lock on the check that started the trace
+	TRACE_LOCKON_QCON,        // lock on the QUIC connection that started the trace
+	TRACE_LOCKON_APPCTX,      // lock on the appctx that started the trace
 	TRACE_LOCKON_ARG1,        // lock on arg1, totally source-dependent
 	TRACE_LOCKON_ARG2,        // lock on arg2, totally source-dependent
 	TRACE_LOCKON_ARG3,        // lock on arg3, totally source-dependent
@@ -122,6 +136,20 @@ struct trace_event {
 	const char *desc;
 };
 
+/* context of a trace in progress. Unknown fields are NULL */
+struct trace_ctx {
+	const struct listener *li;
+	const struct proxy *fe;
+	const struct proxy *be;
+	const struct server *srv;
+	const struct session *sess;
+	const struct stream *strm;
+	const struct connection *conn;
+	const struct check *check;
+	const struct quic_conn *qc;
+	const struct appctx *appctx;
+};
+
 /* Regarding the verbosity, if <decoding> is not NULL, it must point to a NULL-
  * terminated array of name:description, which will define verbosity levels
  * implemented by the decoding callback. The verbosity value will default to
@@ -138,6 +166,8 @@ struct trace_source {
 	                   const struct trace_source *src,
 	                   const struct ist where, const struct ist func,
 	                   const void *a1, const void *a2, const void *a3, const void *a4);
+	void (*fill_ctx)(struct trace_ctx *ctx, const struct trace_source *src,
+	                 const void *a1, const void *a2, const void *a3, const void *a4);
 	uint32_t arg_def;        // argument definitions (sum of TRC_ARG{1..4}_*)
 	const struct name_desc *lockon_args; // must be 4 entries if not NULL
 	const struct name_desc *decoding;    // null-terminated if not NULL
@@ -153,6 +183,8 @@ struct trace_source {
 	/* trace state part below */
 	enum trace_state state;
 	const void *lockon_ptr;  // what to lockon when lockon is set
+	const struct trace_source *follow; // other trace source's tracker to follow
+	int cmdline;             // true if source was activated via -dt command line args
 };
 
 #endif /* _HAPROXY_TRACE_T_H */

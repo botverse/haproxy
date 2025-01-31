@@ -110,18 +110,25 @@ const struct comp_algo comp_algos[] =
  * Add a content-type in the configuration
  * Returns 0 in case of success, 1 in case of allocation failure.
  */
-int comp_append_type(struct comp *comp, const char *type)
+int comp_append_type(struct comp_type **types, const char *type)
 {
 	struct comp_type *comp_type;
 
 	comp_type = calloc(1, sizeof(*comp_type));
 	if (!comp_type)
-		return 1;
+		goto fail;
 	comp_type->name_len = strlen(type);
 	comp_type->name = strdup(type);
-	comp_type->next = comp->types;
-	comp->types = comp_type;
+	if (!comp_type->name)
+		goto fail_free_comp_type;
+	comp_type->next = *types;
+	*types = comp_type;
 	return 0;
+
+fail_free_comp_type:
+	free(comp_type);
+fail:
+	return 1;
 }
 
 /*
@@ -129,7 +136,7 @@ int comp_append_type(struct comp *comp, const char *type)
  * Returns 0 in case of success, -1 if the <algo> is unmanaged, 1 in case of
  * allocation failure.
  */
-int comp_append_algo(struct comp *comp, const char *algo)
+int comp_append_algo(struct comp_algo **algos, const char *algo)
 {
 	struct comp_algo *comp_algo;
 	int i;
@@ -140,8 +147,8 @@ int comp_append_algo(struct comp *comp, const char *algo)
 			if (!comp_algo)
 				return 1;
 			memmove(comp_algo, &comp_algos[i], sizeof(struct comp_algo));
-			comp_algo->next = comp->algos;
-			comp->algos = comp_algo;
+			comp_algo->next = *algos;
+			*algos = comp_algo;
 			return 0;
 		}
 	}
@@ -300,7 +307,7 @@ static int rfc195x_add_data(struct comp_ctx *comp_ctx, const char *in_data, int 
 		 * data and need a buffer now. We reuse the same buffer, as it's
 		 * not used out of the scope of a series of add_data()*, end().
 		 */
-		if (b_alloc(&tmpbuf) == NULL)
+		if (b_alloc(&tmpbuf, DB_PERMANENT) == NULL)
 			return -1; /* no memory */
 		b_reset(&tmpbuf);
 		memcpy(b_tail(&tmpbuf), comp_ctx->direct_ptr, comp_ctx->direct_len);
@@ -350,6 +357,8 @@ static int rfc195x_flush_or_finish(struct comp_ctx *comp_ctx, struct buffer *out
 
 	if (finish)
 		b_add(out, slz_finish(strm, b_tail(out)));
+	else
+		b_add(out, slz_flush(strm, b_tail(out)));
 
 	out_len = b_data(out) - out_len;
 
@@ -712,14 +721,6 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 }};
 
 INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
-
-__attribute__((constructor))
-static void __comp_fetch_init(void)
-{
-#if defined(USE_ZLIB) && defined(DEFAULT_MAXZLIBMEM)
-	global.maxzlibmem = DEFAULT_MAXZLIBMEM * 1024U * 1024U;
-#endif
-}
 
 static void comp_register_build_opts(void)
 {

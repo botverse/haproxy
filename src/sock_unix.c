@@ -12,7 +12,6 @@
 
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -30,8 +29,9 @@
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
 #include <haproxy/listener.h>
-#include <haproxy/receiver-t.h>
 #include <haproxy/namespace.h>
+#include <haproxy/protocol.h>
+#include <haproxy/receiver-t.h>
 #include <haproxy/sock.h>
 #include <haproxy/sock_unix.h>
 #include <haproxy/tools.h>
@@ -41,9 +41,36 @@ struct proto_fam proto_fam_unix = {
 	.name = "unix",
 	.sock_domain = PF_UNIX,
 	.sock_family = AF_UNIX,
+	.real_family = AF_UNIX,
 	.sock_addrlen = sizeof(struct sockaddr_un),
 	.l3_addrlen = sizeof(((struct sockaddr_un*)0)->sun_path),
 	.addrcmp = sock_unix_addrcmp,
+	.bind = sock_unix_bind_receiver,
+	.get_src = sock_get_src,
+	.get_dst = sock_get_dst,
+};
+
+struct proto_fam proto_fam_abns = {
+	.name = "abns",
+	.sock_domain = AF_UNIX,
+	.sock_family = AF_CUST_ABNS,
+	.real_family = AF_UNIX,
+	.sock_addrlen = sizeof(struct sockaddr_un),
+	.l3_addrlen = sizeof(((struct sockaddr_un*)0)->sun_path),
+	.addrcmp = sock_abns_addrcmp,
+	.bind = sock_unix_bind_receiver,
+	.get_src = sock_get_src,
+	.get_dst = sock_get_dst,
+};
+
+struct proto_fam proto_fam_abnsz = {
+	.name = "abnsz",
+	.sock_domain = AF_UNIX,
+	.sock_family = AF_CUST_ABNSZ,
+	.real_family = AF_UNIX,
+	.sock_addrlen = sizeof(struct sockaddr_un),
+	.l3_addrlen = sizeof(((struct sockaddr_un*)0)->sun_path),
+	.addrcmp = sock_abnsz_addrcmp,
 	.bind = sock_unix_bind_receiver,
 	.get_src = sock_get_src,
 	.get_dst = sock_get_dst,
@@ -58,12 +85,58 @@ struct proto_fam proto_fam_unix = {
  */
 
 
-/* Compares two AF_UNIX sockaddr addresses. Returns 0 if they match or non-zero
- * if they do not match. It also supports ABNS socket addresses (those starting
- * with \0). For regular UNIX sockets however, this does explicitly support
- * matching names ending exactly with .XXXXX.tmp which are newly bound sockets
- * about to be replaced; this suffix is then ignored. Note that our UNIX socket
- * paths are always zero-terminated.
+/* Compares two AF_CUST_ABNS sockaddr addresses (ABNS UNIX sockets). Returns 0 if
+ * they match or non-zero.
+ */
+int sock_abns_addrcmp(const struct sockaddr_storage *a, const struct sockaddr_storage *b)
+{
+	const struct sockaddr_un *au = (const struct sockaddr_un *)a;
+	const struct sockaddr_un *bu = (const struct sockaddr_un *)b;
+
+	if (a->ss_family != b->ss_family)
+		return -1;
+
+	if (a->ss_family != AF_CUST_ABNS)
+		return -1;
+
+	if (au->sun_path[0] != bu->sun_path[0])
+		return -1;
+
+	if (au->sun_path[0] != '\0')
+		return -1;
+
+	return memcmp(au->sun_path, bu->sun_path, sizeof(au->sun_path));
+}
+
+
+/* Compares two AF_CUST_ABNSZ sockaddr addresses (ABNSZ UNIX sockets). Returns 0 if
+ * they match or non-zero.
+ */
+int sock_abnsz_addrcmp(const struct sockaddr_storage *a, const struct sockaddr_storage *b)
+{
+	const struct sockaddr_un *au = (const struct sockaddr_un *)a;
+	const struct sockaddr_un *bu = (const struct sockaddr_un *)b;
+
+	if (a->ss_family != b->ss_family)
+		return -1;
+
+	if (a->ss_family != AF_CUST_ABNSZ)
+		return -1;
+
+	if (au->sun_path[0] != bu->sun_path[0])
+		return -1;
+
+	if (au->sun_path[0] != '\0')
+		return -1;
+
+	return strncmp(au->sun_path + 1, bu->sun_path + 1, sizeof(au->sun_path) - 1);
+}
+
+/* Compares two AF_UNIX sockaddr addresses (regular UNIX sockets). Returns 0 if
+ * they match or non-zero. Tis does explicitly support matching names ending
+ * exactly with .XXXXX.tmp which are newly bound sockets about to be replaced;
+ * this suffix is then ignored. Note that our UNIX socket paths are always
+ * zero-terminated.
  */
 int sock_unix_addrcmp(const struct sockaddr_storage *a, const struct sockaddr_storage *b)
 {
@@ -77,13 +150,7 @@ int sock_unix_addrcmp(const struct sockaddr_storage *a, const struct sockaddr_st
 	if (a->ss_family != AF_UNIX)
 		return -1;
 
-	if (au->sun_path[0] != bu->sun_path[0])
-		return -1;
-
-	if (au->sun_path[0] == 0)
-		return memcmp(au->sun_path, bu->sun_path, sizeof(au->sun_path));
-
-	idx = 1; dot = 0;
+	idx = 0; dot = 0;
 	while (au->sun_path[idx] == bu->sun_path[idx]) {
 		if (au->sun_path[idx] == 0)
 			return 0;
@@ -94,7 +161,21 @@ int sock_unix_addrcmp(const struct sockaddr_storage *a, const struct sockaddr_st
 
 	/* Now we have a difference. It's OK if they are within or after a
 	 * sequence of digits following a dot, and are followed by ".tmp".
+	 *
+	 * make sure to perform the check against tempname if the compared
+	 * string is in "final" format (does not end with ".XXXX.tmp").
+	 *
+	 * Examples:
+	 *     /tmp/test matches with /tmp/test.1822.tmp
+	 *     /tmp/test.1822.tmp matches with /tmp/test.XXXX.tmp
 	 */
+	if (au->sun_path[idx] == 0 || bu->sun_path[idx] == 0) {
+		if (au->sun_path[idx] == '.' || bu->sun_path[idx] == '.')
+			dot = idx; /* try to match against temp path */
+		else
+			return -1; /* invalid temp path */
+	}
+
 	if (!dot)
 		return -1;
 
@@ -140,6 +221,30 @@ int sock_unix_bind_receiver(struct receiver *rx, char **errmsg)
 
 	if (rx->flags & RX_F_BOUND)
 		return ERR_NONE;
+
+	if (rx->flags & RX_F_MUST_DUP) {
+		/* this is a secondary receiver that is an exact copy of a
+		 * reference which must already be bound (or has failed).
+		 * We'll try to dup() the other one's FD and take it. We
+		 * try hard not to reconfigure the socket since it's shared.
+		 */
+		BUG_ON(!rx->shard_info);
+		if (!(rx->shard_info->ref->flags & RX_F_BOUND)) {
+			/* it's assumed that the first one has already reported
+			 * the error, let's not spam with another one, and do
+			 * not set ERR_ALERT.
+			 */
+			err |= ERR_RETRYABLE;
+			goto bind_ret_err;
+		}
+		/* taking the other one's FD will result in it being marked
+		 * extern and being dup()ed. Let's mark the receiver as
+		 * inherited so that it properly bypasses all second-stage
+		 * setup and avoids being passed to new processes.
+		 */
+		rx->flags |= RX_F_INHERITED;
+		rx->fd = rx->shard_info->ref->fd;
+	}
 
 	/* if no FD was assigned yet, we'll have to either find a compatible
 	 * one or create a new one.
@@ -218,8 +323,8 @@ int sock_unix_bind_receiver(struct receiver *rx, char **errmsg)
 	}
 	addr.sun_family = AF_UNIX;
 
-	/* WT: shouldn't we use my_socketat(rx->netns) here instead ? */
-	fd = socket(rx->proto->fam->sock_domain, rx->proto->sock_type, rx->proto->sock_prot);
+	fd = my_socketat(rx->settings->netns, rx->proto->fam->sock_domain,
+		rx->proto->sock_type, rx->proto->sock_prot);
 	if (fd < 0) {
 		err |= ERR_FATAL | ERR_ALERT;
 		memprintf(errmsg, "cannot create receiving socket (%s)", strerror(errno));
@@ -227,19 +332,37 @@ int sock_unix_bind_receiver(struct receiver *rx, char **errmsg)
 	}
 
  fd_ready:
+	if (ext && fd < global.maxsock && fdtab[fd].owner) {
+		/* This FD was already bound so this means that it was already
+		 * known and registered before parsing, hence it's an inherited
+		 * FD. The only reason why it's already known here is that it
+		 * has been registered multiple times (multiple listeners on the
+		 * same, or a "shards" directive on the line). There cannot be
+		 * multiple listeners on one FD but at least we can create a
+		 * new one from the original one. We won't reconfigure it,
+		 * however, as this was already done for the first one.
+		 */
+		fd = dup(fd);
+		if (fd == -1) {
+			err |= ERR_RETRYABLE | ERR_ALERT;
+			memprintf(errmsg, "cannot dup() receiving socket (%s)", strerror(errno));
+			goto bind_return;
+		}
+	}
+
 	if (fd >= global.maxsock) {
 		err |= ERR_FATAL | ERR_ABORT | ERR_ALERT;
 		memprintf(errmsg, "not enough free sockets (raise '-n' parameter)");
 		goto bind_close_return;
 	}
 
-	if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1) {
+	if (fd_set_nonblock(fd) == -1) {
 		err |= ERR_FATAL | ERR_ALERT;
 		memprintf(errmsg, "cannot make socket non-blocking");
 		goto bind_close_return;
 	}
 
-	if (!ext && bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+	if (!ext && bind(fd, (struct sockaddr *)&addr, get_addr_len(&rx->addr)) < 0) {
 		/* note that bind() creates the socket <tempname> on the file system */
 		if (errno == EADDRINUSE) {
 			/* the old process might still own it, let's retry */
@@ -285,7 +408,14 @@ int sock_unix_bind_receiver(struct receiver *rx, char **errmsg)
 	rx->fd = fd;
 	rx->flags |= RX_F_BOUND;
 
-	fd_insert(fd, rx->owner, rx->iocb, thread_mask(rx->bind_thread) & all_threads_mask);
+	if (!path[0]) {
+		/* ABNS sockets do not support suspend, and they conflict with
+		 * other ones (no reuseport), so they must always be unbound.
+		 */
+		rx->flags |= RX_F_NON_SUSPENDABLE;
+	}
+
+	fd_insert(fd, rx->owner, rx->iocb, rx->bind_tgroup, rx->bind_thread);
 
 	/* for now, all regularly bound TCP listeners are exportable */
 	if (!(rx->flags & RX_F_INHERITED))
@@ -306,11 +436,17 @@ int sock_unix_bind_receiver(struct receiver *rx, char **errmsg)
 		unlink(backname);
  bind_return:
 	if (errmsg && *errmsg) {
-		if (!ext)
-			memprintf(errmsg, "%s [%s]", *errmsg, path);
+		if (!ext) {
+			char *path_str;
+
+			path_str = sa2str((struct sockaddr_storage *)&rx->addr, 0, 0);
+			memprintf(errmsg, "%s [%s]", *errmsg, ((path_str) ? path_str : ""));
+			ha_free(&path_str);
+		}
 		else
 			memprintf(errmsg, "%s [fd %d]", *errmsg, fd);
 	}
+ bind_ret_err:
 	return err;
 
  bind_close_return:

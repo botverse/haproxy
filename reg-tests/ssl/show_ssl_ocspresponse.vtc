@@ -21,13 +21,15 @@
 
 varnishtest "Test the 'show ssl ocsp-response' and 'show ssl cert foo.pem.ocsp' features of the CLI"
 feature cmd "$HAPROXY_PROGRAM -cc 'version_atleast(2.5-dev0)'"
-feature cmd "$HAPROXY_PROGRAM -cc 'feature(OPENSSL)'"
+feature cmd "$HAPROXY_PROGRAM -cc 'feature(OPENSSL) && !ssllib_name_startswith(BoringSSL) && !ssllib_name_startswith(wolfSSL)'"
 feature cmd "command -v socat && command -v openssl"
 feature ignore_unknown_macro
 
 haproxy h1 -conf {
     global
+    .if !ssllib_name_startswith(AWS-LC)
         tune.ssl.default-dh-param 2048
+    .endif
         tune.ssl.capture-buffer-size 1
         stats socket "${tmpdir}/h1/stats" level admin
 
@@ -62,6 +64,14 @@ haproxy h1 -cli {
     expect ~ "Responder Id: C = FR, O = HAProxy Technologies, CN = ocsp.haproxy.com"
     send "show ssl ocsp-response 303b300906052b0e03021a050004148a83e0060faff709ca7e9b95522a2e81635fda0a0414f652b0e435d5ea923851508f0adbe92d85de007a0202100f"
     expect ~ "Cert Status: good"
+}
+
+# Test the "show ssl ocsp-response" command with a certificate path as parameter
+shell {
+    ocsp_response=$(echo "show ssl ocsp-response ${testdir}/show_ocsp_server.pem" | socat "${tmpdir}/h1/stats" -)
+
+    echo "$ocsp_response" | grep "Responder Id: C = FR, O = HAProxy Technologies, CN = ocsp.haproxy.com" &&
+    echo "$ocsp_response" | grep "Cert Status: good"
 }
 
 # Test the "show ssl cert foo.pem.ocsp" command
@@ -103,7 +113,8 @@ haproxy h1 -cli {
 
 # Change the server certificate's OCSP response through a transaction
 shell {
-    printf "set ssl cert ${testdir}/show_ocsp_server.pem <<\n$(cat ${testdir}/show_ocsp_server.pem)\n\n" | socat  "${tmpdir}/h1/stats" -
+    printf "set ssl cert ${testdir}/show_ocsp_server.pem <<\n$(cat ${testdir}/show_ocsp_server.pem | sed  '/^$/d')\n\n" | socat  "${tmpdir}/h1/stats" -
+    printf "set ssl cert ${testdir}/show_ocsp_server.pem.issuer <<\n$(cat ${testdir}/show_ocsp_server.pem.issuer | sed  '/^$/d')\n\n" | socat  "${tmpdir}/h1/stats" -
     printf "set ssl cert ${testdir}/show_ocsp_server.pem.ocsp <<\n$(cat ${testdir}/show_ocsp_server.pem.ocsp|openssl base64)\n\n" | socat  "${tmpdir}/h1/stats" -
 }
 

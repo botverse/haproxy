@@ -5,7 +5,7 @@ feature ignore_unknown_macro
 
 server s1 {
 	rxreq
-	txresp
+	txresp -hdr "Connection: close"
 } -repeat 8 -start
 
 haproxy h1 -conf {
@@ -98,4 +98,10 @@ client c1 -connect ${h1_fe_sock} {
 	rxresp
 	expect resp.status == 200
 	expect resp.http.x-var_body_mykey ~ "myvalue"
+
+	txreq -url "/" \
+	 -body "{\"my.key\":[\"val1\",\"val2\",\"val3\"],\"key2\":\"val4\"}"
+	expect resp.status == 200
+	expect resp.http.x-var_body_mykey ~ "[\"val1\",\"val2\",\"val3\"]"
+
 } -run

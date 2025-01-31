@@ -1,7 +1,7 @@
 /*
  * UDP protocol layer on top of AF_INET/AF_INET6
  *
- * Copyright 2019 HAProxy Technologies, Frédéric Lécaille <flecaille@haproxy.com>
+ * Copyright 2019 HAProxy Technologies, Frederic Lecaille <flecaille@haproxy.com>
  *
  * Partial merge by Emeric Brun <ebrun@haproxy.com>
  *
@@ -14,7 +14,6 @@
 
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,7 +49,7 @@ struct protocol proto_udp4 = {
 	.name           = "udp4",
 
 	/* connection layer */
-	.ctrl_type      = SOCK_DGRAM,
+	.xprt_type      = PROTO_TYPE_DGRAM,
 	.listen         = udp_bind_listener,
 	.enable         = udp_enable_listener,
 	.disable        = udp_disable_listener,
@@ -73,8 +72,9 @@ struct protocol proto_udp4 = {
 	.rx_enable      = sock_enable,
 	.rx_disable     = sock_disable,
 	.rx_unbind      = sock_unbind,
-	.receivers      = LIST_HEAD_INIT(proto_udp4.receivers),
-	.nb_receivers   = 0,
+#ifdef SO_REUSEPORT
+	.flags          = PROTO_F_REUSEPORT_SUPPORTED,
+#endif
 };
 
 INITCALL1(STG_REGISTER, protocol_register, &proto_udp4);
@@ -84,7 +84,7 @@ struct protocol proto_udp6 = {
 	.name           = "udp6",
 
 	/* connection layer */
-	.ctrl_type      = SOCK_DGRAM,
+	.xprt_type      = PROTO_TYPE_DGRAM,
 	.listen         = udp_bind_listener,
 	.enable         = udp_enable_listener,
 	.disable        = udp_disable_listener,
@@ -107,8 +107,9 @@ struct protocol proto_udp6 = {
 	.rx_enable      = sock_enable,
 	.rx_disable     = sock_disable,
 	.rx_unbind      = sock_unbind,
-	.receivers      = LIST_HEAD_INIT(proto_udp6.receivers),
-	.nb_receivers   = 0,
+#ifdef SO_REUSEPORT
+	.flags          = PROTO_F_REUSEPORT_SUPPORTED,
+#endif
 };
 
 INITCALL1(STG_REGISTER, protocol_register, &proto_udp6);
@@ -141,6 +142,33 @@ int udp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 	if (!(listener->rx.flags & RX_F_BOUND)) {
 		msg = "receiving socket not bound";
 		goto udp_return;
+	}
+
+	/* we may want to adjust the output buffer (tune.sndbuf.backend) */
+	if (global.tune.frontend_rcvbuf)
+		setsockopt(listener->rx.fd, SOL_SOCKET, SO_RCVBUF, &global.tune.frontend_rcvbuf, sizeof(global.tune.frontend_rcvbuf));
+
+	if (global.tune.frontend_sndbuf)
+		setsockopt(listener->rx.fd, SOL_SOCKET, SO_SNDBUF, &global.tune.frontend_sndbuf, sizeof(global.tune.frontend_sndbuf));
+
+	if (listener->rx.flags & RX_F_PASS_PKTINFO) {
+		/* set IP_PKTINFO to retrieve destination address on recv */
+		switch (listener->rx.addr.ss_family) {
+		case AF_INET:
+#if defined(IP_PKTINFO)
+			setsockopt(listener->rx.fd, IPPROTO_IP, IP_PKTINFO, &one, sizeof(one));
+#elif defined(IP_RECVDSTADDR)
+			setsockopt(listener->rx.fd, IPPROTO_IP, IP_RECVDSTADDR, &one, sizeof(one));
+#endif /* IP_PKTINFO || IP_RECVDSTADDR */
+			break;
+		case AF_INET6:
+#ifdef IPV6_RECVPKTINFO
+			setsockopt(listener->rx.fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &one, sizeof(one));
+#endif
+			break;
+		default:
+			break;
+		}
 	}
 
 	listener_set_state(listener, LI_LISTEN);
@@ -177,7 +205,9 @@ static void udp_disable_listener(struct listener *l)
  * suspend the receiver, we want it to stop receiving traffic, which means that
  * the socket must be unhashed from the kernel's socket table. The simple way
  * to do this is to connect to any address that is reachable and will not be
- * used by regular traffic, and a great one is reconnecting to self.
+ * used by regular traffic, and a great one is reconnecting to self. Note that
+ * inherited FDs are neither suspended nor resumed, we only enable/disable
+ * polling on them.
  */
 int udp_suspend_receiver(struct receiver *rx)
 {
@@ -191,14 +221,14 @@ int udp_suspend_receiver(struct receiver *rx)
 	 * parent process and any possible subsequent worker inheriting it.
 	 */
 	if (rx->flags & RX_F_INHERITED)
-		return -1;
+		goto done;
 
 	if (getsockname(rx->fd, (struct sockaddr *)&ss, &len) < 0)
 		return -1;
 
 	if (connect(rx->fd, (struct sockaddr *)&ss, len) < 0)
 		return -1;
-
+ done:
 	/* not necessary but may make debugging clearer */
 	fd_stop_recv(rx->fd);
 	return 1;
@@ -208,7 +238,8 @@ int udp_suspend_receiver(struct receiver *rx)
  * was totally stopped, or > 0 if correctly suspended.
  * The principle is to reverse the change above, we'll break the connection by
  * connecting to AF_UNSPEC. The association breaks and the socket starts to
- * receive from everywhere again.
+ * receive from everywhere again. Note that inherited FDs are neither suspended
+ * nor resumed, we only enable/disable polling on them.
  */
 int udp_resume_receiver(struct receiver *rx)
 {
@@ -217,7 +248,7 @@ int udp_resume_receiver(struct receiver *rx)
 	if (rx->fd < 0)
 		return 0;
 
-	if (connect(rx->fd, &sa, sizeof(sa)) < 0)
+	if (!(rx->flags & RX_F_INHERITED) && connect(rx->fd, &sa, sizeof(sa)) < 0)
 		return -1;
 
 	fd_want_recv(rx->fd);

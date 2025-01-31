@@ -38,15 +38,17 @@
  */
 static void cmn_cli_set_msg(struct appctx *appctx, char *err, char *msg, int cli_state)
 {
+	struct cli_print_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
 	FLT_OT_FUNC("%p, %p, %p, %d", appctx, err, msg, cli_state);
 
 	if ((appctx == NULL) || ((err == NULL) && (msg == NULL)))
 		FLT_OT_RETURN();
 
-	appctx->ctx.cli.err = (err == NULL) ? msg : err;
-	appctx->st0         = (appctx->ctx.cli.err == NULL) ? CLI_ST_PROMPT : cli_state;
+	ctx->err    = (err == NULL) ? msg : err;
+	appctx->st0 = (ctx->err == NULL) ? CLI_ST_PROMPT : cli_state;
 
-	FLT_OT_DBG(1, "err(%d): \"%s\"", appctx->st0, appctx->ctx.cli.err);
+	FLT_OT_DBG(1, "err(%d): \"%s\"", appctx->st0, ctx->err);
 
 	FLT_OT_RETURN();
 }
@@ -95,9 +97,9 @@ static int flt_ot_cli_parse_debug(char **args, char *payload, struct appctx *app
 		(void)memprintf(&msg, FLT_OT_CLI_CMD " : current debug level is %hhu", value);
 	}
 
-	cmn_cli_set_msg(appctx, err, msg, CLI_ST_PRINT_FREE);
+	cmn_cli_set_msg(appctx, err, msg, CLI_ST_PRINT_DYNERR);
 
-	FLT_OT_RETURN(retval);
+	FLT_OT_RETURN_INT(retval);
 }
 
 #endif /* DEBUG_OT */
@@ -135,9 +137,9 @@ static int flt_ot_cli_parse_disabled(char **args, char *payload, struct appctx *
 		(void)memprintf(&msg, "%s%s" FLT_OT_CLI_CMD " : filter %sabled", FLT_OT_CLI_MSG_CAT(msg), value ? "dis" : "en");
 	} FLT_OT_PROXIES_LIST_END();
 
-	cmn_cli_set_msg(appctx, NULL, msg, CLI_ST_PRINT_FREE);
+	cmn_cli_set_msg(appctx, NULL, msg, CLI_ST_PRINT_DYNERR);
 
-	FLT_OT_RETURN(retval);
+	FLT_OT_RETURN_INT(retval);
 }
 
 
@@ -173,9 +175,9 @@ static int flt_ot_cli_parse_option(char **args, char *payload, struct appctx *ap
 		(void)memprintf(&msg, "%s%s" FLT_OT_CLI_CMD " : filter set %s-errors", FLT_OT_CLI_MSG_CAT(msg), value ? "hard" : "soft");
 	} FLT_OT_PROXIES_LIST_END();
 
-	cmn_cli_set_msg(appctx, NULL, msg, CLI_ST_PRINT_FREE);
+	cmn_cli_set_msg(appctx, NULL, msg, CLI_ST_PRINT_DYNERR);
 
-	FLT_OT_RETURN(retval);
+	FLT_OT_RETURN_INT(retval);
 }
 
 
@@ -236,9 +238,9 @@ static int flt_ot_cli_parse_logging(char **args, char *payload, struct appctx *a
 		} FLT_OT_PROXIES_LIST_END();
 	}
 
-	cmn_cli_set_msg(appctx, err, msg, CLI_ST_PRINT_FREE);
+	cmn_cli_set_msg(appctx, err, msg, CLI_ST_PRINT_DYNERR);
 
-	FLT_OT_RETURN(retval);
+	FLT_OT_RETURN_INT(retval);
 }
 
 
@@ -287,9 +289,9 @@ static int flt_ot_cli_parse_rate(char **args, char *payload, struct appctx *appc
 		} FLT_OT_PROXIES_LIST_END();
 	}
 
-	cmn_cli_set_msg(appctx, err, msg, CLI_ST_PRINT_FREE);
+	cmn_cli_set_msg(appctx, err, msg, CLI_ST_PRINT_DYNERR);
 
-	FLT_OT_RETURN(retval);
+	FLT_OT_RETURN_INT(retval);
 }
 
 
@@ -341,9 +343,9 @@ static int flt_ot_cli_parse_status(char **args, char *payload, struct appctx *ap
 		nl = "\n";
 	} FLT_OT_PROXIES_LIST_END();
 
-	cmn_cli_set_msg(appctx, NULL, msg, CLI_ST_PRINT_FREE);
+	cmn_cli_set_msg(appctx, NULL, msg, CLI_ST_PRINT_DYNERR);
 
-	FLT_OT_RETURN(retval);
+	FLT_OT_RETURN_INT(retval);
 }
 
 

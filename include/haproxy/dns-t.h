@@ -27,8 +27,8 @@
 #include <haproxy/connection-t.h>
 #include <haproxy/buf-t.h>
 #include <haproxy/dgram-t.h>
+#include <haproxy/dns_ring-t.h>
 #include <haproxy/obj_type-t.h>
-#include <haproxy/ring-t.h>
 #include <haproxy/stats-t.h>
 #include <haproxy/task-t.h>
 #include <haproxy/thread.h>
@@ -78,7 +78,7 @@ struct dns_additional_record {
  */
 struct dns_stream_server {
 	struct server *srv;
-	struct ring *ring_req;
+	struct dns_ring *ring_req;
 	int max_slots;
 	int maxconn;
 	int idle_conns;
@@ -97,7 +97,7 @@ struct dns_stream_server {
 
 struct dns_dgram_server {
 	struct dgram_conn conn;  /* transport layer */
-	struct ring *ring_req;
+	struct dns_ring *ring_req;
 	size_t ofs_req;           // ring buffer reader offset
 };
 
@@ -121,7 +121,7 @@ struct dns_session {
 	struct task *task_exp;
 	struct eb_root query_ids; /* tree to quickly lookup/retrieve query ids currently in use */
 	size_t ofs;            // ring buffer reader offset
-	struct ring ring;
+	struct dns_ring ring;
 	struct  {
 		uint16_t len;
 		uint16_t offset;
@@ -136,6 +136,7 @@ struct dns_session {
 struct dns_nameserver {
 	char *id;                       /* nameserver unique identifier */
 	void *parent;
+	unsigned int puid;              /* parent-unique numeric id */
 	struct {
 		const char *file;       /* file where the section appears */
 		int         line;       /* line where the section appears */
@@ -153,8 +154,9 @@ struct dns_nameserver {
 
 /* mixed dns and resolver counters, we will have to split them */
 struct dns_counters {
-	char *id;
-	char *pid;
+	char *id;               /* nameserver id */
+	char *pid;              /* parent resolver id */
+	unsigned int ns_puid;   /* nameserver numerical id (ns->puid) */
 	long long sent;         /* - queries sent */
 	long long snd_error;    /* - sending errors */
 	union {

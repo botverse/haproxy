@@ -25,6 +25,7 @@
 #include <haproxy/applet-t.h>
 #include <haproxy/stick_table-t.h>
 #include <haproxy/vars-t.h>
+#include <haproxy/log-t.h>
 
 struct session;
 struct stream;
@@ -40,6 +41,9 @@ enum act_from {
 	ACT_F_TCP_CHK,     /* tcp-check. */
 	ACT_F_CFG_PARSER,  /* config parser */
 	ACT_F_CLI_PARSER,  /* command line parser */
+#ifdef USE_QUIC
+	ACT_F_QUIC_INIT,   /* quic-initial */
+#endif
 };
 
 enum act_return {
@@ -99,6 +103,7 @@ enum act_name {
 enum act_timeout_name {
 	ACT_TIMEOUT_SERVER,
 	ACT_TIMEOUT_TUNNEL,
+	ACT_TIMEOUT_CLIENT,
 };
 
 enum act_normalize_uri {
@@ -140,15 +145,15 @@ struct act_rule {
 		struct {
 			int i;                 /* integer param (status, nice, loglevel, ..) */
 			struct ist str;        /* string param (reason, header name, ...) */
-			struct list fmt;       /* log-format compatible expression */
+			struct lf_expr fmt;    /* log-format compatible expression */
 			struct my_regex *re;   /* used by replace-header/value/uri/path */
 		} http;                        /* args used by some HTTP rules */
 		struct http_reply *http_reply; /* HTTP response to be used by return/deny/tarpit rules */
 		struct redirect_rule *redir;   /* redirect rule or "http-request redirect" */
 		struct {
 			char *ref;             /* MAP or ACL file name to update */
-			struct list key;       /* pattern to retrieve MAP or ACL key */
-			struct list value;     /* pattern to retrieve MAP value */
+			struct lf_expr key;    /* pattern to retrieve MAP or ACL key */
+			struct lf_expr value;  /* pattern to retrieve MAP value */
 		} map;
 		struct sample_expr *expr;
 		struct {
@@ -166,14 +171,16 @@ struct act_rule {
 		} timeout;
 		struct hlua_rule *hlua_rule;
 		struct {
-			struct list fmt;            /* log-format compatible expression */
+			struct lf_expr fmt;         /* log-format compatible expression */
 			struct sample_expr *expr;
-			uint64_t name_hash;
-			enum vars_scope scope;
+			struct var_desc desc;
+			uint conditions;            /* Bitfield of the conditions passed to this set-var call */
 		} vars;
 		struct {
 			int sc;
 			unsigned int idx;
+			long long int value;
+			struct sample_expr *expr;
 		} gpc;
 		struct {
 			int sc;
@@ -182,6 +189,15 @@ struct act_rule {
 			struct sample_expr *expr;
 		} gpt;
 		struct track_ctr_prm trk_ctr;
+		struct {
+			char *srvname; /* server name from config parsing. */
+			struct server *srv; /* target server to attach the connection */
+			struct sample_expr *name; /* used to differentiate idle connections */
+		} attach_srv; /* 'attach-srv' rule */
+		struct {
+			int value;
+			struct sample_expr *expr;
+		} expr_int; /* expr or int value (when expr is NULL)*/
 		struct {
 			void *p[4];
 		} act;                         /* generic pointers to be used by custom actions */

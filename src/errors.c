@@ -1,5 +1,9 @@
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <syslog.h>
 
 #include <haproxy/api.h>
@@ -15,7 +19,9 @@
 
 /* A global buffer used to store all startup alerts/warnings. It will then be
  * retrieve on the CLI. */
-static struct ring *startup_logs = NULL;
+struct ring *startup_logs = NULL;
+uint tot_warnings = 0;
+static struct ring *shm_startup_logs = NULL;
 
 /* A thread local buffer used to store all alerts/warnings. It can be used to
  * retrieve them for CLI commands after startup.
@@ -27,6 +33,70 @@ static THREAD_LOCAL struct buffer usermsgs_buf = BUF_NULL;
  */
 #define USERMSGS_CTX_BUFSIZE   PATH_MAX
 static THREAD_LOCAL struct usermsgs_ctx usermsgs_ctx = { .str = BUF_NULL, };
+
+/*
+ * At process start (step_init_1) opens shm and allocates the ring area for the
+ * startup logs into it. In master-worker mode master and worker share the same
+ * ring until the moment, when worker sends READY state to master. This is done
+ * in order to show worker's init logs in master CLI as the output of the
+ * 'reload' command. After sending its READY status to master, worker must use
+ * its copy of the shm, not the shm itself.
+ */
+static struct ring *startup_logs_init_shm()
+{
+	struct ring *r = NULL;
+	char *area = NULL;
+
+	area = mmap(NULL, STARTUP_LOG_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (area == MAP_FAILED || area == NULL)
+		goto error;
+
+        r = ring_make_from_area(area, STARTUP_LOG_SIZE, 1);
+	if (r == NULL)
+		goto error;
+
+	shm_startup_logs = r; /* save the ptr so we can unmap later */
+
+	return r;
+error:
+	if (area != MAP_FAILED && area != NULL)
+		munmap(area, STARTUP_LOG_SIZE);
+
+	return r;
+}
+
+void startup_logs_init()
+{
+	startup_logs = startup_logs_init_shm();
+	if (startup_logs)
+		vma_set_name(ring_allocated_area(startup_logs),
+		             ring_allocated_size(startup_logs),
+		             "errors", "startup_logs");
+}
+
+/* free the startup logs, unmap if it was an shm */
+void startup_logs_free(struct ring *r)
+{
+	if (r == shm_startup_logs)
+		munmap(ring_allocated_area(r), STARTUP_LOG_SIZE);
+	ring_free(r);
+	startup_logs = NULL;
+}
+
+/* duplicate a startup logs which was previously allocated in a shm */
+struct ring *startup_logs_dup(struct ring *src)
+{
+	struct ring *dst = NULL;
+
+	/* must use the size of the previous buffer */
+	dst = ring_new(ring_allocated_size(src));
+	if (!dst)
+		goto error;
+
+	ring_dup(dst, src, ring_size(src));
+error:
+	return dst;
+}
 
 /* Put msg in usermsgs_buf.
  *
@@ -41,7 +111,8 @@ static void usermsgs_put(const struct ist *msg)
 	/* Allocate the buffer if not already done. */
 	if (unlikely(b_is_null(&usermsgs_buf))) {
 		usermsgs_buf.area = malloc(USER_MESSAGES_BUFSIZE * sizeof(char));
-		usermsgs_buf.size = USER_MESSAGES_BUFSIZE;
+		if (usermsgs_buf.area)
+			usermsgs_buf.size = USER_MESSAGES_BUFSIZE;
 	}
 
 	if (likely(!b_is_null(&usermsgs_buf))) {
@@ -199,9 +270,6 @@ static void print_message(int use_usermsgs_ctx, const char *label, const char *f
 	}
 
 	if (global.mode & MODE_STARTING) {
-		if (unlikely(!startup_logs))
-			startup_logs = ring_new(STARTUP_LOG_SIZE);
-
 		if (likely(startup_logs)) {
 			struct ist m[3];
 
@@ -210,14 +278,16 @@ static void print_message(int use_usermsgs_ctx, const char *label, const char *f
 			m[2] = msg_ist;
 
 			ring_write(startup_logs, ~0, 0, 0, m, 3);
-		}
+		} else
+			usermsgs_put(&msg_ist);
 	}
 	else {
 		usermsgs_put(&msg_ist);
 	}
-
-	fprintf(stderr, "%s%s%s", head, parsing_str, msg);
-	fflush(stderr);
+	if (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)) {
+		fprintf(stderr, "%s%s%s", head, parsing_str, msg);
+		fflush(stderr);
+	}
 
 	free(head);
 	free(msg);
@@ -232,52 +302,48 @@ static void print_message_args(int use_usermsgs_ctx, const char *label, const ch
 }
 
 /*
- * Displays the message on stderr with the date and pid. Overrides the quiet
- * mode during startup.
+ * Display a notice with the happroxy version and executable path when the
+ * first message is emitted in starting mode.
+ */
+static void warn_exec_path()
+{
+	if (!(warned & WARN_EXEC_PATH) && (global.mode & MODE_STARTING)) {
+		const char *path = get_exec_path();
+
+		warned |= WARN_EXEC_PATH;
+		print_message_args(0, "NOTICE", "haproxy version is %s\n", haproxy_version);
+		if (path)
+			print_message_args(0, "NOTICE", "path to executable is %s\n", path);
+	}
+}
+
+/*
+ * Displays the message on stderr with the pid.
  */
 void ha_alert(const char *fmt, ...)
 {
 	va_list argp;
 
-	if (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE) ||
-	    !(global.mode & MODE_STARTING)) {
-		if (!(warned & WARN_EXEC_PATH) && (global.mode & MODE_STARTING)) {
-			const char *path = get_exec_path();
-
-			warned |= WARN_EXEC_PATH;
-			print_message_args(0, "NOTICE", "haproxy version is %s\n", haproxy_version);
-			if (path)
-				print_message_args(0, "NOTICE", "path to executable is %s\n", path);
-		}
-		va_start(argp, fmt);
-		print_message(1, "ALERT", fmt, argp);
-		va_end(argp);
-	}
+	warn_exec_path();
+	va_start(argp, fmt);
+	print_message(1, "ALERT", fmt, argp);
+	va_end(argp);
 }
 
 /*
- * Displays the message on stderr with the date and pid.
+ * Displays the message on stderr with the pid.
  */
 void ha_warning(const char *fmt, ...)
 {
 	va_list argp;
 
 	warned |= WARN_ANY;
+	HA_ATOMIC_INC(&tot_warnings);
 
-	if (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE) ||
-	    !(global.mode & MODE_STARTING)) {
-		if (!(warned & WARN_EXEC_PATH) && (global.mode & MODE_STARTING)) {
-			const char *path = get_exec_path();
-
-			warned |= WARN_EXEC_PATH;
-			print_message_args(0, "NOTICE", "haproxy version is %s\n", haproxy_version);
-			if (path)
-				print_message_args(0, "NOTICE", "path to executable is %s\n", path);
-		}
-		va_start(argp, fmt);
-		print_message(1, "WARNING", fmt, argp);
-		va_end(argp);
-	}
+	warn_exec_path();
+	va_start(argp, fmt);
+	print_message(1, "WARNING", fmt, argp);
+	va_end(argp);
 }
 
 /*
@@ -286,6 +352,10 @@ void ha_warning(const char *fmt, ...)
  */
 void _ha_vdiag_warning(const char *fmt, va_list argp)
 {
+	warned |= WARN_ANY;
+	HA_ATOMIC_INC(&tot_warnings);
+
+	warn_exec_path();
 	print_message(1, "DIAG", fmt, argp);
 }
 
@@ -317,18 +387,15 @@ void ha_diag_warning(const char *fmt, ...)
 }
 
 /*
- * Displays the message on stderr with the date and pid.
+ * Displays the message on stderr with the pid.
  */
 void ha_notice(const char *fmt, ...)
 {
 	va_list argp;
 
-	if (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE) ||
-	    !(global.mode & MODE_STARTING)) {
-		va_start(argp, fmt);
-		print_message(1, "NOTICE", fmt, argp);
-		va_end(argp);
-	}
+	va_start(argp, fmt);
+	print_message(1, "NOTICE", fmt, argp);
+	va_end(argp);
 }
 
 /*
@@ -356,12 +423,12 @@ static int cli_parse_show_startup_logs(char **args, char *payload, struct appctx
 	if (!startup_logs)
 		return cli_msg(appctx, LOG_INFO, "\n"); // nothing to print
 
-	return ring_attach_cli(startup_logs, appctx);
+	return ring_attach_cli(startup_logs, appctx, 0);
 }
 
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{
-	{ { "show", "startup-logs",  NULL }, "show startup-logs                       : report logs emitted during HAProxy startup", cli_parse_show_startup_logs, NULL, NULL },
+	{ { "show", "startup-logs",  NULL }, "show startup-logs                       : report logs emitted during HAProxy startup", cli_parse_show_startup_logs, NULL, NULL, NULL, ACCESS_MASTER },
 	{{},}
 }};
 
@@ -375,4 +442,6 @@ static void deinit_errors_buffers()
 	ha_free(&usermsgs_ctx.str.area);
 }
 
+/* errors might be used in threads and even before forking, thus 2 deinit */
 REGISTER_PER_THREAD_FREE(deinit_errors_buffers);
+REGISTER_POST_DEINIT(deinit_errors_buffers);

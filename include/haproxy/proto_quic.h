@@ -1,7 +1,7 @@
 /*
  * AF_INET/AF_INET6 QUIC protocol layer definitions.
  *
- * Copyright 2020 Frédéric Lécaille <flecaille@haproxy.com>
+ * Copyright 2020 Frederic Lecaille <flecaille@haproxy.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -21,7 +21,13 @@
 #ifndef _HAPROXY_PROTO_QUIC_H
 #define _HAPROXY_PROTO_QUIC_H
 
+#include <import/ebtree.h>
+#include <haproxy/api-t.h>
+#include <haproxy/thread-t.h>
+
 extern struct protocol proto_quic4;
 extern struct protocol proto_quic6;
+
+extern struct quic_dghdlr *quic_dghdlrs;
 
 #endif /* _HAPROXY_PROTO_QUIC_H  */

@@ -27,15 +27,18 @@
 #include <haproxy/buf-t.h>
 #include <haproxy/mux_quic-t.h>
 
-/* H3 unidirectional stream types (does not exist for bidirectional streams) */
-#define H3_UNI_STRM_TP_CONTROL_STREAM 0x00
-#define H3_UNI_STRM_TP_PUSH_STREAM    0x01
-#define H3_UNI_STRM_TP_QPACK_ENCODER  0x02
-#define H3_UNI_STRM_TP_QPACK_DECODER  0x03
+/* H3 unidirecational stream types
+ * Emitted as the first byte on the stream to differentiate it.
+ */
+#define H3_UNI_S_T_CTRL       0x00
+#define H3_UNI_S_T_PUSH       0x01
+#define H3_UNI_S_T_QPACK_ENC  0x02
+#define H3_UNI_S_T_QPACK_DEC  0x03
 /* Must be the last one */
-#define H3_UNI_STRM_TP_MAX            H3_UNI_STRM_TP_QPACK_DECODER
+#define H3_UNI_S_T_MAX        H3_UNI_S_T_QPACK_DEC
 
 /* Settings */
+#define H3_SETTINGS_RESERVED_0               0x00
 #define H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY 0x01
 /* there is a hole here of reserved settings, matching the h2 settings */
 #define H3_SETTINGS_RESERVED_2               0x02
@@ -45,55 +48,67 @@
 #define H3_SETTINGS_MAX_FIELD_SECTION_SIZE   0x06
 #define H3_SETTINGS_QPACK_BLOCKED_STREAMS    0x07
 
-/* Errors. */
+/* RFC 9114 8. Error Handling */
 enum h3_err {
-	H3_NO_ERROR                = 0x100,
-	H3_GENERAL_PROTOCOL_ERROR  = 0x101,
-	H3_INTERNAL_ERROR          = 0x102,
-	H3_STREAM_CREATION_ERROR   = 0x103,
-	H3_CLOSED_CRITICAL_STREAM  = 0x104,
-	H3_FRAME_UNEXPECTED        = 0x105,
-	H3_FRAME_ERROR             = 0x106,
-	H3_EXCESSIVE_LOAD          = 0x107,
-	H3_ID_ERROR                = 0x108,
-	H3_SETTINGS_ERROR          = 0x109,
-	H3_MISSING_SETTINGS        = 0x10a,
-	H3_REQUEST_REJECTED        = 0x10b,
-	H3_REQUEST_CANCELLED       = 0x10c,
-	H3_REQUEST_INCOMPLETE      = 0x10d,
-	H3_MESSAGE_ERROR           = 0x10e,
-	H3_CONNECT_ERROR           = 0x10f,
-	H3_VERSION_FALLBACK        = 0x110,
-
-	QPACK_DECOMPRESSION_FAILED = 0x200,
-	QPACK_ENCODER_STREAM_ERROR = 0x201,
-	QPACK_DECODER_STREAM_ERROR = 0x202,
+	H3_ERR_NO_ERROR                = 0x100,
+	H3_ERR_GENERAL_PROTOCOL_ERROR  = 0x101,
+	H3_ERR_INTERNAL_ERROR          = 0x102,
+	H3_ERR_STREAM_CREATION_ERROR   = 0x103,
+	H3_ERR_CLOSED_CRITICAL_STREAM  = 0x104,
+	H3_ERR_FRAME_UNEXPECTED        = 0x105,
+	H3_ERR_FRAME_ERROR             = 0x106,
+	H3_ERR_EXCESSIVE_LOAD          = 0x107,
+	H3_ERR_ID_ERROR                = 0x108,
+	H3_ERR_SETTINGS_ERROR          = 0x109,
+	H3_ERR_MISSING_SETTINGS        = 0x10a,
+	H3_ERR_REQUEST_REJECTED        = 0x10b,
+	H3_ERR_REQUEST_CANCELLED       = 0x10c,
+	H3_ERR_REQUEST_INCOMPLETE      = 0x10d,
+	H3_ERR_MESSAGE_ERROR           = 0x10e,
+	H3_ERR_CONNECT_ERROR           = 0x10f,
+	H3_ERR_VERSION_FALLBACK        = 0x110,
 };
 
 /* Frame types. */
 enum h3_ft       {
+	/* internal value used to mark demuxing as inactive */
+	H3_FT_UNINIT       = -1,
+
 	H3_FT_DATA         = 0x00,
 	H3_FT_HEADERS      = 0x01,
-	/* There is a hole here */
+	/* hole */
 	H3_FT_CANCEL_PUSH  = 0x03,
 	H3_FT_SETTINGS     = 0x04,
 	H3_FT_PUSH_PROMISE = 0x05,
-	H3_FT_GOAWAY       = 0x06,
-	H3_FT_MAX_PUSH_ID  = 0x07,
+	/* hole */
+	H3_FT_GOAWAY       = 0x07,
+	/* hole */
+	H3_FT_MAX_PUSH_ID  = 0x0d,
 };
 
-/* H3 unidirectional QUIC stream */
-struct h3_uqs {
-	/* Underlying incoming QUIC uni-stream */
-	struct qcs *qcs;
-	/* Callback to tx/rx bytes */
-	int (*cb)(struct h3_uqs *h3_uqs, void *ctx);
-	struct wait_event wait_event;
+/* Stream types */
+enum h3s_t {
+	/* unidirectional streams */
+	H3S_T_CTRL,
+	H3S_T_PUSH,
+	H3S_T_QPACK_DEC,
+	H3S_T_QPACK_ENC,
+
+	/* bidirectional streams */
+	H3S_T_REQ,
+
+	H3S_T_UNKNOWN
+};
+
+/* State for request streams */
+enum h3s_st_req {
+	H3S_ST_REQ_BEFORE = 0, /* initial state */
+	H3S_ST_REQ_HEADERS,    /* header section received */
+	H3S_ST_REQ_DATA,       /* first DATA frame for content received */
+	H3S_ST_REQ_TRAILERS,   /* trailer section received */
 };
 
 extern const struct qcc_app_ops h3_ops;
-
-size_t h3_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t count, int flags);
 
 #endif /* USE_QUIC */
 #endif /* _HAPROXY_H3_T_H */

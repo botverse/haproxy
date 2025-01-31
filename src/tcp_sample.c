@@ -10,14 +10,8 @@
  *
  */
 
-/* this is to have tcp_info defined on systems using musl
- * library, such as Alpine Linux.
- */
-#define _GNU_SOURCE
-
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,8 +33,8 @@
 #include <haproxy/namespace.h>
 #include <haproxy/proxy-t.h>
 #include <haproxy/sample.h>
+#include <haproxy/sc_strm.h>
 #include <haproxy/session.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/tools.h>
 
 /* Fetch the connection's source IPv4/IPv6 address. Depending on the keyword, it
@@ -53,8 +47,8 @@ smp_fetch_src(const struct arg *args, struct sample *smp, const char *kw, void *
 
 	if (kw[0] == 'b') { /* bc_src */
 		struct connection *conn = ((obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-					   ? cs_conn(__objt_check(smp->sess->origin)->cs)
-					   : (smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)): NULL));
+					   ? sc_conn(__objt_check(smp->sess->origin)->sc)
+					   : (smp->strm ? sc_conn(smp->strm->scb): NULL));
 		if (conn && conn_get_src(conn))
 			src = conn_src(conn);
 	}
@@ -65,7 +59,7 @@ smp_fetch_src(const struct arg *args, struct sample *smp, const char *kw, void *
 			src = conn_src(conn);
 	}
         else /* src */
-		src = (smp->strm ? si_src(&smp->strm->si[0]) : sess_src(smp->sess));
+		src = (smp->strm ? sc_src(smp->strm->scf) : sess_src(smp->sess));
 
 	if (!src)
 		return 0;
@@ -97,8 +91,8 @@ smp_fetch_sport(const struct arg *args, struct sample *smp, const char *kw, void
 
 	if (kw[0] == 'b') { /* bc_src_port */
 		struct connection *conn = ((obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-					   ? cs_conn(__objt_check(smp->sess->origin)->cs)
-					   : (smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)): NULL));
+					   ? sc_conn(__objt_check(smp->sess->origin)->sc)
+					   : (smp->strm ? sc_conn(smp->strm->scb): NULL));
 		if (conn && conn_get_src(conn))
 			src = conn_src(conn);
 	}
@@ -109,7 +103,7 @@ smp_fetch_sport(const struct arg *args, struct sample *smp, const char *kw, void
 			src = conn_src(conn);
 	}
         else /* src_port */
-		src = (smp->strm ? si_src(&smp->strm->si[0]) : sess_src(smp->sess));
+		src = (smp->strm ? sc_src(smp->strm->scf) : sess_src(smp->sess));
 
 	if (!src)
 		return 0;
@@ -132,8 +126,8 @@ smp_fetch_dst(const struct arg *args, struct sample *smp, const char *kw, void *
 
 	if (kw[0] == 'b') { /* bc_dst */
 		struct connection *conn = ((obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-					   ? cs_conn(__objt_check(smp->sess->origin)->cs)
-					   : (smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)): NULL));
+					   ? sc_conn(__objt_check(smp->sess->origin)->sc)
+					   : (smp->strm ? sc_conn(smp->strm->scb): NULL));
 		if (conn && conn_get_dst(conn))
 			dst = conn_dst(conn);
 	}
@@ -144,7 +138,7 @@ smp_fetch_dst(const struct arg *args, struct sample *smp, const char *kw, void *
 			dst = conn_dst(conn);
 	}
         else /* dst */
-		dst = (smp->strm ? si_dst(&smp->strm->si[0]) : sess_dst(smp->sess));
+		dst = (smp->strm ? sc_dst(smp->strm->scf) : sess_dst(smp->sess));
 
 	if (!dst)
 		return 0;
@@ -177,11 +171,11 @@ int smp_fetch_dst_is_local(const struct arg *args, struct sample *smp, const cha
 	if (kw[0] == 'f') { /* fc_dst_is_local */
 		struct connection *conn = objt_conn(smp->sess->origin);
 
-		if (conn && conn_get_src(conn))
+		if (conn && conn_get_dst(conn))
 			dst = conn_dst(conn);
 	}
 	else /* dst_is_local */
-		dst = (smp->strm ? si_dst(&smp->strm->si[0]) : sess_dst(smp->sess));
+		dst = (smp->strm ? sc_dst(smp->strm->scf) : sess_dst(smp->sess));
 
 	if (!dst)
 		return 0;
@@ -207,7 +201,7 @@ int smp_fetch_src_is_local(const struct arg *args, struct sample *smp, const cha
 			src = conn_src(conn);
 	}
 	else /* src_is_local */
-		src = (smp->strm ? si_src(&smp->strm->si[0]) : sess_src(smp->sess));
+		src = (smp->strm ? sc_src(smp->strm->scf) : sess_src(smp->sess));
 
 	if (!src)
 		return 0;
@@ -228,19 +222,19 @@ smp_fetch_dport(const struct arg *args, struct sample *smp, const char *kw, void
 
 	if (kw[0] == 'b') { /* bc_dst_port */
 		struct connection *conn = ((obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-					   ? cs_conn(__objt_check(smp->sess->origin)->cs)
-					   : (smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)): NULL));
+					   ? sc_conn(__objt_check(smp->sess->origin)->sc)
+					   : (smp->strm ? sc_conn(smp->strm->scb): NULL));
 		if (conn && conn_get_dst(conn))
 			dst = conn_dst(conn);
 	}
-	else if (kw[0] == 'f') { /* fc_dst_post */
+	else if (kw[0] == 'f') { /* fc_dst_port */
 		struct connection *conn = objt_conn(smp->sess->origin);
 
-		if (conn && conn_get_src(conn))
+		if (conn && conn_get_dst(conn))
 			dst = conn_dst(conn);
 	}
         else /* dst_port */
-		dst = (smp->strm ? si_dst(&smp->strm->si[0]) : sess_dst(smp->sess));
+		dst = (smp->strm ? sc_dst(smp->strm->scf) : sess_dst(smp->sess));
 
 	if (!dst)
 		return 0;
@@ -294,6 +288,7 @@ static int val_fc_time_value(struct arg *args, char **err)
  * case, the argument is ignored and a warning is emitted. Returns 0 on error
  * and non-zero if OK.
  */
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__APPLE__)
 static int var_fc_counter(struct arg *args, char **err)
 {
 	if (args[0].type != ARGT_STOP) {
@@ -305,6 +300,7 @@ static int var_fc_counter(struct arg *args, char **err)
 
 	return 1;
 }
+#endif
 
 /* Returns some tcp_info data if it's available. "dir" must be set to 0 if
  * the client connection is required, otherwise it is set to 1. "val" represents
@@ -315,50 +311,21 @@ static inline int get_tcp_info(const struct arg *args, struct sample *smp,
                                int dir, int val)
 {
 	struct connection *conn;
-	struct tcp_info info;
-	socklen_t optlen;
 
 	/* strm can be null. */
 	if (!smp->strm)
 		return 0;
 
-	/* get the object associated with the stream interface.The
-	 * object can be other thing than a connection. For example,
-	 * it be a appctx. */
-	conn = cs_conn(objt_cs(smp->strm->si[dir].end));
-	if (!conn)
-		return 0;
-
-	/* The fd may not be available for the tcp_info struct, and the
-	  syscal can fail. */
-	optlen = sizeof(info);
-	if (getsockopt(conn->handle.fd, IPPROTO_TCP, TCP_INFO, &info, &optlen) == -1)
-		return 0;
-
-	/* extract the value. */
 	smp->data.type = SMP_T_SINT;
-	switch (val) {
-	case 0:  smp->data.u.sint = info.tcpi_rtt;            break;
-	case 1:  smp->data.u.sint = info.tcpi_rttvar;         break;
-#if defined(__linux__)
-	/* these ones are common to all Linux versions */
-	case 2:  smp->data.u.sint = info.tcpi_unacked;        break;
-	case 3:  smp->data.u.sint = info.tcpi_sacked;         break;
-	case 4:  smp->data.u.sint = info.tcpi_lost;           break;
-	case 5:  smp->data.u.sint = info.tcpi_retrans;        break;
-	case 6:  smp->data.u.sint = info.tcpi_fackets;        break;
-	case 7:  smp->data.u.sint = info.tcpi_reordering;     break;
-#elif defined(__FreeBSD__) || defined(__NetBSD__)
-	/* the ones are found on FreeBSD and NetBSD featuring TCP_INFO */
-	case 2:  smp->data.u.sint = info.__tcpi_unacked;      break;
-	case 3:  smp->data.u.sint = info.__tcpi_sacked;       break;
-	case 4:  smp->data.u.sint = info.__tcpi_lost;         break;
-	case 5:  smp->data.u.sint = info.__tcpi_retrans;      break;
-	case 6:  smp->data.u.sint = info.__tcpi_fackets;      break;
-	case 7:  smp->data.u.sint = info.__tcpi_reordering;   break;
-#endif
-	default: return 0;
-	}
+	/* get the object associated with the stream connector.The
+	 * object can be other thing than a connection. For example,
+	 * it could be an appctx.
+	 */
+	conn = (dir == 0 ? sc_conn(smp->strm->scf) : sc_conn(smp->strm->scb));
+	if (!conn || !conn->ctrl->get_info ||
+	    !conn->ctrl->get_info(conn, &smp->data.u.sint, val))
+		return 0;
+
 
 	return 1;
 }
@@ -391,8 +358,36 @@ smp_fetch_fc_rttvar(const struct arg *args, struct sample *smp, const char *kw, 
 	return 1;
 }
 
-#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
+/* get the mean rtt of a backend connection */
+static int
+smp_fetch_bc_rtt(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	if (!get_tcp_info(args, smp, 1, 0))
+		return 0;
 
+	/* By default or if explicitly specified, convert rtt to ms */
+	if (!args || args[0].type == ARGT_STOP || args[0].data.sint == TIME_UNIT_MS)
+		smp->data.u.sint = (smp->data.u.sint + 500) / 1000;
+
+	return 1;
+}
+
+/* get the variance of the mean rtt of a backend connection */
+static int
+smp_fetch_bc_rttvar(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	if (!get_tcp_info(args, smp, 1, 1))
+		return 0;
+
+	/* By default or if explicitly specified, convert rttvar to ms */
+	if (!args || args[0].type == ARGT_STOP || args[0].data.sint == TIME_UNIT_MS)
+		smp->data.u.sint = (smp->data.u.sint + 500) / 1000;
+
+	return 1;
+}
+
+
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__APPLE__)
 /* get the unacked counter on a client connection */
 static int
 smp_fetch_fc_unacked(const struct arg *args, struct sample *smp, const char *kw, void *private)
@@ -401,7 +396,9 @@ smp_fetch_fc_unacked(const struct arg *args, struct sample *smp, const char *kw,
 		return 0;
 	return 1;
 }
+#endif
 
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
 /* get the sacked counter on a client connection */
 static int
 smp_fetch_fc_sacked(const struct arg *args, struct sample *smp, const char *kw, void *private)
@@ -410,7 +407,9 @@ smp_fetch_fc_sacked(const struct arg *args, struct sample *smp, const char *kw, 
 		return 0;
 	return 1;
 }
+#endif
 
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__APPLE__)
 /* get the lost counter on a client connection */
 static int
 smp_fetch_fc_lost(const struct arg *args, struct sample *smp, const char *kw, void *private)
@@ -419,7 +418,9 @@ smp_fetch_fc_lost(const struct arg *args, struct sample *smp, const char *kw, vo
 		return 0;
 	return 1;
 }
+#endif
 
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__APPLE__)
 /* get the retrans counter on a client connection */
 static int
 smp_fetch_fc_retrans(const struct arg *args, struct sample *smp, const char *kw, void *private)
@@ -428,7 +429,9 @@ smp_fetch_fc_retrans(const struct arg *args, struct sample *smp, const char *kw,
 		return 0;
 	return 1;
 }
+#endif
 
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
 /* get the fackets counter on a client connection */
 static int
 smp_fetch_fc_fackets(const struct arg *args, struct sample *smp, const char *kw, void *private)
@@ -437,7 +440,9 @@ smp_fetch_fc_fackets(const struct arg *args, struct sample *smp, const char *kw,
 		return 0;
 	return 1;
 }
+#endif
 
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
 /* get the reordering counter on a client connection */
 static int
 smp_fetch_fc_reordering(const struct arg *args, struct sample *smp, const char *kw, void *private)
@@ -446,46 +451,138 @@ smp_fetch_fc_reordering(const struct arg *args, struct sample *smp, const char *
 		return 0;
 	return 1;
 }
-#endif // linux || freebsd || netbsd
+#endif
 #endif // TCP_INFO
 
+/* Validates the data unit argument passed to "accept_date" fetch. Argument 0 support an
+ * optional string representing the unit of the result: "s" for seconds, "ms" for
+ * milliseconds and "us" for microseconds.
+ * Returns 0 on error and non-zero if OK.
+ */
+int smp_check_accept_date_unit(struct arg *args, char **err)
+{
+	if (args[0].type == ARGT_STR) {
+		long long int unit;
+
+		if (strcmp(args[0].data.str.area, "s") == 0) {
+			unit = TIME_UNIT_S;
+		}
+		else if (strcmp(args[0].data.str.area, "ms") == 0) {
+			unit = TIME_UNIT_MS;
+		}
+		else if (strcmp(args[0].data.str.area, "us") == 0) {
+			unit = TIME_UNIT_US;
+		}
+		else {
+			memprintf(err, "expects 's', 'ms' or 'us', got '%s'",
+				  args[0].data.str.area);
+			return 0;
+		}
+
+		chunk_destroy(&args[0].data.str);
+		args[0].type = ARGT_SINT;
+		args[0].data.sint = unit;
+	}
+	else if (args[0].type != ARGT_STOP) {
+		memprintf(err, "Unexpected arg type");
+		return 0;
+	}
+
+	return 1;
+}
+
+/* retrieve the accept or request date in epoch time, converts it to milliseconds
+ * or microseconds if asked to in optional args[1] unit param */
+static int
+smp_fetch_accept_date(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct strm_logs *logs;
+	struct timeval tv;
+
+	if (!smp->strm)
+		return 0;
+
+	logs = &smp->strm->logs;
+
+	if (kw[0] == 'r') {  /* request_date */
+		tv_ms_add(&tv, &logs->accept_date, logs->t_idle >= 0 ? logs->t_idle + logs->t_handshake : 0);
+	} else {             /* accept_date */
+		tv.tv_sec = logs->accept_date.tv_sec;
+		tv.tv_usec = logs->accept_date.tv_usec;
+	}
+
+	smp->data.u.sint = tv.tv_sec;
+
+	/* report in milliseconds */
+	if (args[0].type == ARGT_SINT && args[0].data.sint == TIME_UNIT_MS) {
+		smp->data.u.sint *= 1000;
+		smp->data.u.sint += tv.tv_usec / 1000;
+	}
+	/* report in microseconds */
+	else if (args[0].type == ARGT_SINT && args[0].data.sint == TIME_UNIT_US) {
+		smp->data.u.sint *= 1000000;
+		smp->data.u.sint += tv.tv_usec;
+	}
+
+	smp->data.type = SMP_T_SINT;
+	smp->flags |= SMP_F_VOL_TEST | SMP_F_MAY_CHANGE;
+	return 1;
+}
+
 /* Note: must not be declared <const> as its list will be overwritten.
- * Note: fetches that may return multiple types must be declared as the lowest
- * common denominator, the type that can be casted into all other ones. For
- * instance v4/v6 must be declared v4.
+ * Note: fetches that may return multiple types should be declared using the
+ * appropriate pseudo-type. If not available it must be declared as the lowest
+ * common denominator, the type that can be casted into all other ones.
  */
 static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
-	{ "bc_dst",      smp_fetch_dst,   0, NULL, SMP_T_SINT, SMP_USE_L4SRV },
+	/* timestamps */
+	{ "accept_date", smp_fetch_accept_date,  ARG1(0,STR), smp_check_accept_date_unit, SMP_T_SINT, SMP_USE_L4CLI },
+	{ "request_date", smp_fetch_accept_date,  ARG1(0,STR), smp_check_accept_date_unit, SMP_T_SINT, SMP_USE_HRQHP },
+
+	{ "bc_dst",      smp_fetch_dst,   0, NULL, SMP_T_ADDR, SMP_USE_L4SRV },
 	{ "bc_dst_port", smp_fetch_dport, 0, NULL, SMP_T_SINT, SMP_USE_L4SRV },
-	{ "bc_src",      smp_fetch_src,   0, NULL, SMP_T_SINT, SMP_USE_L4SRV },
+	{ "bc_src",      smp_fetch_src,   0, NULL, SMP_T_ADDR, SMP_USE_L4SRV },
 	{ "bc_src_port", smp_fetch_sport, 0, NULL, SMP_T_SINT, SMP_USE_L4SRV },
 
-	{ "dst",      smp_fetch_dst,   0, NULL, SMP_T_IPV4, SMP_USE_L4CLI },
+	{ "dst",      smp_fetch_dst,   0, NULL, SMP_T_ADDR, SMP_USE_L4CLI },
 	{ "dst_is_local", smp_fetch_dst_is_local, 0, NULL, SMP_T_BOOL, SMP_USE_L4CLI },
 	{ "dst_port", smp_fetch_dport, 0, NULL, SMP_T_SINT, SMP_USE_L4CLI },
 
-	{ "fc_dst",      smp_fetch_dst,   0, NULL, SMP_T_IPV4, SMP_USE_L4CLI },
+	{ "fc_dst",      smp_fetch_dst,   0, NULL, SMP_T_ADDR, SMP_USE_L4CLI },
 	{ "fc_dst_is_local", smp_fetch_dst_is_local, 0, NULL, SMP_T_BOOL, SMP_USE_L4CLI },
 	{ "fc_dst_port", smp_fetch_dport, 0, NULL, SMP_T_SINT, SMP_USE_L4CLI },
 
-	{ "fc_src",      smp_fetch_src,   0, NULL, SMP_T_IPV4, SMP_USE_L4CLI },
+	{ "fc_src",      smp_fetch_src,   0, NULL, SMP_T_ADDR, SMP_USE_L4CLI },
 	{ "fc_src_is_local", smp_fetch_src_is_local, 0, NULL, SMP_T_BOOL, SMP_USE_L4CLI },
 	{ "fc_src_port", smp_fetch_sport, 0, NULL, SMP_T_SINT, SMP_USE_L4CLI },
 
-	{ "src",      smp_fetch_src,   0, NULL, SMP_T_IPV4, SMP_USE_L4CLI },
+	{ "src",      smp_fetch_src,   0, NULL, SMP_T_ADDR, SMP_USE_L4CLI },
 	{ "src_is_local", smp_fetch_src_is_local, 0, NULL, SMP_T_BOOL, SMP_USE_L4CLI },
 	{ "src_port", smp_fetch_sport, 0, NULL, SMP_T_SINT, SMP_USE_L4CLI },
 #ifdef TCP_INFO
 	{ "fc_rtt",           smp_fetch_fc_rtt,           ARG1(0,STR), val_fc_time_value, SMP_T_SINT, SMP_USE_L4CLI },
 	{ "fc_rttvar",        smp_fetch_fc_rttvar,        ARG1(0,STR), val_fc_time_value, SMP_T_SINT, SMP_USE_L4CLI },
-#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
+	{ "bc_rtt",           smp_fetch_bc_rtt,           ARG1(0,STR), val_fc_time_value, SMP_T_SINT, SMP_USE_L4CLI },
+	{ "bc_rttvar",        smp_fetch_bc_rttvar,        ARG1(0,STR), val_fc_time_value, SMP_T_SINT, SMP_USE_L4CLI },
+
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__APPLE__)
 	{ "fc_unacked",       smp_fetch_fc_unacked,       ARG1(0,STR), var_fc_counter, SMP_T_SINT, SMP_USE_L4CLI },
+#endif
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
 	{ "fc_sacked",        smp_fetch_fc_sacked,        ARG1(0,STR), var_fc_counter, SMP_T_SINT, SMP_USE_L4CLI },
+#endif
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__APPLE__)
 	{ "fc_retrans",       smp_fetch_fc_retrans,       ARG1(0,STR), var_fc_counter, SMP_T_SINT, SMP_USE_L4CLI },
+#endif
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
 	{ "fc_fackets",       smp_fetch_fc_fackets,       ARG1(0,STR), var_fc_counter, SMP_T_SINT, SMP_USE_L4CLI },
+#endif
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__APPLE__)
 	{ "fc_lost",          smp_fetch_fc_lost,          ARG1(0,STR), var_fc_counter, SMP_T_SINT, SMP_USE_L4CLI },
+#endif
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
 	{ "fc_reordering",    smp_fetch_fc_reordering,    ARG1(0,STR), var_fc_counter, SMP_T_SINT, SMP_USE_L4CLI },
-#endif // linux || freebsd || netbsd
+#endif
 #endif // TCP_INFO
 	{ /* END */ },
 }};

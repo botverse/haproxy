@@ -18,6 +18,7 @@
 #include <haproxy/openssl-compat.h>
 #include <haproxy/base64.h>
 #include <haproxy/jwt.h>
+#include <haproxy/buf.h>
 
 
 #ifdef USE_OPENSSL
@@ -133,6 +134,18 @@ int jwt_tree_load_cert(char *path, int pathlen, char **err)
 	EVP_PKEY *pkey = NULL;
 	BIO *bio = NULL;
 
+	entry = calloc(1, sizeof(*entry) + pathlen + 1);
+	if (!entry) {
+		memprintf(err, "%sunable to allocate memory (jwt_cert_tree_entry).\n", err && *err ? *err : "");
+		return -1;
+	}
+	memcpy(entry->path, path, pathlen + 1);
+
+	if (ebst_insert(&jwt_cert_tree, &entry->node) != &entry->node) {
+		free(entry);
+		return 0; /* Entry already in the tree */
+	}
+
 	bio = BIO_new(BIO_s_file());
 	if (!bio) {
 		memprintf(err, "%sunable to allocate memory (BIO).\n", err && *err ? *err : "");
@@ -148,20 +161,18 @@ int jwt_tree_load_cert(char *path, int pathlen, char **err)
 			goto end;
 		}
 
-		entry = calloc(1, sizeof(*entry) + pathlen + 1);
-		if (!entry) {
-			memprintf(err, "%sunable to allocate memory (jwt_cert_tree_entry).\n", err && *err ? *err : "");
-			goto end;
-		}
-
-		memcpy(entry->path, path, pathlen + 1);
 		entry->pkey = pkey;
-
-		ebst_insert(&jwt_cert_tree, &entry->node);
 		retval = 0;
 	}
 
 end:
+	if (retval) {
+		/* Some error happened during pkey parsing, remove the already
+		 * inserted node from the tree and free it.
+		 */
+		ebmb_delete(&entry->node);
+		free(entry);
+	}
 	BIO_free(bio);
 	return retval;
 }
@@ -204,31 +215,108 @@ jwt_jwsverify_hmac(const struct jwt_ctx *ctx, const struct buffer *decoded_signa
 }
 
 /*
+ * Convert a JWT ECDSA signature (R and S parameters concatenatedi, see section
+ * 3.4 of RFC7518) into an ECDSA_SIG that can be fed back into OpenSSL's digest
+ * verification functions.
+ * Returns 0 in case of success.
+ */
+static int convert_ecdsa_sig(const struct jwt_ctx *ctx, EVP_PKEY *pkey, struct buffer *signature)
+{
+	int retval = 0;
+	ECDSA_SIG *ecdsa_sig = NULL;
+	BIGNUM *ec_R = NULL, *ec_S = NULL;
+	unsigned int bignum_len;
+	unsigned char *p;
+
+	ecdsa_sig = ECDSA_SIG_new();
+	if (!ecdsa_sig) {
+		retval = JWT_VRFY_OUT_OF_MEMORY;
+		goto end;
+	}
+
+	if (b_data(signature) % 2) {
+		retval = JWT_VRFY_INVALID_TOKEN;
+		goto end;
+	}
+
+	bignum_len = b_data(signature) / 2;
+
+	ec_R = BN_bin2bn((unsigned char*)b_orig(signature), bignum_len, NULL);
+	ec_S = BN_bin2bn((unsigned char *)(b_orig(signature) + bignum_len), bignum_len, NULL);
+
+	if (!ec_R || !ec_S) {
+		retval = JWT_VRFY_INVALID_TOKEN;
+		goto end;
+	}
+
+	/* Build ecdsa out of R and S values. */
+	ECDSA_SIG_set0(ecdsa_sig, ec_R, ec_S);
+
+	p = (unsigned char*)signature->area;
+
+	signature->data = i2d_ECDSA_SIG(ecdsa_sig, &p);
+	if (signature->data == 0) {
+		retval = JWT_VRFY_INVALID_TOKEN;
+		goto end;
+	}
+
+end:
+	ECDSA_SIG_free(ecdsa_sig);
+	return retval;
+}
+
+/*
  * Check that the signature included in a JWT signed via RSA or ECDSA is valid
  * and can be verified thanks to a given public certificate.
  * Returns 1 in case of success.
  */
 static enum jwt_vrfy_status
-jwt_jwsverify_rsa_ecdsa(const struct jwt_ctx *ctx, const struct buffer *decoded_signature)
+jwt_jwsverify_rsa_ecdsa(const struct jwt_ctx *ctx, struct buffer *decoded_signature)
 {
 	const EVP_MD *evp = NULL;
 	EVP_MD_CTX *evp_md_ctx;
+	EVP_PKEY_CTX *pkey_ctx = NULL;
 	enum jwt_vrfy_status retval = JWT_VRFY_KO;
 	struct ebmb_node *eb;
 	struct jwt_cert_tree_entry *entry = NULL;
+	int is_ecdsa = 0;
+	int padding = RSA_PKCS1_PADDING;
 
 	switch(ctx->alg) {
 	case JWS_ALG_RS256:
-	case JWS_ALG_ES256:
 		evp = EVP_sha256();
 		break;
 	case JWS_ALG_RS384:
-	case JWS_ALG_ES384:
 		evp = EVP_sha384();
 		break;
 	case JWS_ALG_RS512:
+		evp = EVP_sha512();
+		break;
+
+	case JWS_ALG_ES256:
+		evp = EVP_sha256();
+		is_ecdsa = 1;
+		break;
+	case JWS_ALG_ES384:
+		evp = EVP_sha384();
+		is_ecdsa = 1;
+		break;
 	case JWS_ALG_ES512:
 		evp = EVP_sha512();
+		is_ecdsa = 1;
+		break;
+
+	case JWS_ALG_PS256:
+		evp = EVP_sha256();
+		padding = RSA_PKCS1_PSS_PADDING;
+		break;
+	case JWS_ALG_PS384:
+		evp = EVP_sha384();
+		padding = RSA_PKCS1_PSS_PADDING;
+		break;
+	case JWS_ALG_PS512:
+		evp = EVP_sha512();
+		padding = RSA_PKCS1_PSS_PADDING;
 		break;
 	default: break;
 	}
@@ -251,15 +339,38 @@ jwt_jwsverify_rsa_ecdsa(const struct jwt_ctx *ctx, const struct buffer *decoded_
 		goto end;
 	}
 
-	if (EVP_DigestVerifyInit(evp_md_ctx, NULL, evp, NULL,entry-> pkey) == 1 &&
-	    EVP_DigestVerifyUpdate(evp_md_ctx, (const unsigned char*)ctx->jose.start,
-				   ctx->jose.length + ctx->claims.length + 1) == 1 &&
-	    EVP_DigestVerifyFinal(evp_md_ctx, (const unsigned char*)decoded_signature->area, decoded_signature->data) == 1) {
-		retval = JWT_VRFY_OK;
+	/*
+	 * ECXXX signatures are a direct concatenation of the (R, S) pair and
+	 * need to be converted back to asn.1 in order for verify operations to
+	 * work with OpenSSL.
+	 */
+	if (is_ecdsa) {
+		int conv_retval = convert_ecdsa_sig(ctx, entry->pkey, decoded_signature);
+		if (conv_retval != 0) {
+			retval = conv_retval;
+			goto end;
+		}
+	}
+
+	if (EVP_DigestVerifyInit(evp_md_ctx, &pkey_ctx, evp, NULL, entry->pkey) == 1) {
+		if (is_ecdsa || EVP_PKEY_CTX_set_rsa_padding(pkey_ctx, padding) > 0) {
+			if (EVP_DigestVerifyUpdate(evp_md_ctx, (const unsigned char*)ctx->jose.start,
+						   ctx->jose.length + ctx->claims.length + 1) == 1 &&
+			    EVP_DigestVerifyFinal(evp_md_ctx, (const unsigned char*)decoded_signature->area, decoded_signature->data) == 1) {
+				retval = JWT_VRFY_OK;
+			}
+		}
 	}
 
 end:
 	EVP_MD_CTX_free(evp_md_ctx);
+	if (retval != JWT_VRFY_OK) {
+		/* Don't forget to remove SSL errors to be sure they cannot be
+		 * caught elsewhere. The error queue is cleared because it seems
+		 * at least 2 errors are produced.
+		 */
+		ERR_clear_error();
+	}
 	return retval;
 }
 
@@ -334,16 +445,15 @@ enum jwt_vrfy_status jwt_verify(const struct buffer *token, const struct buffer 
 	case JWS_ALG_ES256:
 	case JWS_ALG_ES384:
 	case JWS_ALG_ES512:
-		/* RSASSA-PKCS1-v1_5 + SHA-XXX */
-		/* ECDSA using P-XXX and SHA-XXX */
-		retval = jwt_jwsverify_rsa_ecdsa(&ctx, decoded_sig);
-		break;
 	case JWS_ALG_PS256:
 	case JWS_ALG_PS384:
 	case JWS_ALG_PS512:
-	default:
+		/* RSASSA-PKCS1-v1_5 + SHA-XXX */
+		/* ECDSA using P-XXX and SHA-XXX */
 		/* RSASSA-PSS using SHA-XXX and MGF1 with SHA-XXX */
-
+		retval = jwt_jwsverify_rsa_ecdsa(&ctx, decoded_sig);
+		break;
+	default:
 		/* Not managed yet */
 		retval = JWT_VRFY_UNMANAGED_ALG;
 		break;
@@ -363,6 +473,8 @@ static void jwt_deinit(void)
 	node = ebmb_first(&jwt_cert_tree);
 	while (node) {
 		entry = ebmb_entry(node, struct jwt_cert_tree_entry, node);
+		ebmb_delete(node);
+		EVP_PKEY_free(entry->pkey);
 		ha_free(&entry);
 		node = ebmb_first(&jwt_cert_tree);
 	}

@@ -38,7 +38,7 @@
 #endif
 
 /* ASCII to lower case conversion table */
-#define _IST_LC ((const unsigned char[256]){            \
+#define _IST_LC {                                       \
 	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, \
 	0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, \
 	0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, \
@@ -71,10 +71,10 @@
 	0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef, \
 	0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, \
 	0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff, \
-})
+}
 
 /* ASCII to upper case conversion table */
-#define _IST_UC ((const unsigned char[256]){            \
+#define _IST_UC {                                       \
 	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, \
 	0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, \
 	0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, \
@@ -107,14 +107,15 @@
 	0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef, \
 	0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, \
 	0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff, \
-})
+}
 
-#ifdef USE_OBSOLETE_LINKER
+#if defined(USE_OBSOLETE_LINKER) || defined(__TINYC__)
 /* some old linkers and some non-ELF platforms have issues with the weak
- * attribute so we turn these arrays to literals there.
+ * attribute so we turn these arrays to literals there. TCC silently ignores
+ * it so we switch to literal as well.
  */
-#define ist_lc _IST_LC
-#define ist_uc _IST_UC
+#define ist_lc ((const unsigned char[256])_IST_LC)
+#define ist_uc ((const unsigned char[256])_IST_UC)
 #else
 const unsigned char ist_lc[256] __attribute__((weak)) = _IST_LC;
 const unsigned char ist_uc[256] __attribute__((weak)) = _IST_UC;
@@ -327,6 +328,25 @@ static inline struct ist istzero(const struct ist ist, size_t size)
 			ret.len = size - 1;
 		ret.ptr[ret.len] = 0;
 	}
+	return ret;
+}
+
+/* Remove trailing newline characters if present in <ist> by reducing its
+ * length. Both '\n', '\r' and '\n\r' match. Return the modified ist.
+ */
+static inline struct ist iststrip(const struct ist ist)
+{
+	struct ist ret = ist;
+
+	if (ret.len) {
+		if (ret.ptr[ret.len - 1] == '\n')
+			--ret.len;
+	}
+	if (ret.len) {
+		if (ret.ptr[ret.len - 1] == '\r')
+			--ret.len;
+	}
+
 	return ret;
 }
 
@@ -746,6 +766,53 @@ static inline const char *ist_find_ctl(const struct ist ist)
 	return NULL;
 }
 
+/* Returns a pointer to the first character found <ist> that belongs to the
+ * range [min:max] inclusive, or NULL if none is present. The function is
+ * optimized for strings having no such chars by processing up to sizeof(long)
+ * bytes at once on architectures supporting efficient unaligned accesses.
+ * Despite this it is not very fast (~0.43 byte/cycle) and should mostly be
+ * used on low match probability when it can save a call to a much slower
+ * function. Will not work for characters 0x80 and above. It's optimized for
+ * min and max to be known at build time.
+ */
+static inline const char *ist_find_range(const struct ist ist, unsigned char min, unsigned char max)
+{
+	const union { unsigned long v; } __attribute__((packed)) *u;
+	const char *curr = (void *)ist.ptr - sizeof(long);
+	const char *last = curr + ist.len;
+	unsigned long l1, l2;
+
+	/* easier with an exclusive boundary */
+	max++;
+
+	do {
+		curr += sizeof(long);
+		if (curr > last)
+			break;
+		u = (void *)curr;
+		/* add 0x<min><min><min><min>..<min> then subtract
+		 * 0x<max><max><max><max>..<max> to the value to generate a
+		 * carry in the lower byte if the byte contains a lower value.
+		 * If we generate a bit 7 that was not there, it means the byte
+		 * was min..max.
+		 */
+		l2  = u->v;
+		l1  = ~l2 & ((~0UL / 255) * 0x80); /* 0x808080...80 */
+		l2 += (~0UL / 255) * min;          /* 0x<min><min>..<min> */
+		l2 -= (~0UL / 255) * max;          /* 0x<max><max>..<max> */
+	} while ((l1 & l2) == 0);
+
+	last += sizeof(long);
+	if (__builtin_expect(curr < last, 0)) {
+		do {
+			if ((unsigned char)(*curr - min) < (unsigned char)(max - min))
+				return curr;
+			curr++;
+		} while (curr < last);
+	}
+	return NULL;
+}
+
 /* looks for first occurrence of character <chr> in string <ist> and returns
  * the tail of the string starting with this character, or (ist.end,0) if not
  * found.
@@ -863,7 +930,7 @@ static inline int istissame(const struct ist ist1, const struct ist ist2)
 static inline struct ist istalloc(const size_t size)
 {
 	/* Note: do not use ist2 here, as it triggers a gcc11 warning.
-	 * â€˜<unknown>â€™ may be used uninitialized [-Werror=maybe-uninitialized]
+	 * €˜<unknown>€™ may be used uninitialized [-Werror=maybe-uninitialized]
 	 *
 	 * This warning is reported because the uninitialized memory block
 	 * allocated by malloc should not be passed to a const argument as in
@@ -891,15 +958,12 @@ static inline void istfree(struct ist *ist)
  */
 static inline struct ist istdup(const struct ist src)
 {
-	const size_t src_size = src.len;
-
-	/* Allocate at least 1 byte to allow duplicating an empty string with
-	 * malloc implementations that return NULL for a 0-size allocation.
-	 */
-	struct ist dst = istalloc(src_size ? src_size : 1);
+	/* Allocate 1 extra byte to add an extra \0 delimiter. */
+	struct ist dst = istalloc(src.len + 1);
 
 	if (isttest(dst)) {
-		istcpy(&dst, src, src_size);
+		istcpy(&dst, src, src.len);
+		dst.ptr[dst.len] = '\0';
 	}
 
 	return dst;

@@ -64,15 +64,15 @@ client c1 -connect ${h1_fe_sock} {
        expect resp.bodylen == 609
        txreq \
                -hdr "if-none-match: *"
-       rxresp
+       rxresphdrs
        expect resp.status == 304
        txreq \
                -hdr "if-none-match: \"etag\""
-       rxresp
+       rxresphdrs
        expect resp.status == 304
        txreq \
                -hdr "if-none-match: W/\"etag\""
-       rxresp
+       rxresphdrs
        expect resp.status == 304
 } -run
 
@@ -84,6 +84,6 @@ client c2 -connect ${h1_fe_sock} {
        expect resp.bodylen == 609
        txreq \
                -hdr "if-none-match: W/\"wrong_etag\", W/\"etag\""
-       rxresp
+       rxresphdrs
        expect resp.status == 304
 } -run

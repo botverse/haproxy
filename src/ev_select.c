@@ -21,6 +21,7 @@
 #include <haproxy/global.h>
 #include <haproxy/task.h>
 #include <haproxy/ticks.h>
+#include <haproxy/tools.h>
 
 
 /* private data */
@@ -38,15 +39,18 @@ static void __fd_clo(int fd)
 static void _update_fd(int fd, int *max_add_fd)
 {
 	int en;
+	ulong pr, ps;
 
 	en = fdtab[fd].state;
+	pr = _HA_ATOMIC_LOAD(&polled_mask[fd].poll_recv);
+	ps = _HA_ATOMIC_LOAD(&polled_mask[fd].poll_send);
 
 	/* we have a single state for all threads, which is why we
 	 * don't check the tid_bit. First thread to see the update
 	 * takes it for every other one.
 	 */
 	if (!(en & FD_EV_ACTIVE_RW)) {
-		if (!(polled_mask[fd].poll_recv | polled_mask[fd].poll_send)) {
+		if (!(pr | ps)) {
 			/* fd was not watched, it's still not */
 			return;
 		}
@@ -60,22 +64,22 @@ static void _update_fd(int fd, int *max_add_fd)
 		/* OK fd has to be monitored, it was either added or changed */
 		if (!(en & FD_EV_ACTIVE_R)) {
 			hap_fd_clr(fd, fd_evts[DIR_RD]);
-			if (polled_mask[fd].poll_recv & tid_bit)
-				_HA_ATOMIC_AND(&polled_mask[fd].poll_recv, ~tid_bit);
+			if (pr & ti->ltid_bit)
+				_HA_ATOMIC_AND(&polled_mask[fd].poll_recv, ~ti->ltid_bit);
 		} else {
 			hap_fd_set(fd, fd_evts[DIR_RD]);
-			if (!(polled_mask[fd].poll_recv & tid_bit))
-				_HA_ATOMIC_OR(&polled_mask[fd].poll_recv, tid_bit);
+			if (!(pr & ti->ltid_bit))
+				_HA_ATOMIC_OR(&polled_mask[fd].poll_recv, ti->ltid_bit);
 		}
 
 		if (!(en & FD_EV_ACTIVE_W)) {
 			hap_fd_clr(fd, fd_evts[DIR_WR]);
-			if (polled_mask[fd].poll_send & tid_bit)
-				_HA_ATOMIC_AND(&polled_mask[fd].poll_send, ~tid_bit);
+			if (ps & ti->ltid_bit)
+				_HA_ATOMIC_AND(&polled_mask[fd].poll_send, ~ti->ltid_bit);
 		} else {
 			hap_fd_set(fd, fd_evts[DIR_WR]);
-			if (!(polled_mask[fd].poll_send & tid_bit))
-				_HA_ATOMIC_OR(&polled_mask[fd].poll_send, tid_bit);
+			if (!(ps & ti->ltid_bit))
+				_HA_ATOMIC_OR(&polled_mask[fd].poll_send, ti->ltid_bit);
 		}
 
 		if (fd > *max_add_fd)
@@ -105,7 +109,7 @@ static void _do_poll(struct poller *p, int exp, int wake)
 	for (updt_idx = 0; updt_idx < fd_nbupdt; updt_idx++) {
 		fd = fd_updt[updt_idx];
 
-		_HA_ATOMIC_AND(&fdtab[fd].update_mask, ~tid_bit);
+		_HA_ATOMIC_AND(&fdtab[fd].update_mask, ~ti->ltid_bit);
 		if (!fdtab[fd].owner) {
 			activity[tid].poll_drop_fd++;
 			continue;
@@ -113,7 +117,7 @@ static void _do_poll(struct poller *p, int exp, int wake)
 		_update_fd(fd, &max_add_fd);
 	}
 	/* Now scan the global update list */
-	for (old_fd = fd = update_list.first; fd != -1; fd = fdtab[fd].update.next) {
+	for (old_fd = fd = update_list[tgid - 1].first; fd != -1; fd = fdtab[fd].update.next) {
 		if (fd == -2) {
 			fd = old_fd;
 			continue;
@@ -122,12 +126,12 @@ static void _do_poll(struct poller *p, int exp, int wake)
 			fd = -fd -4;
 		if (fd == -1)
 			break;
-		if (fdtab[fd].update_mask & tid_bit) {
+		if (fdtab[fd].update_mask & ti->ltid_bit) {
 			/* Cheat a bit, as the state is global to all pollers
 			 * we don't need every thread to take care of the
 			 * update.
 			 */
-			_HA_ATOMIC_AND(&fdtab[fd].update_mask, ~all_threads_mask);
+			_HA_ATOMIC_AND(&fdtab[fd].update_mask, ~tg->threads_enabled);
 			done_update_polling(fd);
 		} else
 			continue;
@@ -180,13 +184,7 @@ static void _do_poll(struct poller *p, int exp, int wake)
 			NULL,
 			&delta);
 	clock_update_date(delta_ms, status);
-	clock_leaving_poll(delta_ms, status);
-
-	thread_harmless_end();
-	thread_idle_end();
-
-	if (sleeping_thread_mask & tid_bit)
-		_HA_ATOMIC_AND(&sleeping_thread_mask, ~tid_bit);
+	fd_leaving_poll(delta_ms, status);
 
 	if (status <= 0)
 		return;
@@ -226,9 +224,11 @@ static int init_select_per_thread()
 	tmp_evts[DIR_RD] = calloc(1, fd_set_bytes);
 	if (tmp_evts[DIR_RD] == NULL)
 		goto fail;
+	vma_set_name_id(tmp_evts[DIR_RD], fd_set_bytes, "ev_select", "tmp_evts_rd", tid + 1);
 	tmp_evts[DIR_WR] = calloc(1, fd_set_bytes);
 	if (tmp_evts[DIR_WR] == NULL)
 		goto fail;
+	vma_set_name_id(tmp_evts[DIR_WR], fd_set_bytes, "ev_select", "tmp_evts_wr", tid + 1);
 	return 1;
   fail:
 	free(tmp_evts[DIR_RD]);
@@ -253,6 +253,12 @@ static int _do_init(struct poller *p)
 
 	p->private = NULL;
 
+	/* this old poller uses a process-wide FD list that cannot work with
+	 * groups.
+	 */
+	if (global.nbtgroups > 1)
+		goto fail_srevt;
+
 	if (global.maxsock > FD_SETSIZE)
 		goto fail_srevt;
 
@@ -260,8 +266,10 @@ static int _do_init(struct poller *p)
 
 	if ((fd_evts[DIR_RD] = calloc(1, fd_set_bytes)) == NULL)
 		goto fail_srevt;
+	vma_set_name(fd_evts[DIR_RD], fd_set_bytes, "ev_select", "fd_evts_rd");
 	if ((fd_evts[DIR_WR] = calloc(1, fd_set_bytes)) == NULL)
 		goto fail_swevt;
+	vma_set_name(fd_evts[DIR_WR], fd_set_bytes, "ev_select", "fd_evts_wr");
 
 	hap_register_per_thread_init(init_select_per_thread);
 	hap_register_per_thread_deinit(deinit_select_per_thread);
@@ -300,11 +308,8 @@ static int _do_test(struct poller *p)
 }
 
 /*
- * It is a constructor, which means that it will automatically be called before
- * main(). This is GCC-specific but it works at least since 2.95.
- * Special care must be taken so that it does not need any uninitialized data.
+ * Registers the poller.
  */
-__attribute__((constructor))
 static void _do_register(void)
 {
 	struct poller *p;
@@ -325,6 +330,7 @@ static void _do_register(void)
 	p->poll = _do_poll;
 }
 
+INITCALL0(STG_REGISTER, _do_register);
 
 /*
  * Local variables:

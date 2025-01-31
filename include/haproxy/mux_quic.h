@@ -1,125 +1,131 @@
-/*
- * include/haproxy/mux_quic-t.h
- * This file contains prototypes for QUIC mux-demux.
- *
- * Copyright 2021 HAProxy Technologies, Frédéric Lécaille <flecaille@haproxy.com>
- *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation, version 2.1
- * exclusively.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
- */
-
 #ifndef _HAPROXY_MUX_QUIC_H
 #define _HAPROXY_MUX_QUIC_H
+
 #ifdef USE_QUIC
 #ifndef USE_OPENSSL
 #error "Must define USE_OPENSSL"
 #endif
 
-#include <haproxy/buf-t.h>
+#include <haproxy/api.h>
+#include <haproxy/connection.h>
+#include <haproxy/list.h>
 #include <haproxy/mux_quic-t.h>
-#include <haproxy/obj_type.h>
+#include <haproxy/stconn.h>
 
-void quic_mux_transport_params_update(struct qcc *qcc);
-void qc_error(struct qcc *qcc, int err);
-struct buffer *qc_get_buf(struct qcs *qcs, struct buffer *bptr);
-struct qcs *qcc_get_stream(struct qcc *qcc, uint64_t id);
-struct qcs *bidi_qcs_new(struct qcc *qcc, uint64_t id);
-struct qcs *luqs_new(struct qcc *qcc);
-struct qcs *ruqs_new(struct qcc *qcc, uint64_t id);
-size_t luqs_snd_buf(struct qcs *qcs, struct buffer *buf, size_t count, int flags);
-void qcs_release(struct qcs *qcs);
+#define qcc_report_glitch(qcc, inc, ...) ({		\
+		COUNT_GLITCH(__VA_ARGS__);		\
+		_qcc_report_glitch(qcc, inc); 		\
+	})
 
-void ruqs_notify_recv(struct qcs *qcs);
+void qcc_set_error(struct qcc *qcc, int err, int app);
+int _qcc_report_glitch(struct qcc *qcc, int inc);
+struct qcs *qcc_init_stream_local(struct qcc *qcc, int bidi);
+void qcs_send_metadata(struct qcs *qcs);
+int qcs_attach_sc(struct qcs *qcs, struct buffer *buf, char fin);
+int qcs_is_close_local(struct qcs *qcs);
+int qcs_is_close_remote(struct qcs *qcs);
 
-/* Return 1 if the stream with <id> as ID attached to <qcc> connection
- * has been locally initiated, 0 if not.
+int qcs_subscribe(struct qcs *qcs, int event_type, struct wait_event *es);
+void qcs_notify_recv(struct qcs *qcs);
+void qcs_notify_send(struct qcs *qcs);
+void qcc_notify_buf(struct qcc *qcc, uint64_t free_size);
+
+struct buffer *qcc_get_stream_rxbuf(struct qcs *qcs);
+struct buffer *qcc_get_stream_txbuf(struct qcs *qcs, int *err, int small);
+struct buffer *qcc_realloc_stream_txbuf(struct qcs *qcs);
+int qcc_realign_stream_txbuf(const struct qcs *qcs, struct buffer *out);
+int qcc_release_stream_txbuf(struct qcs *qcs);
+int qcc_stream_can_send(const struct qcs *qcs);
+void qcc_reset_stream(struct qcs *qcs, int err);
+void qcc_send_stream(struct qcs *qcs, int urg, int count);
+void qcc_abort_stream_read(struct qcs *qcs);
+int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
+             char fin, char *data);
+int qcc_recv_max_data(struct qcc *qcc, uint64_t max);
+int qcc_recv_max_stream_data(struct qcc *qcc, uint64_t id, uint64_t max);
+int qcc_recv_reset_stream(struct qcc *qcc, uint64_t id, uint64_t err, uint64_t final_size);
+int qcc_recv_stop_sending(struct qcc *qcc, uint64_t id, uint64_t err);
+
+/* Bit shift to get the stream sub ID for internal use which is obtained
+ * shifting the stream IDs by this value, knowing that the
+ * QCS_ID_TYPE_SHIFT less significant bits identify the stream ID
+ * types (client initiated bidirectional, server initiated bidirectional,
+ * client initiated unidirectional, server initiated bidirectional).
+ * Note that there is no reference to such stream sub IDs in the RFC.
  */
-static inline int qc_local_stream_id(struct qcc *qcc, uint64_t id)
-{
-	if ((objt_listener(qcc->conn->target) && (id & QCS_ID_SRV_INTIATOR_BIT)) ||
-	    (objt_server(qcc->conn->target) && !(id & QCS_ID_SRV_INTIATOR_BIT)))
-		return 1;
-
-	return 0;
-}
-
-/* Return 1 if <qcs> stream  has been locally initiated, 0 if not. */
-static inline int qcs_local(struct qcs *qcs)
-{
-	if ((objt_listener(qcs->qcc->conn->target) && (qcs->id & QCS_ID_SRV_INTIATOR_BIT)) ||
-	    (objt_server(qcs->qcc->conn->target) && !(qcs->id & QCS_ID_SRV_INTIATOR_BIT)))
-		return 1;
-
-	return 0;
-}
-
-/* Return the direction of a stream with <id> as ID. */
-static inline enum qcs_dir qcs_id_dir(uint64_t id)
-{
-	return (id & QCS_ID_DIR_BIT) >> QCS_ID_DIR_BIT_SHIFT;
-}
-
-/* Return the direction of <qcs> QUIC stream. */
-static inline enum qcs_dir qcs_dir(struct qcs *qcs)
-{
-	return (qcs->id & QCS_ID_DIR_BIT) >> QCS_ID_DIR_BIT_SHIFT;
-}
+#define QCS_ID_TYPE_MASK         0x3
+#define QCS_ID_TYPE_SHIFT          2
+/* The less significant bit of a stream ID is set for a server initiated stream */
+#define QCS_ID_SRV_INTIATOR_BIT  0x1
+/* This bit is set for unidirectional streams */
+#define QCS_ID_DIR_BIT           0x2
 
 static inline enum qcs_type qcs_id_type(uint64_t id)
 {
 	return id & QCS_ID_TYPE_MASK;
 }
 
-static inline enum qcs_type qcs_type_from_dir(struct qcc *qcc, enum qcs_dir dir)
+/* Return true if stream has been opened locally. */
+static inline int quic_stream_is_local(struct qcc *qcc, uint64_t id)
 {
-	return (dir << QCS_ID_DIR_BIT_SHIFT) |
-		(!!objt_listener(qcc->conn->target) ? QCS_ID_SRV_INTIATOR_BIT : 0);
+	return conn_is_back(qcc->conn) == !(id & QCS_ID_SRV_INTIATOR_BIT);
 }
 
-static inline int64_t qcc_wnd(struct qcc *qcc)
+/* Return true if stream is opened by peer. */
+static inline int quic_stream_is_remote(struct qcc *qcc, uint64_t id)
 {
-	return qcc->tx.max_data - qcc->tx.bytes;
+	return !quic_stream_is_local(qcc, id);
 }
 
-/* Return 1 if <qcs> is unidirectional, 0 if not. */
-static inline int qcs_uni(struct qcs *qcs)
+static inline int quic_stream_is_uni(uint64_t id)
 {
-	return qcs->id & QCS_ID_DIR_BIT;
+	return id & QCS_ID_DIR_BIT;
 }
 
-/* Return 1 if <qcs> is bidirectional, 0 if not. */
-static inline int qcs_bidi(struct qcs *qcs)
+static inline int quic_stream_is_bidi(uint64_t id)
 {
-	return !qcs_uni(qcs);
+	return !quic_stream_is_uni(id);
 }
 
-/* Return the next stream ID with <qcs_type> as type if succeeded, (uint64_t)-1 if not. */
-static inline uint64_t qcs_next_id(struct qcc *qcc, enum qcs_type qcs_type)
+static inline char *qcs_st_to_str(enum qcs_state st)
 {
-	if (qcc->strms[qcs_type].nb_streams + 1 > qcc->strms[qcs_type].max_streams)
-		return (uint64_t)-1;
-
-	return (qcc->strms[qcs_type].nb_streams++ << QCS_ID_TYPE_SHIFT) | qcs_type;
+	switch (st) {
+	case QC_SS_IDLE: return "IDL";
+	case QC_SS_OPEN: return "OPN";
+	case QC_SS_HLOC: return "HCL";
+	case QC_SS_HREM: return "HCR";
+	case QC_SS_CLO:  return "CLO";
+	default:         return "???";
+	}
 }
 
-static inline void *qcs_new(struct qcc *qcc, uint64_t id)
+int qcc_install_app_ops(struct qcc *qcc, const struct qcc_app_ops *app_ops);
+
+/* Register <qcs> stream for http-request timeout. If the stream is not yet
+ * attached in the configured delay, qcc timeout task will be triggered. This
+ * means the full header section was not received in time.
+ *
+ * This function should be called by the application protocol layer on request
+ * streams initialization.
+ */
+static inline void qcs_wait_http_req(struct qcs *qcs)
 {
-	if (id & QCS_ID_DIR_BIT)
-		return ruqs_new(qcc, id);
-	else
-		return bidi_qcs_new(qcc, id);
+	struct qcc *qcc = qcs->qcc;
+
+	/* A stream cannot be registered several times. */
+	BUG_ON_HOT(tick_isset(qcs->start));
+	qcs->start = now_ms;
+
+	/* qcc.opening_list size is limited by flow-control so no custom
+	 * restriction is needed here.
+	 */
+	LIST_APPEND(&qcc->opening_list, &qcs->el_opening);
 }
+
+void qcc_show_quic(struct qcc *qcc);
+
+void qcc_wakeup(struct qcc *qcc);
 
 #endif /* USE_QUIC */
+
 #endif /* _HAPROXY_MUX_QUIC_H */

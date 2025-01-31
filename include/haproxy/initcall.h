@@ -63,9 +63,9 @@
 enum init_stage {
 	STG_PREPARE = 0,      // preset variables, tables, list heads
 	STG_LOCK,             // pre-initialize locks
+	STG_REGISTER,         // register static lists (keywords etc)
 	STG_ALLOC,            // allocate required structures
 	STG_POOL,             // create pools
-	STG_REGISTER,         // register static lists (keywords etc)
 	STG_INIT,             // subsystems normal initialization
 	STG_SIZE              // size of the stages array, must be last
 };
@@ -96,11 +96,9 @@ struct initcall {
  * as a pointer (args are cast to (void*)). Do not use this macro directly,
  * use INITCALL{0..3}() instead.
  */
-#define __HA_GLOBL1(sym)   __asm__(".globl " #sym)
-#define __HA_GLOBL(sym)    __HA_GLOBL1(sym)
 #define __DECLARE_INITCALL(stg, linenum, function, a1, a2, a3)     \
-        __HA_GLOBL(__start_i_##stg );                              \
-        __HA_GLOBL(__stop_i_##stg );                               \
+        HA_GLOBL(__start_i_##stg );                                \
+        HA_GLOBL(__stop_i_##stg );                                 \
 	static const struct initcall *__initcb_##linenum           \
 	    __attribute__((__used__)) HA_INIT_SECTION(stg) =	   \
 	        (stg < STG_SIZE) ? &(const struct initcall) {      \
@@ -200,9 +198,9 @@ __attribute__((constructor)) static void __initcb_##linenum()      \
 /* Declare all initcall sections here */
 DECLARE_INIT_SECTION(STG_PREPARE);
 DECLARE_INIT_SECTION(STG_LOCK);
+DECLARE_INIT_SECTION(STG_REGISTER);
 DECLARE_INIT_SECTION(STG_ALLOC);
 DECLARE_INIT_SECTION(STG_POOL);
-DECLARE_INIT_SECTION(STG_REGISTER);
 DECLARE_INIT_SECTION(STG_INIT);
 
 // for use in the main haproxy.c file

@@ -28,8 +28,10 @@
 
 /* These are the flags that are found in txn->flags */
 
-/* action flags */
-/* Unusued: 0x00000001..0x00000004 */
+/* action flags.
+ * Please also update the txn_show_flags() function below in case of changes.
+ */
+/* Unused: 0x00000001..0x00000004 */
 #define TX_CONST_REPLY  0x00000008      /* The http reply must not be rewritten (don't eval after-response ruleset) */
 #define TX_CLTARPIT	0x00000010	/* the transaction is tarpitted (anti-dos) */
 
@@ -59,20 +61,57 @@
 /* cacheability management, bits values 0x1000 to 0x3000 (0-3 shift 12) */
 #define TX_CACHEABLE	0x00001000	/* at least part of the response is cacheable */
 #define TX_CACHE_COOK	0x00002000	/* a cookie in the response is cacheable */
-#define TX_CACHE_IGNORE 0x00004000	/* do not retrieve object from cache, or avoid caching response */
+#define TX_CACHE_IGNORE 0x00004000	/* do not retrieve object from cache */
 #define TX_CACHE_SHIFT	12		/* bit shift */
 
 #define TX_CON_WANT_TUN 0x00008000	/* Will be a tunnel (CONNECT or 101-Switching-Protocol) */
 
-#define TX_CACHE_HAS_SEC_KEY 0x00010000 /* secondary key building succedeed */
+#define TX_CACHE_HAS_SEC_KEY 0x00010000 /* secondary key building succeeded */
 
 #define TX_USE_PX_CONN	0x00020000	/* Use "Proxy-Connection" instead of "Connection" */
 
 /* used only for keep-alive purposes, to indicate we're on a second transaction */
 #define TX_NOT_FIRST	0x00040000	/* the transaction is not the first one */
 
+#define TX_L7_RETRY     0x00080000      /* The transaction may attempt L7 retries */
+#define TX_D_L7_RETRY   0x00100000      /* Disable L7 retries on this transaction, even if configured to do it */
+
+/* This function is used to report flags in debugging tools. Please reflect
+ * below any single-bit flag addition above in the same order via the
+ * __APPEND_FLAG and __APPEND_ENUM macros. The new end of the buffer is
+ * returned.
+ */
+static forceinline char *txn_show_flags(char *buf, size_t len, const char *delim, uint flg)
+{
+#define _(f, ...)     __APPEND_FLAG(buf, len, delim, flg, f, #f, __VA_ARGS__)
+#define _e(m, e, ...) __APPEND_ENUM(buf, len, delim, flg, m, e, #e, __VA_ARGS__)
+	/* prologue */
+	_(0);
+	/* flags & enums */
+	_(TX_SCK_PRESENT, _(TX_CACHEABLE, _(TX_CACHE_COOK, _(TX_CACHE_IGNORE,
+	_(TX_CON_WANT_TUN, _(TX_CACHE_HAS_SEC_KEY, _(TX_USE_PX_CONN,
+	_(TX_NOT_FIRST, _(TX_L7_RETRY, _(TX_D_L7_RETRY))))))))));
+
+	_e(TX_SCK_MASK, TX_SCK_FOUND,     _e(TX_SCK_MASK, TX_SCK_DELETED,
+	_e(TX_SCK_MASK, TX_SCK_INSERTED,  _e(TX_SCK_MASK, TX_SCK_REPLACED,
+	_e(TX_SCK_MASK, TX_SCK_UPDATED)))));
+
+	_e(TX_CK_MASK, TX_CK_INVALID,     _e(TX_CK_MASK, TX_CK_DOWN,
+	_e(TX_CK_MASK, TX_CK_VALID,       _e(TX_CK_MASK, TX_CK_EXPIRED,
+	_e(TX_CK_MASK, TX_CK_OLD,         _e(TX_CK_MASK, TX_CK_UNUSED))))));
+
+	_(TX_CONST_REPLY, _(TX_CLTARPIT));
+	/* epilogue */
+	_(~0U);
+	return buf;
+#undef _e
+#undef _
+}
+
+
 /*
- * HTTP message status flags (msg->flags)
+ * HTTP message status flags (msg->flags).
+ * Please also update the txn_show_flags() function below in case of changes.
  */
 #define HTTP_MSGF_CNT_LEN     0x00000001  /* content-length was found in the message */
 #define HTTP_MSGF_TE_CHNK     0x00000002  /* transfer-encoding: chunked was found */
@@ -91,12 +130,34 @@
 #define HTTP_MSGF_BODYLESS    0x00000040  /* The message has no body (content-length = 0) */
 #define HTTP_MSGF_CONN_UPG    0x00000080  /* The message contains "Connection: Upgrade" header */
 
+#define HTTP_MSGF_EXPECT_CHECKED 0x00000100  /* Expect header was already handled, if any */
+
+/* This function is used to report flags in debugging tools. Please reflect
+ * below any single-bit flag addition above in the same order via the
+ * __APPEND_FLAG macro. The new end of the buffer is returned.
+ */
+static forceinline char *hmsg_show_flags(char *buf, size_t len, const char *delim, uint flg)
+{
+#define _(f, ...)     __APPEND_FLAG(buf, len, delim, flg, f, #f, __VA_ARGS__)
+	/* prologue */
+	_(0);
+	/* flags */
+	_(HTTP_MSGF_CNT_LEN, _(HTTP_MSGF_TE_CHNK, _(HTTP_MSGF_XFER_LEN,
+	_(HTTP_MSGF_VER_11, _(HTTP_MSGF_SOFT_RW, _(HTTP_MSGF_COMPRESSING,
+	_(HTTP_MSGF_BODYLESS, _(HTTP_MSGF_CONN_UPG, _(HTTP_MSGF_EXPECT_CHECKED)))))))));
+	/* epilogue */
+	_(~0U);
+	return buf;
+#undef _
+}
+
+
 /* Maximum length of the cache secondary key (sum of all the possible parts of
  * the secondary key). The actual keys might be smaller for some
  * request/response pairs, because they depend on the responses' optional Vary
  * header. The different sizes can be found in the vary_information object (see
  * cache.c).*/
-#define HTTP_CACHE_SEC_KEY_LEN (sizeof(uint32_t)+sizeof(int))
+#define HTTP_CACHE_SEC_KEY_LEN (sizeof(uint32_t)+sizeof(uint64_t)+sizeof(uint64_t))
 
 
 /* Redirect flags */
@@ -106,6 +167,8 @@ enum {
 	REDIRECT_FLAG_APPEND_SLASH = 2,	/* append a slash if missing at the end */
 	REDIRECT_FLAG_FROM_REQ = 4,     /* redirect rule on the request path */
 	REDIRECT_FLAG_IGNORE_EMPTY = 8, /* silently ignore empty location expressions */
+	REDIRECT_FLAG_KEEP_QS = 16,	/* append the query string to location, if any */
+	REDIRECT_FLAG_COOKIE_FMT = 32,  /* The cookie value is a log-format stirng*/
 };
 
 /* Redirect types (location, prefix, extended ) */
@@ -116,7 +179,7 @@ enum {
 	REDIRECT_TYPE_SCHEME,           /* scheme redirect (eg: switch from http to https) */
 };
 
-/* Perist types (force-persist, ignore-persist) */
+/* Persist types (force-persist, ignore-persist) */
 enum {
 	PERSIST_TYPE_NONE = 0,          /* no persistence */
 	PERSIST_TYPE_FORCE,             /* force-persist */
@@ -142,23 +205,19 @@ enum h1_state {
 	HTTP_MSG_RQBEFORE     =  0, // request: leading LF, before start line
 	HTTP_MSG_RPBEFORE     =  1, // response: leading LF, before start line
 
-	/* error state : must be before HTTP_MSG_BODY so that (>=BODY) always indicates
-	 * that data are being processed.
-	 */
-	HTTP_MSG_ERROR        =  2, // an error occurred
 	/* Body processing.
 	 * The state HTTP_MSG_BODY is a delimiter to know if we're waiting for headers
 	 * or body. All the sub-states below also indicate we're processing the body,
 	 * with some additional information.
 	 */
-	HTTP_MSG_BODY         =  3, // parsing body at end of headers
-	HTTP_MSG_DATA         =  4, // skipping data chunk / content-length data
+	HTTP_MSG_BODY         =  2, // parsing body at end of headers
+	HTTP_MSG_DATA         =  3, // skipping data chunk / content-length data
 	/* we enter this state when we've received the end of the current message */
-	HTTP_MSG_ENDING       =  5, // message end received, wait that the filters end too
-	HTTP_MSG_DONE         =  6, // message end received, waiting for resync or close
-	HTTP_MSG_CLOSING      =  7, // shutdown_w done, not all bytes sent yet
-	HTTP_MSG_CLOSED       =  8, // shutdown_w done, all bytes sent
-	HTTP_MSG_TUNNEL       =  9, // tunneled data after DONE
+	HTTP_MSG_ENDING       =  4, // message end received, wait that the filters end too
+	HTTP_MSG_DONE         =  5, // message end received, waiting for resync or close
+	HTTP_MSG_CLOSING      =  6, // shutdown_w done, not all bytes sent yet
+	HTTP_MSG_CLOSED       =  7, // shutdown_w done, all bytes sent
+	HTTP_MSG_TUNNEL       =  8, // tunneled data after DONE
 } __attribute__((packed));
 
 
@@ -167,8 +226,8 @@ enum h1_state {
  */
 struct http_msg {
 	enum h1_state msg_state;               /* where we are in the current message parsing */
-	unsigned char flags;                   /* flags describing the message (HTTP version, ...) */
-	/* 5 bytes unused here */
+	/* 3 bytes unused here */
+	unsigned int flags;                    /* flags describing the message (HTTP version, ...) */
 	struct channel *chn;                   /* pointer to the channel transporting the message */
 };
 
@@ -182,9 +241,10 @@ struct http_txn {
 	unsigned int flags;             /* transaction flags */
 	enum http_meth_t meth;          /* HTTP method */
 	/* 1 unused byte here */
-	short status;                   /* HTTP status from the server, negative if from proxy */
+	short status;                   /* HTTP status sent to the client, negative if not set */
+	short server_status;            /* HTTP status received from the server, negative if not received */
 	struct http_reply *http_reply;  /* The HTTP reply to use as reply */
-
+	struct buffer l7_buffer;        /* To store the data, in case we have to retry */
 	char cache_hash[20];               /* Store the cache hash  */
 	char cache_secondary_hash[HTTP_CACHE_SEC_KEY_LEN]; /* Optional cache secondary key. */
 	char *uri;                      /* first line if log needed, NULL otherwise */

@@ -25,6 +25,7 @@
 #include <import/ebtree-t.h>
 
 #include <haproxy/api-t.h>
+#include <haproxy/event_hdl-t.h>
 #include <haproxy/regex-t.h>
 #include <haproxy/sample_data-t.h>
 #include <haproxy/thread-t.h>
@@ -36,7 +37,7 @@
  * ACLs :
  *   - PASS : at least one pattern already matches
  *   - MISS : some data is missing to decide if some rules may finally match.
- *   - FAIL : no mattern may ever match
+ *   - FAIL : no pattern may ever match
  *
  * We assign values 0, 1 and 3 to FAIL, MISS and PASS respectively, so that we
  * can make use of standard arithmetic for the truth tables below :
@@ -92,9 +93,11 @@ enum {
 	PAT_MATCH_NUM
 };
 
-#define PAT_REF_MAP 0x1 /* Set if the reference is used by at least one map. */
-#define PAT_REF_ACL 0x2 /* Set if the reference is used by at least one acl. */
-#define PAT_REF_SMP 0x4 /* Flag used if the reference contains a sample. */
+#define PAT_REF_MAP  0x01 /* Set if the reference is used by at least one map. */
+#define PAT_REF_ACL  0x02 /* Set if the reference is used by at least one acl. */
+#define PAT_REF_SMP  0x04 /* Flag used if the reference contains a sample. */
+#define PAT_REF_FILE 0x08 /* Set if the reference was loaded from a file */
+#define PAT_REF_ID   0x10 /* Set if the reference is only an ID (not loaded from a file) */
 
 /* This struct contain a list of reference strings for dunamically
  * updatable patterns.
@@ -104,6 +107,7 @@ struct pat_ref {
 	char *reference; /* The reference name. */
 	char *display; /* String displayed to identify the pattern origin. */
 	struct list head; /* The head of the list of struct pat_ref_elt. */
+	struct eb_root ebmb_root; /* The tree where pattern reference elements are attached. */
 	struct list pat; /* The head of the list of struct pattern_expr. */
 	unsigned int flags; /* flags PAT_REF_*. */
 	unsigned int curr_gen; /* current generation number (anything below can be removed) */
@@ -111,22 +115,25 @@ struct pat_ref {
 	int unique_id; /* Each pattern reference have unique id. */
 	unsigned long long revision; /* updated for each update */
 	unsigned long long entry_cnt; /* the total number of entries */
-	__decl_thread(HA_SPINLOCK_T lock); /* Lock used to protect pat ref elements */
+	THREAD_ALIGN(64);
+	__decl_thread(HA_RWLOCK_T lock); /* Lock used to protect pat ref elements */
+	event_hdl_sub_list e_subs;       /* event_hdl: pat_ref's subscribers list (atomically updated) */
 };
 
 /* This is a part of struct pat_ref. Each entry contains one pattern and one
  * associated value as original string. All derivative forms (via exprs) are
- * accessed from list_head or tree_head.
+ * accessed from list_head or tree_head. Be careful, it's variable-sized!
  */
 struct pat_ref_elt {
 	struct list list; /* Used to chain elements. */
 	struct list back_refs; /* list of users tracking this pat ref */
 	void *list_head; /* all &pattern_list->from_ref derived from this reference, ends with NULL */
 	void *tree_head; /* all &pattern_tree->from_ref derived from this reference, ends with NULL */
-	char *pattern;
 	char *sample;
 	unsigned int gen_id; /* generation of pat_ref this was made for */
 	int line;
+	struct ebmb_node node; /* Node to attach this element to its <pat_ref> ebtree. */
+	const char pattern[0]; // const only to make sure nobody tries to free it.
 };
 
 /* This contain each tree indexed entry. This struct permit to associate
@@ -136,6 +143,7 @@ struct pattern_tree {
 	void *from_ref;    // pattern_tree linked from pat_ref_elt, ends with NULL
 	struct sample_data *data;
 	struct pat_ref_elt *ref;
+	struct pattern_expr *expr;
 	struct ebmb_node node;
 };
 
@@ -181,6 +189,7 @@ struct pattern_list {
 	void *from_ref;    // pattern_tree linked from pat_ref_elt, ends with NULL
 	struct list list;
 	struct pattern pat;
+	struct pattern_expr *expr;
 };
 
 /* Description of a pattern expression.
@@ -200,6 +209,7 @@ struct pattern_expr {
 	struct eb_root pattern_tree;  /* may be used for lookup in large datasets */
 	struct eb_root pattern_tree_2;  /* may be used for different types */
 	int mflags;                     /* flags relative to the parsing or matching method. */
+	uint32_t refcount;            /* refcount used to know if the expr can be deleted or not */
 	__decl_thread(HA_RWLOCK_T lock);               /* lock used to protect patterns */
 };
 
@@ -209,7 +219,6 @@ struct pattern_expr {
  */
 struct pattern_expr_list {
 	struct list list; /* Used for chaining pattern_expr in pattern_head. */
-	int do_free;
 	struct pattern_expr *expr; /* The used expr. */
 };
 

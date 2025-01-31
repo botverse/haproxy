@@ -22,8 +22,11 @@
 #ifndef _HAPROXY_TIME_H
 #define _HAPROXY_TIME_H
 
+#include <haproxy/time-t.h>
+
 #include <sys/time.h>
 #include <haproxy/api.h>
+#include <haproxy/ticks.h>
 
 #define TIME_ETERNITY   (TV_ETERNITY_MS)
 
@@ -108,6 +111,52 @@ static inline struct timeval * __tv_from_ms(struct timeval *tv, unsigned long ms
 	tv->tv_usec = (ms % 1000) * 1000;
 	return tv;
 }
+
+/*
+ * Converts a struct timeval to a relative timestamp in nanoseconds (only
+ * wraps every 585 years, i.e. never for our purpose).
+ */
+static forceinline ullong tv_to_ns(const struct timeval *tv)
+{
+	ullong ret;
+
+	ret  = (ullong)tv->tv_sec  * 1000000000ULL;
+	ret += (ullong)tv->tv_usec * 1000ULL;
+	return ret;
+}
+
+/* turns nanoseconds to seconds, just to avoid typos */
+static forceinline uint ns_to_sec(ullong ns)
+{
+	return ns / 1000000000ULL;
+}
+
+/* turns nanoseconds to milliseconds, just to avoid typos */
+static forceinline uint ns_to_ms(ullong ns)
+{
+	return ns / 1000000ULL;
+}
+
+/* turns seconds to nanoseconds, just to avoid typos */
+static forceinline ullong sec_to_ns(uint sec)
+{
+	return sec * 1000000000ULL;
+}
+
+/* turns milliseconds to nanoseconds, just to avoid typos */
+static forceinline ullong ms_to_ns(uint ms)
+{
+	return ms * 1000000ULL;
+}
+
+/* turns microseconds to nanoseconds, just to avoid typos */
+static forceinline ullong us_to_ns(uint us)
+{
+	return us * 1000ULL;
+}
+
+/* creates a struct timeval from a relative timestamp in nanosecond */
+#define NS_TO_TV(t) ((const struct timeval){ .tv_sec = (t) / 1000000000ULL, .tv_usec = ((t) % 1000000000ULL) / 1000U })
 
 /* Return a number of 1024Hz ticks between 0 and 1023 for input number of
  * usecs between 0 and 999999. This function has been optimized to remove
@@ -463,6 +512,40 @@ static inline struct timeval *__tv_ms_add(struct timeval *tv, const struct timev
                   *tv1 = *tv2;     \
         tv1;                       \
 })
+
+/* Initialize <timer>. */
+static inline void tot_time_reset(struct tot_time *timer)
+{
+	timer->curr = 0;
+	timer->tot = 0;
+}
+
+/* Start to account with <timer>. No-op if already started. */
+static inline void tot_time_start(struct tot_time *timer)
+{
+	if (!timer->curr)
+		timer->curr = now_ms;
+}
+
+/* Stop <timer> accounting and update its total. No-op if already stopped. */
+static inline void tot_time_stop(struct tot_time *timer)
+{
+	if (timer->curr) {
+		timer->tot += now_ms - timer->curr;
+		timer->curr = 0;
+	}
+}
+
+/* Retrieve the total value accounted by <timer>, including the current period
+ * if currently started.
+ */
+static inline uint32_t tot_time_read(const struct tot_time *timer)
+{
+	uint32_t value = timer->tot;
+	if (timer->curr)
+		value += now_ms - timer->curr;
+	return value;
+}
 
 #endif /* _HAPROXY_TIME_H */
 

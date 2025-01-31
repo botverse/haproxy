@@ -24,6 +24,7 @@
 
 #include <haproxy/api-t.h>
 #include <haproxy/port_range-t.h>
+#include <haproxy/show_flags-t.h>
 
 /* Direction for each FD event update */
 enum {
@@ -69,6 +70,8 @@ enum {
 #define FD_ET_POSSIBLE_BIT 19  /* edge-triggered is possible on this FD */
 #define FD_EXPORTED_BIT    20  /* FD is exported and must not be closed */
 #define FD_EXCL_SYSCALL_BIT 21 /* a syscall claims exclusivity on this FD */
+#define FD_DISOWN_BIT      22  /* this fd will be closed by some external code */
+#define FD_MUST_CLOSE_BIT  23  /* this fd will be closed by some external code */
 
 
 /* and flag values */
@@ -109,6 +112,29 @@ enum {
 #define FD_ET_POSSIBLE      (1U << FD_ET_POSSIBLE_BIT)
 #define FD_EXPORTED         (1U << FD_EXPORTED_BIT)
 #define FD_EXCL_SYSCALL     (1U << FD_EXCL_SYSCALL_BIT)
+#define FD_DISOWN           (1U << FD_DISOWN_BIT)
+#define FD_MUST_CLOSE       (1U << FD_MUST_CLOSE_BIT)
+
+/* This function is used to report flags in debugging tools. Please reflect
+ * below any single-bit flag addition above in the same order via the
+ * __APPEND_FLAG macro. The new end of the buffer is returned.
+ */
+static forceinline char *fd_show_flags(char *buf, size_t len, const char *delim, uint flg)
+{
+#define _(f, ...) __APPEND_FLAG(buf, len, delim, flg, f, #f, __VA_ARGS__)
+	/* prologue */
+	_(0);
+	/* flags */
+	_(FD_EV_ACTIVE_R, _(FD_EV_ACTIVE_W, _(FD_EV_READY_R, _(FD_EV_READY_W,
+	_(FD_EV_SHUT_R, _(FD_EV_SHUT_W, _(FD_EV_ERR_RW, _(FD_POLL_IN,
+	_(FD_POLL_PRI, _(FD_POLL_OUT, _(FD_POLL_ERR, _(FD_POLL_HUP,
+	_(FD_LINGER_RISK, _(FD_CLONED, _(FD_INITIALIZED, _(FD_ET_POSSIBLE,
+	_(FD_EXPORTED, _(FD_EXCL_SYSCALL, _(FD_DISOWN)))))))))))))))))));
+	/* epilogue */
+	_(~0U);
+	return buf;
+#undef _
+}
 
 /* FD update status after fd_update_events() */
 enum {
@@ -143,14 +169,20 @@ struct fdlist_entry {
 	int prev;
 } ALIGNED(8);
 
-/* head of the fd cache */
+/* head of the fd cache, per-group */
 struct fdlist {
 	int first;
 	int last;
-} ALIGNED(8);
+} ALIGNED(64);
 
 /* info about one given fd. Note: only align on cache lines when using threads;
  * 32-bit small archs can put everything in 32-bytes when threads are disabled.
+ * refc_tgid is an atomic 32-bit composite value made of 16 higher bits
+ * containing a refcount on tgid and the running_mask, and 16 lower bits
+ * containing a thread group ID and a lock bit on the 16th. The tgid may only
+ * be changed when refc is zero and running may only be checked/changed when
+ * refc is held and shows the reader is alone. An FD with tgid zero belongs to
+ * nobody.
  */
 struct fdtab {
 	unsigned long running_mask;          /* mask of thread IDs currently using the fd */
@@ -160,6 +192,13 @@ struct fdtab {
 	void (*iocb)(int fd);                /* I/O handler */
 	void *owner;                         /* the connection or listener associated with this fd, NULL if closed */
 	unsigned int state;                  /* FD state for read and write directions (FD_EV_*) + FD_POLL_* */
+	unsigned int refc_tgid;              /* refcounted tgid, updated atomically */
+	/* the info below are mainly used for epoll debugging/strengthening.
+	 * they're filling the rest of the cache line but may easily be dropped
+	 * if the room is needed for more important stuff.
+	 */
+	unsigned int nb_takeover;            /* number of times this FD was taken over since inserted (used for debugging) */
+	unsigned int generation;             /* number of times this FD was closed before (used for epoll strengthening) */
 #ifdef DEBUG_FD
 	unsigned int event_count;            /* number of events reported */
 #endif

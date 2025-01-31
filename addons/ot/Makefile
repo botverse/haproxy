@@ -65,11 +65,9 @@ OPTIONS_OBJS += \
 	addons/ot/src/util.o
 
 ifneq ($(OT_USE_VARS),)
-OT_DEFINE     = -DUSE_OT_VARS
+OT_DEFINE    += -DUSE_OT_VARS
 OPTIONS_OBJS += \
 	addons/ot/src/vars.o
 endif
 
-OPTIONS_CFLAGS  += $(OT_CFLAGS) -Iaddons/ot/include
-OPTIONS_LDFLAGS += $(OT_LDFLAGS)
-OPTIONS_CFLAGS  += $(OT_DEFINE)
+OT_CFLAGS := $(OT_CFLAGS) -Iaddons/ot/include $(OT_DEFINE)

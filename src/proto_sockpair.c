@@ -12,7 +12,6 @@
 
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <pwd.h>
 #include <grp.h>
 #include <stdio.h>
@@ -51,8 +50,9 @@ struct connection *sockpair_accept_conn(struct listener *l, int *status);
 
 struct proto_fam proto_fam_sockpair = {
 	.name = "sockpair",
-	.sock_domain = AF_CUST_SOCKPAIR,
-	.sock_family = AF_UNIX,
+	.sock_domain = AF_UNIX,
+	.sock_family = AF_CUST_SOCKPAIR,
+	.real_family = AF_CUST_SOCKPAIR,
 	.sock_addrlen = sizeof(struct sockaddr_un),
 	.l3_addrlen = sizeof(((struct sockaddr_un*)0)->sun_path),
 	.addrcmp = NULL,
@@ -66,7 +66,7 @@ struct protocol proto_sockpair = {
 	.name           = "sockpair",
 
 	/* connection layer */
-	.ctrl_type      = SOCK_STREAM,
+	.xprt_type      = PROTO_TYPE_STREAM,
 	.listen         = sockpair_bind_listener,
 	.enable         = sockpair_enable_listener,
 	.disable        = sockpair_disable_listener,
@@ -95,8 +95,6 @@ struct protocol proto_sockpair = {
 	.rx_unbind      = sock_unbind,
 	.rx_listening   = sockpair_accepting_conn,
 	.default_iocb   = sock_accept_iocb,
-	.receivers      = LIST_HEAD_INIT(proto_sockpair.receivers),
-	.nb_receivers   = 0,
 };
 
 INITCALL1(STG_REGISTER, protocol_register, &proto_sockpair);
@@ -138,6 +136,30 @@ int sockpair_bind_receiver(struct receiver *rx, char **errmsg)
 	if (rx->flags & RX_F_BOUND)
 		return ERR_NONE;
 
+	if (rx->flags & RX_F_MUST_DUP) {
+		/* this is a secondary receiver that is an exact copy of a
+		 * reference which must already be bound (or has failed).
+		 * We'll try to dup() the other one's FD and take it. We
+		 * try hard not to reconfigure the socket since it's shared.
+		 */
+		BUG_ON(!rx->shard_info);
+		if (!(rx->shard_info->ref->flags & RX_F_BOUND)) {
+			/* it's assumed that the first one has already reported
+			 * the error, let's not spam with another one, and do
+			 * not set ERR_ALERT.
+			 */
+			err |= ERR_RETRYABLE;
+			goto bind_ret_err;
+		}
+		/* taking the other one's FD will result in it being marked
+		 * extern and being dup()ed. Let's mark the receiver as
+		 * inherited so that it properly bypasses all second-stage
+		 * setup and avoids being passed to new processes.
+		 */
+		rx->flags |= RX_F_INHERITED;
+		rx->fd = rx->shard_info->ref->fd;
+	}
+
 	if (rx->fd == -1) {
 		err |= ERR_FATAL | ERR_ALERT;
 		memprintf(errmsg, "sockpair may be only used with inherited FDs");
@@ -150,7 +172,7 @@ int sockpair_bind_receiver(struct receiver *rx, char **errmsg)
 		goto bind_close_return;
 	}
 
-	if (fcntl(rx->fd, F_SETFL, O_NONBLOCK) == -1) {
+	if (fd_set_nonblock(rx->fd) == -1) {
 		err |= ERR_FATAL | ERR_ALERT;
 		memprintf(errmsg, "cannot make socket non-blocking");
 		goto bind_close_return;
@@ -158,13 +180,14 @@ int sockpair_bind_receiver(struct receiver *rx, char **errmsg)
 
 	rx->flags |= RX_F_BOUND;
 
-	fd_insert(rx->fd, rx->owner, rx->iocb, thread_mask(rx->bind_thread) & all_threads_mask);
+	fd_insert(rx->fd, rx->owner, rx->iocb, rx->bind_tgroup, rx->bind_thread);
 	return err;
 
  bind_return:
 	if (errmsg && *errmsg)
 		memprintf(errmsg, "%s for [fd %d]", *errmsg, rx->fd);
 
+ bind_ret_err:
 	return err;
 
  bind_close_return:
@@ -216,12 +239,12 @@ static int sockpair_bind_listener(struct listener *listener, char *errmsg, int e
  */
 int send_fd_uxst(int fd, int send_fd)
 {
-	char iobuf[2];
+	char iobuf[2] = {0};
 	struct iovec iov;
 	struct msghdr msghdr;
 
-	char cmsgbuf[CMSG_SPACE(sizeof(int))];
-	char buf[CMSG_SPACE(sizeof(int))];
+	char cmsgbuf[CMSG_SPACE(sizeof(int))] = {0};
+	char buf[CMSG_SPACE(sizeof(int))] = {0};
 	struct cmsghdr *cmsg = (void *)buf;
 
 	int *fdptr;
@@ -246,8 +269,7 @@ int send_fd_uxst(int fd, int send_fd)
 	memcpy(fdptr, &send_fd, sizeof(send_fd));
 
 	if (sendmsg(fd, &msghdr, 0) != sizeof(iobuf)) {
-		ha_warning("Failed to transfer socket\n");
-		return 1;
+		return -1;
 	}
 
 	return 0;
@@ -284,6 +306,8 @@ static int sockpair_connect_server(struct connection *conn, int flags)
 {
 	int sv[2], fd, dst_fd = -1;
 
+	BUG_ON(!conn->dst);
+
 	/* the FD is stored in the sockaddr struct */
 	dst_fd = ((struct sockaddr_in *)conn->dst)->sin_addr.s_addr;
 
@@ -313,7 +337,7 @@ static int sockpair_connect_server(struct connection *conn, int flags)
 		return SF_ERR_PRXCOND; /* it is a configuration limit */
 	}
 
-	if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1) {
+	if (fd_set_nonblock(fd) == -1) {
 		qfprintf(stderr,"Cannot set client socket to non blocking mode.\n");
 		close(sv[0]);
 		close(sv[1]);
@@ -322,7 +346,7 @@ static int sockpair_connect_server(struct connection *conn, int flags)
 		return SF_ERR_INTERNAL;
 	}
 
-	if (master == 1 && (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1)) {
+	if (master == 1 && fd_set_cloexec(fd) == -1) {
 		ha_alert("Cannot set CLOEXEC on client socket.\n");
 		close(sv[0]);
 		close(sv[1]);
@@ -340,6 +364,7 @@ static int sockpair_connect_server(struct connection *conn, int flags)
 	/* The new socket is sent on the other side, it should be retrieved and
 	 * considered as an 'accept' socket on the server side */
 	if (send_fd_uxst(dst_fd, sv[0]) == -1) {
+		ha_alert("socketpair: Cannot transfer the fd %d over sockpair@%d. Giving up.\n", sv[0], dst_fd);
 		close(sv[0]);
 		close(sv[1]);
 		conn->err_code = CO_ER_SOCK_ERR;
@@ -350,8 +375,6 @@ static int sockpair_connect_server(struct connection *conn, int flags)
 	close(sv[0]); /* we don't need this side anymore */
 
 	conn->flags &= ~CO_FL_WAIT_L4_CONN;
-
-	conn->flags |= CO_FL_ADDR_TO_SET;
 
 	/* Prepare to send a few handshakes related to the on-wire protocol. */
 	if (conn->send_proxy_ofs)
@@ -469,7 +492,7 @@ struct connection *sockpair_accept_conn(struct listener *l, int *status)
 	int cfd;
 
 	if ((cfd = recv_fd_uxst(l->rx.fd)) != -1)
-		DISGUISE(fcntl(cfd, F_SETFL, O_NONBLOCK));
+		fd_set_nonblock(cfd);
 
 	if (likely(cfd != -1)) {
 		/* Perfect, the connection was accepted */
@@ -483,12 +506,14 @@ struct connection *sockpair_accept_conn(struct listener *l, int *status)
 		/* just like with UNIX sockets, only the family is filled */
 		conn->src->ss_family = AF_UNIX;
 		conn->handle.fd = cfd;
-		conn->flags |= CO_FL_ADDR_FROM_SET;
 		ret = CO_AC_DONE;
 		goto done;
 	}
 
 	switch (errno) {
+#if defined(EWOULDBLOCK) && defined(EAGAIN) && EWOULDBLOCK != EAGAIN
+	case EWOULDBLOCK:
+#endif
 	case EAGAIN:
 		ret = CO_AC_DONE; /* nothing more to accept */
 		if (fdtab[l->rx.fd].state & (FD_POLL_HUP|FD_POLL_ERR)) {

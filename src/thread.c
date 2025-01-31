@@ -13,7 +13,6 @@
 #define _GNU_SOURCE
 #include <unistd.h>
 #include <stdlib.h>
-#include <fcntl.h>
 
 #include <signal.h>
 #include <unistd.h>
@@ -56,32 +55,31 @@ THREAD_LOCAL const struct tgroup_info *tg = &ha_tgroup_info[0];
 struct thread_info ha_thread_info[MAX_THREADS] = { };
 THREAD_LOCAL const struct thread_info *ti = &ha_thread_info[0];
 
+struct tgroup_ctx ha_tgroup_ctx[MAX_TGROUPS] = { };
+THREAD_LOCAL struct tgroup_ctx *tg_ctx = &ha_tgroup_ctx[0];
+
 struct thread_ctx ha_thread_ctx[MAX_THREADS] = { };
 THREAD_LOCAL struct thread_ctx *th_ctx = &ha_thread_ctx[0];
 
 #ifdef USE_THREAD
 
-volatile unsigned long threads_want_rdv_mask __read_mostly = 0;
-volatile unsigned long threads_harmless_mask = 0;
-volatile unsigned long threads_idle_mask = 0;
-volatile unsigned long threads_sync_mask = 0;
-volatile unsigned long all_threads_mask __read_mostly  = 1; // nbthread 1 assumed by default
+volatile unsigned long all_tgroups_mask __read_mostly  = 1; // nbtgroup 1 assumed by default
+volatile unsigned int rdv_requests       = 0;  // total number of threads requesting RDV
+volatile unsigned int isolated_thread    = ~0; // ID of the isolated thread, or ~0 when none
 THREAD_LOCAL unsigned int  tgid          = 1; // thread ID starts at 1
 THREAD_LOCAL unsigned int  tid           = 0;
-THREAD_LOCAL unsigned long tid_bit       = (1UL << 0);
 int thread_cpus_enabled_at_boot          = 1;
 static pthread_t ha_pthread[MAX_THREADS] = { };
 
 /* Marks the thread as harmless until the last thread using the rendez-vous
- * point quits, excluding the current one. Thus an isolated thread may be safely
- * marked as harmless. Given that we can wait for a long time, sched_yield() is
+ * point quits. Given that we can wait for a long time, sched_yield() is
  * used when available to offer the CPU resources to competing threads if
  * needed.
  */
 void thread_harmless_till_end()
 {
-	_HA_ATOMIC_OR(&threads_harmless_mask, tid_bit);
-	while (threads_want_rdv_mask & all_threads_mask & ~tid_bit) {
+	_HA_ATOMIC_OR(&tg_ctx->threads_harmless, ti->ltid_bit);
+	while (_HA_ATOMIC_LOAD(&rdv_requests) != 0) {
 		ha_thread_relax();
 	}
 }
@@ -89,37 +87,67 @@ void thread_harmless_till_end()
 /* Isolates the current thread : request the ability to work while all other
  * threads are harmless, as defined by thread_harmless_now() (i.e. they're not
  * going to touch any visible memory area). Only returns once all of them are
- * harmless, with the current thread's bit in threads_harmless_mask cleared.
+ * harmless, with the current thread's bit in &tg_ctx->threads_harmless cleared.
  * Needs to be completed using thread_release().
  */
 void thread_isolate()
 {
-	unsigned long old;
+	uint tgrp, thr;
 
-	_HA_ATOMIC_OR(&threads_harmless_mask, tid_bit);
+	_HA_ATOMIC_OR(&tg_ctx->threads_harmless, ti->ltid_bit);
 	__ha_barrier_atomic_store();
-	_HA_ATOMIC_OR(&threads_want_rdv_mask, tid_bit);
+	_HA_ATOMIC_INC(&rdv_requests);
 
-	/* wait for all threads to become harmless */
-	old = threads_harmless_mask;
+	/* wait for all threads to become harmless. They cannot change their
+	 * mind once seen thanks to rdv_requests above, unless they pass in
+	 * front of us. For this reason we proceed in 4 steps:
+	 *   1) wait for all threads to declare themselves harmless
+	 *   2) try to grab the isolated_thread exclusivity
+	 *   3) verify again that all threads are harmless, since another one
+	 *      that was isolating between 1 and 2 could have dropped its
+	 *      harmless state there.
+	 *   4) drop harmless flag (which also has the benefit of leaving
+	 *      all other threads wait on reads instead of writes.
+	 */
 	while (1) {
-		if (unlikely((old & all_threads_mask) != all_threads_mask))
-			old = threads_harmless_mask;
-		else if (_HA_ATOMIC_CAS(&threads_harmless_mask, &old, old & ~tid_bit))
-			break;
+		for (tgrp = 0; tgrp < global.nbtgroups; tgrp++) {
+			do {
+				ulong te = _HA_ATOMIC_LOAD(&ha_tgroup_info[tgrp].threads_enabled);
+				ulong th = _HA_ATOMIC_LOAD(&ha_tgroup_ctx[tgrp].threads_harmless);
 
-		ha_thread_relax();
+				if ((th & te) == te)
+					break;
+				ha_thread_relax();
+			} while (1);
+		}
+
+		/* all other ones are harmless. isolated_thread will contain
+		 * ~0U if no other one competes, !=tid if another one got it,
+		 * tid if the current thread already grabbed it on the previous
+		 * round.
+		 */
+		thr = _HA_ATOMIC_LOAD(&isolated_thread);
+		if (thr == tid)
+			break; // we won and we're certain everyone is harmless
+
+		/* try to win the race against others */
+		if (thr != ~0U || !_HA_ATOMIC_CAS(&isolated_thread, &thr, tid))
+			ha_thread_relax();
 	}
-	/* one thread gets released at a time here, with its harmess bit off.
-	 * The loss of this bit makes the other one continue to spin while the
-	 * thread is working alone.
+
+	/* the thread is no longer harmless as it runs */
+	_HA_ATOMIC_AND(&tg_ctx->threads_harmless, ~ti->ltid_bit);
+
+	/* the thread is isolated until it calls thread_release() which will
+	 * 1) reset isolated_thread to ~0;
+	 * 2) decrement rdv_requests.
 	 */
 }
 
 /* Isolates the current thread : request the ability to work while all other
  * threads are idle, as defined by thread_idle_now(). It only returns once
  * all of them are both harmless and idle, with the current thread's bit in
- * threads_harmless_mask and idle_mask cleared. Needs to be completed using
+ * &tg_ctx->threads_harmless and idle_mask cleared. Needs to be completed using
  * thread_release(). By doing so the thread also engages in being safe against
  * any actions that other threads might be about to start under the same
  * conditions. This specifically targets destruction of any internal structure,
@@ -132,70 +160,73 @@ void thread_isolate()
  */
 void thread_isolate_full()
 {
-	unsigned long old;
+	uint tgrp, thr;
 
-	_HA_ATOMIC_OR(&threads_idle_mask, tid_bit);
-	_HA_ATOMIC_OR(&threads_harmless_mask, tid_bit);
+	_HA_ATOMIC_OR(&tg_ctx->threads_idle, ti->ltid_bit);
+	_HA_ATOMIC_OR(&tg_ctx->threads_harmless, ti->ltid_bit);
 	__ha_barrier_atomic_store();
-	_HA_ATOMIC_OR(&threads_want_rdv_mask, tid_bit);
+	_HA_ATOMIC_INC(&rdv_requests);
 
-	/* wait for all threads to become harmless */
-	old = threads_harmless_mask;
+	/* wait for all threads to become harmless. They cannot change their
+	 * mind once seen thanks to rdv_requests above, unless they pass in
+	 * front of us. For this reason we proceed in 4 steps:
+	 *   1) wait for all threads to declare themselves harmless
+	 *   2) try to grab the isolated_thread exclusivity
+	 *   3) verify again that all threads are harmless, since another one
+	 *      that was isolating between 1 and 2 could have dropped its
+	 *      harmless state there.
+	 *   4) drop harmless flag (which also has the benefit of leaving
+	 *      all other threads wait on reads instead of writes.
+	 */
 	while (1) {
-		unsigned long idle = _HA_ATOMIC_LOAD(&threads_idle_mask);
+		for (tgrp = 0; tgrp < global.nbtgroups; tgrp++) {
+			do {
+				ulong te = _HA_ATOMIC_LOAD(&ha_tgroup_info[tgrp].threads_enabled);
+				ulong th = _HA_ATOMIC_LOAD(&ha_tgroup_ctx[tgrp].threads_harmless);
+				ulong id = _HA_ATOMIC_LOAD(&ha_tgroup_ctx[tgrp].threads_idle);
 
-		if (unlikely((old & all_threads_mask) != all_threads_mask))
-			old = _HA_ATOMIC_LOAD(&threads_harmless_mask);
-		else if ((idle & all_threads_mask) == all_threads_mask &&
-			 _HA_ATOMIC_CAS(&threads_harmless_mask, &old, old & ~tid_bit))
-			break;
+				if ((th & id & te) == te)
+					break;
+				ha_thread_relax();
+			} while (1);
+		}
 
-		ha_thread_relax();
+		/* all other ones are harmless and idle. isolated_thread will
+		 * contain ~0U if no other one competes, !=tid if another one
+		 * got it, tid if the current thread already grabbed it on the
+		 * previous round.
+		 */
+		thr = _HA_ATOMIC_LOAD(&isolated_thread);
+		if (thr == tid)
+			break; // we won and we're certain everyone is harmless
+
+		if (thr != ~0U || !_HA_ATOMIC_CAS(&isolated_thread, &thr, tid))
+			ha_thread_relax();
 	}
 
-	/* we're not idle anymore at this point. Other threads waiting on this
-	 * condition will need to wait until out next pass to the poller, or
-	 * our next call to thread_isolate_full().
+	/* we're not idle nor harmless anymore at this point. Other threads
+	 * waiting on this condition will need to wait until out next pass to
+	 * the poller, or our next call to thread_isolate_full().
 	 */
-	_HA_ATOMIC_AND(&threads_idle_mask, ~tid_bit);
+	_HA_ATOMIC_AND(&tg_ctx->threads_idle, ~ti->ltid_bit);
+	_HA_ATOMIC_AND(&tg_ctx->threads_harmless, ~ti->ltid_bit);
+
+	/* the thread is isolated until it calls thread_release() which will
+	 * 1) reset isolated_thread to ~0;
+	 * 2) decrement rdv_requests.
+	 */
 }
 
-/* Cancels the effect of thread_isolate() by releasing the current thread's bit
- * in threads_want_rdv_mask. This immediately allows other threads to expect be
- * executed, though they will first have to wait for this thread to become
- * harmless again (possibly by reaching the poller again).
+/* Cancels the effect of thread_isolate() by resetting the ID of the isolated
+ * thread and decrementing the number of RDV requesters. This immediately allows
+ * other threads to expect to be executed, though they will first have to wait
+ * for this thread to become harmless again (possibly by reaching the poller
+ * again).
  */
 void thread_release()
 {
-	_HA_ATOMIC_AND(&threads_want_rdv_mask, ~tid_bit);
-}
-
-/* Cancels the effect of thread_isolate() by releasing the current thread's bit
- * in threads_want_rdv_mask and by marking this thread as harmless until the
- * last worker finishes. The difference with thread_release() is that this one
- * will not leave the function before others are notified to do the same, so it
- * guarantees that the current thread will not pass through a subsequent call
- * to thread_isolate() before others finish.
- */
-void thread_sync_release()
-{
-	_HA_ATOMIC_OR(&threads_sync_mask, tid_bit);
-	__ha_barrier_atomic_store();
-	_HA_ATOMIC_AND(&threads_want_rdv_mask, ~tid_bit);
-
-	while (threads_want_rdv_mask & all_threads_mask) {
-		_HA_ATOMIC_OR(&threads_harmless_mask, tid_bit);
-		while (threads_want_rdv_mask & all_threads_mask)
-			ha_thread_relax();
-		HA_ATOMIC_AND(&threads_harmless_mask, ~tid_bit);
-	}
-
-	/* the current thread is not harmless anymore, thread_isolate()
-	 * is forced to wait till all waiters finish.
-	 */
-	_HA_ATOMIC_AND(&threads_sync_mask, ~tid_bit);
-	while (threads_sync_mask & all_threads_mask)
-		ha_thread_relax();
+	HA_ATOMIC_STORE(&isolated_thread, ~0U);
+	HA_ATOMIC_DEC(&rdv_requests);
 }
 
 /* Sets up threads, signals and masks, and starts threads 2 and above.
@@ -246,13 +277,10 @@ void set_thread_cpu_affinity()
 		return;
 
 	/* Now the CPU affinity for all threads */
-	if (ha_cpuset_count(&cpu_map.proc))
-		ha_cpuset_and(&cpu_map.thread[tid], &cpu_map.proc);
-
-	if (ha_cpuset_count(&cpu_map.thread[tid])) {/* only do this if the thread has a THREAD map */
+	if (ha_cpuset_count(&cpu_map[tgid - 1].thread[ti->ltid])) {/* only do this if the thread has a THREAD map */
 #  if defined(__APPLE__)
 		/* Note: this API is limited to the first 32/64 CPUs */
-		unsigned long set = cpu_map.thread[tid].cpuset;
+		unsigned long set = cpu_map[tgid - 1].thread[ti->ltid].cpuset;
 		int j;
 
 		while ((j = ffsl(set)) > 0) {
@@ -264,7 +292,7 @@ void set_thread_cpu_affinity()
 			set &= ~(1UL << (j - 1));
 		}
 #  else
-		struct hap_cpuset *set = &cpu_map.thread[tid];
+		struct hap_cpuset *set = &cpu_map[tgid - 1].thread[ti->ltid];
 
 		pthread_setaffinity_np(ha_pthread[tid], sizeof(set->cpuset), &set->cpuset);
 #  endif
@@ -316,7 +344,7 @@ void ha_tkillall(int sig)
 	unsigned int thr;
 
 	for (thr = 0; thr < global.nbthread; thr++) {
-		if (!(all_threads_mask & (1UL << thr)))
+		if (!(ha_thread_info[thr].tg->threads_enabled & ha_thread_info[thr].ltid_bit))
 			continue;
 		if (thr == tid)
 			continue;
@@ -346,7 +374,9 @@ void ha_rwlock_init(HA_RWLOCK_T *l)
 	HA_RWLOCK_INIT(l);
 }
 
-/* returns the number of CPUs the current process is enabled to run on */
+/* returns the number of CPUs the current process is enabled to run on,
+ * regardless of any MAX_THREADS limitation.
+ */
 static int thread_cpus_enabled()
 {
 	int ret = 1;
@@ -367,7 +397,6 @@ static int thread_cpus_enabled()
 #endif
 #endif
 	ret = MAX(ret, 1);
-	ret = MIN(ret, MAX_THREADS);
 	return ret;
 }
 
@@ -421,7 +450,7 @@ static const char *lock_label(enum lock_label label)
 	case PIPES_LOCK:           return "PIPES";
 	case TLSKEYS_REF_LOCK:     return "TLSKEYS_REF";
 	case AUTH_LOCK:            return "AUTH";
-	case LOGSRV_LOCK:          return "LOGSRV";
+	case RING_LOCK:            return "RING";
 	case DICT_LOCK:            return "DICT";
 	case PROTO_LOCK:           return "PROTO";
 	case QUEUE_LOCK:           return "QUEUE";
@@ -430,7 +459,10 @@ static const char *lock_label(enum lock_label label)
 	case SSL_SERVER_LOCK:      return "SSL_SERVER";
 	case SFT_LOCK:             return "SFT";
 	case IDLE_CONNS_LOCK:      return "IDLE_CONNS";
-	case QUIC_LOCK:            return "QUIC";
+	case OCSP_LOCK:            return "OCSP";
+	case QC_CID_LOCK:          return "QC_CID";
+	case CACHE_LOCK:           return "CACHE";
+	case GUID_LOCK:            return "GUID";
 	case OTHER_LOCK:           return "OTHER";
 	case DEBUG1_LOCK:          return "DEBUG1";
 	case DEBUG2_LOCK:          return "DEBUG2";
@@ -463,37 +495,37 @@ void show_lock_stats()
 
 		if (lock_stats[lbl].num_write_locked)
 			fprintf(stderr,
-			        "\t # write lock  : %lu\n"
-			        "\t # write unlock: %lu (%ld)\n"
+			        "\t # write lock  : %llu\n"
+			        "\t # write unlock: %llu (%lld)\n"
 			        "\t # wait time for write     : %.3f msec\n"
 			        "\t # wait time for write/lock: %.3f nsec\n",
-			        lock_stats[lbl].num_write_locked,
-			        lock_stats[lbl].num_write_unlocked,
-			        lock_stats[lbl].num_write_unlocked - lock_stats[lbl].num_write_locked,
+			        (ullong)lock_stats[lbl].num_write_locked,
+			        (ullong)lock_stats[lbl].num_write_unlocked,
+			        (llong)(lock_stats[lbl].num_write_unlocked - lock_stats[lbl].num_write_locked),
 			        (double)lock_stats[lbl].nsec_wait_for_write / 1000000.0,
 			        lock_stats[lbl].num_write_locked ? ((double)lock_stats[lbl].nsec_wait_for_write / (double)lock_stats[lbl].num_write_locked) : 0);
 
 		if (lock_stats[lbl].num_seek_locked)
 			fprintf(stderr,
-			        "\t # seek lock   : %lu\n"
-			        "\t # seek unlock : %lu (%ld)\n"
+			        "\t # seek lock   : %llu\n"
+			        "\t # seek unlock : %llu (%lld)\n"
 			        "\t # wait time for seek      : %.3f msec\n"
 			        "\t # wait time for seek/lock : %.3f nsec\n",
-			        lock_stats[lbl].num_seek_locked,
-			        lock_stats[lbl].num_seek_unlocked,
-			        lock_stats[lbl].num_seek_unlocked - lock_stats[lbl].num_seek_locked,
+			        (ullong)lock_stats[lbl].num_seek_locked,
+			        (ullong)lock_stats[lbl].num_seek_unlocked,
+			        (llong)(lock_stats[lbl].num_seek_unlocked - lock_stats[lbl].num_seek_locked),
 			        (double)lock_stats[lbl].nsec_wait_for_seek / 1000000.0,
 			        lock_stats[lbl].num_seek_locked ? ((double)lock_stats[lbl].nsec_wait_for_seek / (double)lock_stats[lbl].num_seek_locked) : 0);
 
 		if (lock_stats[lbl].num_read_locked)
 			fprintf(stderr,
-			        "\t # read lock   : %lu\n"
-			        "\t # read unlock : %lu (%ld)\n"
+			        "\t # read lock   : %llu\n"
+			        "\t # read unlock : %llu (%lld)\n"
 			        "\t # wait time for read      : %.3f msec\n"
 			        "\t # wait time for read/lock : %.3f nsec\n",
-			        lock_stats[lbl].num_read_locked,
-			        lock_stats[lbl].num_read_unlocked,
-			        lock_stats[lbl].num_read_unlocked - lock_stats[lbl].num_read_locked,
+			        (ullong)lock_stats[lbl].num_read_locked,
+			        (ullong)lock_stats[lbl].num_read_unlocked,
+			        (llong)(lock_stats[lbl].num_read_unlocked - lock_stats[lbl].num_read_locked),
 			        (double)lock_stats[lbl].nsec_wait_for_read / 1000000.0,
 			        lock_stats[lbl].num_read_locked ? ((double)lock_stats[lbl].nsec_wait_for_read / (double)lock_stats[lbl].num_read_locked) : 0);
 	}
@@ -515,12 +547,14 @@ void __ha_rwlock_destroy(struct ha_rwlock *l)
 void __ha_rwlock_wrlock(enum lock_label lbl, struct ha_rwlock *l,
                         const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 
-	if ((l->info.cur_readers | l->info.cur_seeker | l->info.cur_writer) & tid_bit)
+	if ((st->cur_readers | st->cur_seeker | st->cur_writer) & tbit)
 		abort();
 
-	HA_ATOMIC_OR(&l->info.wait_writers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_writers, tbit);
 
 	start_time = now_mono_time();
 	__RWLOCK_WRLOCK(&l->lock);
@@ -528,41 +562,43 @@ void __ha_rwlock_wrlock(enum lock_label lbl, struct ha_rwlock *l,
 
 	HA_ATOMIC_INC(&lock_stats[lbl].num_write_locked);
 
-	l->info.cur_writer             = tid_bit;
+	st->cur_writer                 = tbit;
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
 
-	HA_ATOMIC_AND(&l->info.wait_writers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_writers, ~tbit);
 }
 
 int __ha_rwlock_trywrlock(enum lock_label lbl, struct ha_rwlock *l,
                           const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 	int r;
 
-	if ((l->info.cur_readers | l->info.cur_seeker | l->info.cur_writer) & tid_bit)
+	if ((st->cur_readers | st->cur_seeker | st->cur_writer) & tbit)
 		abort();
 
 	/* We set waiting writer because trywrlock could wait for readers to quit */
-	HA_ATOMIC_OR(&l->info.wait_writers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_writers, tbit);
 
 	start_time = now_mono_time();
 	r = __RWLOCK_TRYWRLOCK(&l->lock);
 	HA_ATOMIC_ADD(&lock_stats[lbl].nsec_wait_for_write, (now_mono_time() - start_time));
 	if (unlikely(r)) {
-		HA_ATOMIC_AND(&l->info.wait_writers, ~tid_bit);
+		HA_ATOMIC_AND(&st->wait_writers, ~tbit);
 		return r;
 	}
 	HA_ATOMIC_INC(&lock_stats[lbl].num_write_locked);
 
-	l->info.cur_writer             = tid_bit;
+	st->cur_writer                 = tbit;
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
 
-	HA_ATOMIC_AND(&l->info.wait_writers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_writers, ~tbit);
 
 	return 0;
 }
@@ -570,12 +606,15 @@ int __ha_rwlock_trywrlock(enum lock_label lbl, struct ha_rwlock *l,
 void __ha_rwlock_wrunlock(enum lock_label lbl,struct ha_rwlock *l,
                           const char *func, const char *file, int line)
 {
-	if (unlikely(!(l->info.cur_writer & tid_bit))) {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
+
+	if (unlikely(!(st->cur_writer & tbit))) {
 		/* the thread is not owning the lock for write */
 		abort();
 	}
 
-	l->info.cur_writer             = 0;
+	st->cur_writer                 = 0;
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
@@ -587,28 +626,32 @@ void __ha_rwlock_wrunlock(enum lock_label lbl,struct ha_rwlock *l,
 
 void __ha_rwlock_rdlock(enum lock_label lbl,struct ha_rwlock *l)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 
-	if ((l->info.cur_readers | l->info.cur_seeker | l->info.cur_writer) & tid_bit)
+	if ((st->cur_readers | st->cur_seeker | st->cur_writer) & tbit)
 		abort();
 
-	HA_ATOMIC_OR(&l->info.wait_readers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_readers, tbit);
 
 	start_time = now_mono_time();
 	__RWLOCK_RDLOCK(&l->lock);
 	HA_ATOMIC_ADD(&lock_stats[lbl].nsec_wait_for_read, (now_mono_time() - start_time));
 	HA_ATOMIC_INC(&lock_stats[lbl].num_read_locked);
 
-	HA_ATOMIC_OR(&l->info.cur_readers, tid_bit);
+	HA_ATOMIC_OR(&st->cur_readers, tbit);
 
-	HA_ATOMIC_AND(&l->info.wait_readers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_readers, ~tbit);
 }
 
 int __ha_rwlock_tryrdlock(enum lock_label lbl,struct ha_rwlock *l)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	int r;
 
-	if ((l->info.cur_readers | l->info.cur_seeker | l->info.cur_writer) & tid_bit)
+	if ((st->cur_readers | st->cur_seeker | st->cur_writer) & tbit)
 		abort();
 
 	/* try read should never wait */
@@ -617,19 +660,22 @@ int __ha_rwlock_tryrdlock(enum lock_label lbl,struct ha_rwlock *l)
 		return r;
 	HA_ATOMIC_INC(&lock_stats[lbl].num_read_locked);
 
-	HA_ATOMIC_OR(&l->info.cur_readers, tid_bit);
+	HA_ATOMIC_OR(&st->cur_readers, tbit);
 
 	return 0;
 }
 
 void __ha_rwlock_rdunlock(enum lock_label lbl,struct ha_rwlock *l)
 {
-	if (unlikely(!(l->info.cur_readers & tid_bit))) {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
+
+	if (unlikely(!(st->cur_readers & tbit))) {
 		/* the thread is not owning the lock for read */
 		abort();
 	}
 
-	HA_ATOMIC_AND(&l->info.cur_readers, ~tid_bit);
+	HA_ATOMIC_AND(&st->cur_readers, ~tbit);
 
 	__RWLOCK_RDUNLOCK(&l->lock);
 
@@ -639,15 +685,17 @@ void __ha_rwlock_rdunlock(enum lock_label lbl,struct ha_rwlock *l)
 void __ha_rwlock_wrtord(enum lock_label lbl, struct ha_rwlock *l,
                         const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 
-	if ((l->info.cur_readers | l->info.cur_seeker) & tid_bit)
+	if ((st->cur_readers | st->cur_seeker) & tbit)
 		abort();
 
-	if (!(l->info.cur_writer & tid_bit))
+	if (!(st->cur_writer & tbit))
 		abort();
 
-	HA_ATOMIC_OR(&l->info.wait_readers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_readers, tbit);
 
 	start_time = now_mono_time();
 	__RWLOCK_WRTORD(&l->lock);
@@ -655,27 +703,29 @@ void __ha_rwlock_wrtord(enum lock_label lbl, struct ha_rwlock *l,
 
 	HA_ATOMIC_INC(&lock_stats[lbl].num_read_locked);
 
-	HA_ATOMIC_OR(&l->info.cur_readers, tid_bit);
-	HA_ATOMIC_AND(&l->info.cur_writer, ~tid_bit);
+	HA_ATOMIC_OR(&st->cur_readers, tbit);
+	HA_ATOMIC_AND(&st->cur_writer, ~tbit);
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
 
-	HA_ATOMIC_AND(&l->info.wait_readers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_readers, ~tbit);
 }
 
 void __ha_rwlock_wrtosk(enum lock_label lbl, struct ha_rwlock *l,
                         const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 
-	if ((l->info.cur_readers | l->info.cur_seeker) & tid_bit)
+	if ((st->cur_readers | st->cur_seeker) & tbit)
 		abort();
 
-	if (!(l->info.cur_writer & tid_bit))
+	if (!(st->cur_writer & tbit))
 		abort();
 
-	HA_ATOMIC_OR(&l->info.wait_seekers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_seekers, tbit);
 
 	start_time = now_mono_time();
 	__RWLOCK_WRTOSK(&l->lock);
@@ -683,24 +733,26 @@ void __ha_rwlock_wrtosk(enum lock_label lbl, struct ha_rwlock *l,
 
 	HA_ATOMIC_INC(&lock_stats[lbl].num_seek_locked);
 
-	HA_ATOMIC_OR(&l->info.cur_seeker, tid_bit);
-	HA_ATOMIC_AND(&l->info.cur_writer, ~tid_bit);
+	HA_ATOMIC_OR(&st->cur_seeker, tbit);
+	HA_ATOMIC_AND(&st->cur_writer, ~tbit);
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
 
-	HA_ATOMIC_AND(&l->info.wait_seekers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_seekers, ~tbit);
 }
 
 void __ha_rwlock_sklock(enum lock_label lbl, struct ha_rwlock *l,
                         const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 
-	if ((l->info.cur_readers | l->info.cur_seeker | l->info.cur_writer) & tid_bit)
+	if ((st->cur_readers | st->cur_seeker | st->cur_writer) & tbit)
 		abort();
 
-	HA_ATOMIC_OR(&l->info.wait_seekers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_seekers, tbit);
 
 	start_time = now_mono_time();
 	__RWLOCK_SKLOCK(&l->lock);
@@ -708,26 +760,28 @@ void __ha_rwlock_sklock(enum lock_label lbl, struct ha_rwlock *l,
 
 	HA_ATOMIC_INC(&lock_stats[lbl].num_seek_locked);
 
-	HA_ATOMIC_OR(&l->info.cur_seeker, tid_bit);
+	HA_ATOMIC_OR(&st->cur_seeker, tbit);
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
 
-	HA_ATOMIC_AND(&l->info.wait_seekers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_seekers, ~tbit);
 }
 
 void __ha_rwlock_sktowr(enum lock_label lbl, struct ha_rwlock *l,
                         const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 
-	if ((l->info.cur_readers | l->info.cur_writer) & tid_bit)
+	if ((st->cur_readers | st->cur_writer) & tbit)
 		abort();
 
-	if (!(l->info.cur_seeker & tid_bit))
+	if (!(st->cur_seeker & tbit))
 		abort();
 
-	HA_ATOMIC_OR(&l->info.wait_writers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_writers, tbit);
 
 	start_time = now_mono_time();
 	__RWLOCK_SKTOWR(&l->lock);
@@ -735,27 +789,29 @@ void __ha_rwlock_sktowr(enum lock_label lbl, struct ha_rwlock *l,
 
 	HA_ATOMIC_INC(&lock_stats[lbl].num_write_locked);
 
-	HA_ATOMIC_OR(&l->info.cur_writer, tid_bit);
-	HA_ATOMIC_AND(&l->info.cur_seeker, ~tid_bit);
+	HA_ATOMIC_OR(&st->cur_writer, tbit);
+	HA_ATOMIC_AND(&st->cur_seeker, ~tbit);
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
 
-	HA_ATOMIC_AND(&l->info.wait_writers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_writers, ~tbit);
 }
 
 void __ha_rwlock_sktord(enum lock_label lbl, struct ha_rwlock *l,
                         const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 
-	if ((l->info.cur_readers | l->info.cur_writer) & tid_bit)
+	if ((st->cur_readers | st->cur_writer) & tbit)
 		abort();
 
-	if (!(l->info.cur_seeker & tid_bit))
+	if (!(st->cur_seeker & tbit))
 		abort();
 
-	HA_ATOMIC_OR(&l->info.wait_readers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_readers, tbit);
 
 	start_time = now_mono_time();
 	__RWLOCK_SKTORD(&l->lock);
@@ -763,22 +819,24 @@ void __ha_rwlock_sktord(enum lock_label lbl, struct ha_rwlock *l,
 
 	HA_ATOMIC_INC(&lock_stats[lbl].num_read_locked);
 
-	HA_ATOMIC_OR(&l->info.cur_readers, tid_bit);
-	HA_ATOMIC_AND(&l->info.cur_seeker, ~tid_bit);
+	HA_ATOMIC_OR(&st->cur_readers, tbit);
+	HA_ATOMIC_AND(&st->cur_seeker, ~tbit);
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
 
-	HA_ATOMIC_AND(&l->info.wait_readers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_readers, ~tbit);
 }
 
 void __ha_rwlock_skunlock(enum lock_label lbl,struct ha_rwlock *l,
                           const char *func, const char *file, int line)
 {
-	if (!(l->info.cur_seeker & tid_bit))
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
+	if (!(st->cur_seeker & tbit))
 		abort();
 
-	HA_ATOMIC_AND(&l->info.cur_seeker, ~tid_bit);
+	HA_ATOMIC_AND(&st->cur_seeker, ~tbit);
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
@@ -791,13 +849,15 @@ void __ha_rwlock_skunlock(enum lock_label lbl,struct ha_rwlock *l,
 int __ha_rwlock_trysklock(enum lock_label lbl, struct ha_rwlock *l,
                           const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 	int r;
 
-	if ((l->info.cur_readers | l->info.cur_seeker | l->info.cur_writer) & tid_bit)
+	if ((st->cur_readers | st->cur_seeker | st->cur_writer) & tbit)
 		abort();
 
-	HA_ATOMIC_OR(&l->info.wait_seekers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_seekers, tbit);
 
 	start_time = now_mono_time();
 	r = __RWLOCK_TRYSKLOCK(&l->lock);
@@ -806,29 +866,31 @@ int __ha_rwlock_trysklock(enum lock_label lbl, struct ha_rwlock *l,
 	if (likely(!r)) {
 		/* got the lock ! */
 		HA_ATOMIC_INC(&lock_stats[lbl].num_seek_locked);
-		HA_ATOMIC_OR(&l->info.cur_seeker, tid_bit);
+		HA_ATOMIC_OR(&st->cur_seeker, tbit);
 		l->info.last_location.function = func;
 		l->info.last_location.file     = file;
 		l->info.last_location.line     = line;
 	}
 
-	HA_ATOMIC_AND(&l->info.wait_seekers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_seekers, ~tbit);
 	return r;
 }
 
 int __ha_rwlock_tryrdtosk(enum lock_label lbl, struct ha_rwlock *l,
                           const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 	int r;
 
-	if ((l->info.cur_writer | l->info.cur_seeker) & tid_bit)
+	if ((st->cur_writer | st->cur_seeker) & tbit)
 		abort();
 
-	if (!(l->info.cur_readers & tid_bit))
+	if (!(st->cur_readers & tbit))
 		abort();
 
-	HA_ATOMIC_OR(&l->info.wait_seekers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_seekers, tbit);
 
 	start_time = now_mono_time();
 	r = __RWLOCK_TRYRDTOSK(&l->lock);
@@ -837,14 +899,14 @@ int __ha_rwlock_tryrdtosk(enum lock_label lbl, struct ha_rwlock *l,
 	if (likely(!r)) {
 		/* got the lock ! */
 		HA_ATOMIC_INC(&lock_stats[lbl].num_seek_locked);
-		HA_ATOMIC_OR(&l->info.cur_seeker, tid_bit);
-		HA_ATOMIC_AND(&l->info.cur_readers, ~tid_bit);
+		HA_ATOMIC_OR(&st->cur_seeker, tbit);
+		HA_ATOMIC_AND(&st->cur_readers, ~tbit);
 		l->info.last_location.function = func;
 		l->info.last_location.file     = file;
 		l->info.last_location.line     = line;
 	}
 
-	HA_ATOMIC_AND(&l->info.wait_seekers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_seekers, ~tbit);
 	return r;
 }
 
@@ -863,14 +925,16 @@ void __spin_destroy(struct ha_spinlock *l)
 void __spin_lock(enum lock_label lbl, struct ha_spinlock *l,
                  const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_spinlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 
-	if (unlikely(l->info.owner & tid_bit)) {
+	if (unlikely(st->owner & tbit)) {
 		/* the thread is already owning the lock */
 		abort();
 	}
 
-	HA_ATOMIC_OR(&l->info.waiters, tid_bit);
+	HA_ATOMIC_OR(&st->waiters, tbit);
 
 	start_time = now_mono_time();
 	__SPIN_LOCK(&l->lock);
@@ -879,20 +943,22 @@ void __spin_lock(enum lock_label lbl, struct ha_spinlock *l,
 	HA_ATOMIC_INC(&lock_stats[lbl].num_write_locked);
 
 
-	l->info.owner                  = tid_bit;
+	st->owner                  = tbit;
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
 
-	HA_ATOMIC_AND(&l->info.waiters, ~tid_bit);
+	HA_ATOMIC_AND(&st->waiters, ~tbit);
 }
 
 int __spin_trylock(enum lock_label lbl, struct ha_spinlock *l,
                    const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_spinlock_state *st = &l->info.st[tgid-1];
 	int r;
 
-	if (unlikely(l->info.owner & tid_bit)) {
+	if (unlikely(st->owner & tbit)) {
 		/* the thread is already owning the lock */
 		abort();
 	}
@@ -903,7 +969,7 @@ int __spin_trylock(enum lock_label lbl, struct ha_spinlock *l,
 		return r;
 	HA_ATOMIC_INC(&lock_stats[lbl].num_write_locked);
 
-	l->info.owner                  = tid_bit;
+	st->owner                      = tbit;
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
@@ -914,12 +980,15 @@ int __spin_trylock(enum lock_label lbl, struct ha_spinlock *l,
 void __spin_unlock(enum lock_label lbl, struct ha_spinlock *l,
                    const char *func, const char *file, int line)
 {
-	if (unlikely(!(l->info.owner & tid_bit))) {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_spinlock_state *st = &l->info.st[tgid-1];
+
+	if (unlikely(!(st->owner & tbit))) {
 		/* the thread is not owning the lock */
 		abort();
 	}
 
-	l->info.owner                  = 0;
+	st->owner                      = 0;
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
@@ -929,6 +998,75 @@ void __spin_unlock(enum lock_label lbl, struct ha_spinlock *l,
 }
 
 #endif // defined(DEBUG_THREAD) || defined(DEBUG_FULL)
+
+
+#if defined(USE_PTHREAD_EMULATION)
+
+/* pthread rwlock emulation using plocks (to avoid expensive futexes).
+ * these are a direct mapping on Progressive Locks, with the exception that
+ * since there's a common unlock operation in pthreads, we need to know if
+ * we need to unlock for reads or writes, so we set the topmost bit to 1 when
+ * a write lock is acquired to indicate that a write unlock needs to be
+ * performed. It's not a problem since this bit will never be used given that
+ * haproxy won't support as many threads as the plocks.
+ *
+ * The storage is the pthread_rwlock_t cast as an ulong
+ */
+
+int pthread_rwlock_init(pthread_rwlock_t *restrict rwlock, const pthread_rwlockattr_t *restrict attr)
+{
+	ulong *lock = (ulong *)rwlock;
+
+	*lock = 0;
+	return 0;
+}
+
+int pthread_rwlock_destroy(pthread_rwlock_t *rwlock)
+{
+	ulong *lock = (ulong *)rwlock;
+
+	*lock = 0;
+	return 0;
+}
+
+int pthread_rwlock_rdlock(pthread_rwlock_t *rwlock)
+{
+	pl_lorw_rdlock((unsigned long *)rwlock);
+	return 0;
+}
+
+int pthread_rwlock_tryrdlock(pthread_rwlock_t *rwlock)
+{
+	return !!pl_cmpxchg((unsigned long *)rwlock, 0, PLOCK_LORW_SHR_BASE);
+}
+
+int pthread_rwlock_timedrdlock(pthread_rwlock_t *restrict rwlock, const struct timespec *restrict abstime)
+{
+	return pthread_rwlock_tryrdlock(rwlock);
+}
+
+int pthread_rwlock_wrlock(pthread_rwlock_t *rwlock)
+{
+	pl_lorw_wrlock((unsigned long *)rwlock);
+	return 0;
+}
+
+int pthread_rwlock_trywrlock(pthread_rwlock_t *rwlock)
+{
+	return !!pl_cmpxchg((unsigned long *)rwlock, 0, PLOCK_LORW_EXC_BASE);
+}
+
+int pthread_rwlock_timedwrlock(pthread_rwlock_t *restrict rwlock, const struct timespec *restrict abstime)
+{
+	return pthread_rwlock_trywrlock(rwlock);
+}
+
+int pthread_rwlock_unlock(pthread_rwlock_t *rwlock)
+{
+	pl_lorw_unlock((unsigned long *)rwlock);
+	return 0;
+}
+#endif // defined(USE_PTHREAD_EMULATION)
 
 /* Depending on the platform and how libpthread was built, pthread_exit() may
  * involve some code in libgcc_s that would be loaded on exit for the first
@@ -947,34 +1085,28 @@ static void *dummy_thread_function(void *data)
 static inline void preload_libgcc_s(void)
 {
 	pthread_t dummy_thread;
-	pthread_create(&dummy_thread, NULL, dummy_thread_function, NULL);
-	pthread_join(dummy_thread, NULL);
+	if (pthread_create(&dummy_thread, NULL, dummy_thread_function, NULL) == 0)
+		pthread_join(dummy_thread, NULL);
 }
 
-__attribute__((constructor))
 static void __thread_init(void)
 {
 	char *ptr = NULL;
 
-	if (MAX_THREADS < 1 || MAX_THREADS > LONGBITS) {
-		ha_alert("MAX_THREADS value must be between 1 and %d inclusive; "
-		         "HAProxy was built with value %d, please fix it and rebuild.\n",
-			 LONGBITS, MAX_THREADS);
-		exit(1);
-	}
-
 	preload_libgcc_s();
 
 	thread_cpus_enabled_at_boot = thread_cpus_enabled();
+	thread_cpus_enabled_at_boot = MIN(thread_cpus_enabled_at_boot, MAX_THREADS);
 
-	memprintf(&ptr, "Built with multi-threading support (MAX_THREADS=%d, default=%d).",
-		  MAX_THREADS, thread_cpus_enabled_at_boot);
+	memprintf(&ptr, "Built with multi-threading support (MAX_TGROUPS=%d, MAX_THREADS=%d, default=%d).",
+		  MAX_TGROUPS, MAX_THREADS, thread_cpus_enabled_at_boot);
 	hap_register_build_opts(ptr, 1);
 
 #if defined(DEBUG_THREAD) || defined(DEBUG_FULL)
 	memset(lock_stats, 0, sizeof(lock_stats));
 #endif
 }
+INITCALL0(STG_PREPARE, __thread_init);
 
 #else
 
@@ -1002,6 +1134,101 @@ REGISTER_BUILD_OPTS("Built without multi-threading support (USE_THREAD not set).
 #endif // USE_THREAD
 
 
+/* Returns non-zero on anomaly (bound vs unbound), and emits a warning in this
+ * case.
+ */
+int thread_detect_binding_discrepancies(void)
+{
+#if defined(USE_CPU_AFFINITY)
+	uint th, tg, id;
+	uint tot_b = 0, tot_u = 0;
+	int first_b = -1;
+	int first_u = -1;
+
+	for (th = 0; th < global.nbthread; th++) {
+		tg = ha_thread_info[th].tgid;
+		id = ha_thread_info[th].ltid;
+
+		if (ha_cpuset_count(&cpu_map[tg - 1].thread[id]) == 0) {
+			tot_u++;
+			if (first_u < 0)
+				first_u = th;
+		} else {
+			tot_b++;
+			if (first_b < 0)
+				first_b = th;
+		}
+	}
+
+	if (tot_u > 0 && tot_b > 0) {
+		ha_warning("Found %u thread(s) mapped to a CPU and %u thread(s) not mapped to any CPU. "
+			   "This will result in some threads being randomly assigned to the same CPU, "
+			   "which will occasionally cause severe performance degradation. First thread "
+			   "bound is %d and first thread not bound is %d. Please either bind all threads "
+			   "or none (maybe some cpu-map directives are missing?).\n",
+			   tot_b, tot_u, first_b, first_u);
+		return 1;
+	}
+#endif
+	return 0;
+}
+
+/* Returns non-zero on anomaly (more threads than CPUs), and emits a warning in
+ * this case. It checks against configured cpu-map if any, otherwise against
+ * the number of CPUs at boot if known. It's better to run it only after
+ * thread_detect_binding_discrepancies() so that mixed cases can be eliminated.
+ */
+int thread_detect_more_than_cpus(void)
+{
+#if defined(USE_CPU_AFFINITY)
+	struct hap_cpuset cpuset_map, cpuset_boot, cpuset_all;
+	uint th, tg, id;
+	int bound;
+	int tot_map, tot_all;
+
+	ha_cpuset_zero(&cpuset_boot);
+	ha_cpuset_zero(&cpuset_map);
+	ha_cpuset_zero(&cpuset_all);
+	bound = 0;
+	for (th = 0; th < global.nbthread; th++) {
+		tg = ha_thread_info[th].tgid;
+		id = ha_thread_info[th].ltid;
+		if (ha_cpuset_count(&cpu_map[tg - 1].thread[id])) {
+			ha_cpuset_or(&cpuset_map, &cpu_map[tg - 1].thread[id]);
+			bound++;
+		}
+	}
+
+	ha_cpuset_assign(&cpuset_all, &cpuset_map);
+	if (bound != global.nbthread) {
+		if (ha_cpuset_detect_bound(&cpuset_boot))
+			ha_cpuset_or(&cpuset_all, &cpuset_boot);
+	}
+
+	tot_map = ha_cpuset_count(&cpuset_map);
+	tot_all = ha_cpuset_count(&cpuset_all);
+
+	if (tot_map && bound > tot_map) {
+		ha_warning("This configuration binds %d threads to a total of %d CPUs via cpu-map "
+			   "directives. This means that some threads will compete for the same CPU, "
+			   "which will cause severe performance degradation. Please fix either the "
+			   "'cpu-map' directives or set the global 'nbthread' value accordingly.\n",
+			   bound, tot_map);
+		return 1;
+	}
+	else if (tot_all && global.nbthread > tot_all) {
+		ha_warning("This configuration enables %d threads running on a total of %d CPUs. "
+			   "This means that some threads will compete for the same CPU, which will cause "
+			   "severe performance degradation. Please either the 'cpu-map' directives to "
+			   "adjust the CPUs to use, or fix the global 'nbthread' value.\n",
+			   global.nbthread, tot_all);
+		return 1;
+	}
+#endif
+	return 0;
+}
+
+
 /* scans the configured thread mapping and establishes the final one. Returns <0
  * on failure, >=0 on success.
  */
@@ -1009,6 +1236,7 @@ int thread_map_to_groups()
 {
 	int t, g, ut, ug;
 	int q, r;
+	ulong m __maybe_unused;
 
 	ut = ug = 0; // unassigned threads & groups
 
@@ -1020,7 +1248,7 @@ int thread_map_to_groups()
 	for (g = 0; g < global.nbtgroups; g++) {
 		if (!ha_tgroup_info[g].count)
 			ug++;
-		ha_tgroup_info[g].tgid = g + 1;
+		ha_tgroup_info[g].tgid_bit = 1UL << g;
 	}
 
 	if (ug > ut) {
@@ -1041,7 +1269,7 @@ int thread_map_to_groups()
 		q = ut / ug;
 		r = ut % ug;
 		if ((q + !!r) > MAX_THREADS_PER_GROUP) {
-			ha_alert("Too many remaining unassigned threads (%d) for thread groups (%d). Please increase thread-groups or make sure to keep thread numbers contiguous\n", ug, ut);
+			ha_alert("Too many remaining unassigned threads (%d) for thread groups (%d). Please increase thread-groups or make sure to keep thread numbers contiguous\n", ut, ug);
 			return -1;
 		}
 
@@ -1062,7 +1290,9 @@ int thread_map_to_groups()
 			}
 
 			ha_tgroup_info[g].count++;
+			ha_thread_info[t].tgid = g + 1;
 			ha_thread_info[t].tg = &ha_tgroup_info[g];
+			ha_thread_info[t].tg_ctx = &ha_tgroup_ctx[g];
 
 			ut--;
 			/* switch to next unassigned thread */
@@ -1079,89 +1309,102 @@ int thread_map_to_groups()
 	for (t = 0; t < global.nbthread; t++) {
 		ha_thread_info[t].tid      = t;
 		ha_thread_info[t].ltid     = t - ha_thread_info[t].tg->base;
-
-		ha_thread_info[t].tid_bit  = 1UL << ha_thread_info[t].tid;
 		ha_thread_info[t].ltid_bit = 1UL << ha_thread_info[t].ltid;
 	}
 
+	m = 0;
+	for (g = 0; g < global.nbtgroups; g++) {
+		ha_tgroup_info[g].threads_enabled = nbits(ha_tgroup_info[g].count);
+		/* for now, additional threads are not started, so we should
+		 * consider them as harmless and idle.
+		 * This will get automatically updated when such threads are
+		 * started in run_thread_poll_loop()
+		 * Without this, thread_isolate() and thread_isolate_full()
+		 * will fail to work as long as secondary threads did not enter
+		 * the polling loop at least once.
+		 */
+		ha_tgroup_ctx[g].threads_harmless = ha_tgroup_info[g].threads_enabled;
+		ha_tgroup_ctx[g].threads_idle = ha_tgroup_info[g].threads_enabled;
+		if (!ha_tgroup_info[g].count)
+			continue;
+		m |= 1UL << g;
+
+	}
+
+#ifdef USE_THREAD
+	all_tgroups_mask = m;
+#endif
 	return 0;
 }
 
-/* converts a configuration thread group+mask to a global group+mask depending on
- * the configured thread group id. This is essentially for use with the "thread"
- * directive on "bind" lines, where "thread 2/1-3" might be turned to "4-6" for
- * the global ID. It cannot be used before the thread mapping above was completed
- * and the thread group number configured. Possible options:
- *  - igid == 0: imask represents global IDs. We have to check that all
- *    configured threads in the mask belong to the same group. If imask is zero
- *    it means everything, so for now we only support this with a single group.
- *  - igid > 0, imask = 0: convert local values to global values for this thread
- *  - igid > 0, imask > 0: convert local values to global values
+/* Converts a configuration thread set based on either absolute or relative
+ * thread numbers into a global group+mask. This is essentially for use with
+ * the "thread" directive on "bind" lines, where "thread 4-6,10-12" might be
+ * turned to "2/1-3,4/1-3". It cannot be used before the thread mapping above
+ * was completed and the thread group numbers configured. The thread_set is
+ * replaced by the resolved group-based one. It is possible to force a single
+ * default group for unspecified sets instead of enabling all groups by passing
+ * this group's non-zero value to defgrp.
  *
  * Returns <0 on failure, >=0 on success.
  */
-int thread_resolve_group_mask(uint igid, ulong imask, uint *ogid, ulong *omask, char **err)
+int thread_resolve_group_mask(struct thread_set *ts, int defgrp, char **err)
 {
-	ulong mask;
-	uint t;
+	struct thread_set new_ts = { };
+	ulong mask, imask;
+	uint g;
 
-	if (igid == 0) {
+	if (!ts->grps) {
 		/* unspecified group, IDs are global */
-		if (!imask) {
-			/* all threads of all groups */
-			if (global.nbtgroups > 1) {
-				memprintf(err, "'thread' directive spans multiple groups");
-				return -1;
+		if (thread_set_is_empty(ts)) {
+			/* all threads of all groups, unless defgrp is set and
+			 * we then set it as the only group.
+			 */
+			for (g = defgrp ? defgrp-1 : 0; g < (defgrp ? defgrp : global.nbtgroups); g++) {
+				new_ts.rel[g] = ha_tgroup_info[g].threads_enabled;
+				if (new_ts.rel[g])
+					new_ts.grps |= 1UL << g;
 			}
-			mask = 0;
-			*ogid = 1; // first and only group
-			*omask = all_threads_mask;
-			return 0;
 		} else {
-			/* some global threads */
-			imask &= all_threads_mask;
-			for (t = 0; t < global.nbthread; t++) {
-				if (imask & (1UL << t)) {
-					if (ha_thread_info[t].tg->tgid != igid) {
-						if (!igid)
-							igid = ha_thread_info[t].tg->tgid;
-						else {
-							memprintf(err, "'thread' directive spans multiple groups (at least %u and %u)", igid, ha_thread_info[t].tg->tgid);
-							return -1;
-						}
-					}
-				}
-			}
+			/* some absolute threads are set, we must remap them to
+			 * relative ones. Each group cannot have more than
+			 * LONGBITS threads, thus it spans at most two absolute
+			 * blocks.
+			 */
+			for (g = 0; g < global.nbtgroups; g++) {
+				uint block = ha_tgroup_info[g].base / LONGBITS;
+				uint base  = ha_tgroup_info[g].base % LONGBITS;
 
-			if (!igid) {
-				memprintf(err, "'thread' directive contains threads that belong to no group");
-				return -1;
-			}
+				mask = ts->abs[block] >> base;
+				if (base &&
+				    (block + 1) < sizeof(ts->abs) / sizeof(ts->abs[0]) &&
+				    ha_tgroup_info[g].count > (LONGBITS - base))
+					mask |= ts->abs[block + 1] << (LONGBITS - base);
+				mask &= nbits(ha_tgroup_info[g].count);
+				mask &= ha_tgroup_info[g].threads_enabled;
 
-			/* we have a valid group, convert this to global thread IDs */
-			*ogid = igid;
-			*omask = imask << ha_tgroup_info[igid - 1].base;
-			return 0;
+				/* now the mask exactly matches the threads to be enabled
+				 * in this group.
+				 */
+				new_ts.rel[g] |= mask;
+				if (new_ts.rel[g])
+					new_ts.grps |= 1UL << g;
+			}
 		}
 	} else {
-		/* group was specified */
-		if (igid > global.nbtgroups) {
-			memprintf(err, "'thread' directive references non-existing thread group %u", igid);
-			return -1;
-		}
+		/* groups were specified */
+		for (g = 0; g < MAX_TGROUPS; g++) {
+			imask = ts->rel[g];
+			if (!imask)
+				continue;
 
-		if (!imask) {
-			/* all threads of this groups. Let's make a mask from their count and base. */
-			*ogid = igid;
-			mask = 1UL << (ha_tgroup_info[igid - 1].count - 1);
-			mask |= mask - 1;
-			*omask = mask << ha_tgroup_info[igid - 1].base;
-			return 0;
-		} else {
-			/* some local threads. Keep only existing ones for this group */
+			if (g >= global.nbtgroups) {
+				memprintf(err, "'thread' directive references non-existing thread group %u", g+1);
+				return -1;
+			}
 
-			mask = 1UL << (ha_tgroup_info[igid - 1].count - 1);
-			mask |= mask - 1;
+			/* some relative threads are set. Keep only existing ones for this group */
+			mask = nbits(ha_tgroup_info[g].count);
 
 			if (!(mask & imask)) {
 				/* no intersection between the thread group's
@@ -1172,21 +1415,255 @@ int thread_resolve_group_mask(uint igid, ulong imask, uint *ogid, ulong *omask, 
 
 				while (imask) {
 					new_mask |= imask & mask;
-					imask >>= ha_tgroup_info[igid - 1].count;
+					imask >>= ha_tgroup_info[g].count;
 				}
 				imask = new_mask;
 #else
-				memprintf(err, "'thread' directive only references threads not belonging to the group");
+				memprintf(err, "'thread' directive only references threads not belonging to group %u", g+1);
 				return -1;
 #endif
 			}
 
-			mask &= imask;
-			*omask = mask << ha_tgroup_info[igid - 1].base;
-			*ogid = igid;
-			return 0;
+			new_ts.rel[g] = imask & mask;
+			if (new_ts.rel[g])
+				new_ts.grps |= 1UL << g;
 		}
 	}
+
+	/* update the thread_set */
+	if (!thread_set_nth_group(&new_ts, 0)) {
+		memprintf(err, "'thread' directive only references non-existing threads");
+		return -1;
+	}
+
+	*ts = new_ts;
+	return 0;
+}
+
+/* Parse a string representing a thread set in one of the following forms:
+ *
+ * - { "all" | "odd" | "even" | <abs_num> [ "-" <abs_num> ] }[,...]
+ *   => these are (lists of) absolute thread numbers
+ *
+ * - <tgnum> "/" { "all" | "odd" | "even" | <rel_num> [ "-" <rel_num> ][,...]
+ *   => these are (lists of) per-group relative thread numbers. All numbers
+ *      must be lower than or equal to LONGBITS. When multiple list elements
+ *      are provided, each of them must contain the thread group number.
+ *
+ * Minimum value for a thread or group number is always 1. Maximum value for an
+ * absolute thread number is MAX_THREADS, maximum value for a relative thread
+ * number is MAX_THREADS_PER_GROUP, an maximum value for a thread group is
+ * MAX_TGROUPS. "all", "even" and "odd" will be bound by MAX_THREADS and/or
+ * MAX_THREADS_PER_GROUP in any case. In ranges, a missing digit before "-"
+ * is implicitly 1, and a missing digit after "-" is implicitly the highest of
+ * its class. As such "-" is equivalent to "all", allowing to build strings
+ * such as "${MIN}-${MAX}" where both MIN and MAX are optional.
+ *
+ * It is not valid to mix absolute and relative numbers. As such:
+ * - all               valid (all absolute threads)
+ * - 12-19,24-31       valid (abs threads 12 to 19 and 24 to 31)
+ * - 1/all             valid (all 32 or 64 threads of group 1)
+ * - 1/1-4,1/8-10,2/1  valid
+ * - 1/1-4,8-10        invalid (mixes relatve "1/1-4" with absolute "8-10")
+ * - 1-4,8-10,2/1      invalid (mixes absolute "1-4,8-10" with relative "2/1")
+ * - 1/odd-4           invalid (mixes range with boundary)
+ *
+ * The target thread set is *completed* with supported threads, which means
+ * that it's the caller's responsibility for pre-initializing it. If the target
+ * thread set is NULL, it's not updated and the function only verifies that the
+ * input parses.
+ *
+ * On success, it returns 0. otherwise it returns non-zero with an error
+ * message in <err>.
+ */
+int parse_thread_set(const char *arg, struct thread_set *ts, char **err)
+{
+	const char *set;
+	const char *sep;
+	int v, min, max, tg;
+	int is_rel;
+
+	/* search for the first delimiter (',', '-' or '/') to decide whether
+	 * we're facing an absolute or relative form. The relative form always
+	 * starts with a number followed by a slash.
+	 */
+	for (sep = arg; isdigit((uchar)*sep); sep++)
+		;
+
+	is_rel = (/*sep > arg &&*/ *sep == '/'); /* relative form */
+
+	/* from there we have to cut the thread spec around commas */
+
+	set = arg;
+	tg = 0;
+	while (*set) {
+		/* note: we can't use strtol() here because "-3" would parse as
+		 * (-3) while we want to stop before the "-", so we find the
+		 * separator ourselves and rely on atoi() whose value we may
+		 * ignore depending where the separator is.
+		 */
+		for (sep = set; isdigit((uchar)*sep); sep++)
+			;
+
+		if (sep != set && *sep && *sep != '/' && *sep != '-' && *sep != ',') {
+			memprintf(err, "invalid character '%c' in thread set specification: '%s'.", *sep, set);
+			return -1;
+		}
+
+		v = (sep != set) ? atoi(set) : 0;
+
+		/* Now we know that the string is made of an optional series of digits
+		 * optionally followed by one of the delimiters above, or that it
+		 * starts with a different character.
+		 */
+
+		/* first, let's search for the thread group (digits before '/') */
+
+		if (tg || !is_rel) {
+			/* thread group already specified or not expected if absolute spec */
+			if (*sep == '/') {
+				if (tg)
+					memprintf(err, "redundant thread group specification '%s' for group %d", set, tg);
+				else
+					memprintf(err, "group-relative thread specification '%s' is not permitted after a absolute thread range.", set);
+				return -1;
+			}
+		} else {
+			/* this is a group-relative spec, first field is the group number */
+			if (sep == set && *sep == '/') {
+				memprintf(err, "thread group number expected before '%s'.", set);
+				return -1;
+			}
+
+			if (*sep != '/') {
+				memprintf(err, "absolute thread specification '%s' is not permitted after a group-relative thread range.", set);
+				return -1;
+			}
+
+			if (v < 1 || v > MAX_TGROUPS) {
+				memprintf(err, "invalid thread group number '%d', permitted range is 1..%d in '%s'.", v, MAX_TGROUPS, set);
+				return -1;
+			}
+
+			tg = v;
+
+			/* skip group number and go on with set,sep,v as if
+			 * there was no group number.
+			 */
+			set = sep + 1;
+			continue;
+		}
+
+		/* Now 'set' starts at the min thread number, whose value is in v if any,
+		 * and preset the max to it, unless the range is filled at once via "all"
+		 * (stored as 1:0), "odd" (stored as) 1:-1, or "even" (stored as 1:-2).
+		 * 'sep' points to the next non-digit which may be set itself e.g. for
+		 * "all" etc or "-xx".
+		 */
+
+		if (!*set) {
+			/* empty set sets no restriction */
+			min = 1;
+			max = is_rel ? MAX_THREADS_PER_GROUP : MAX_THREADS;
+		}
+		else {
+			if (sep != set && *sep && *sep != '-' && *sep != ',') {
+				// Only delimiters are permitted around digits.
+				memprintf(err, "invalid character '%c' in thread set specification: '%s'.", *sep, set);
+				return -1;
+			}
+
+			/* for non-digits, find next delim */
+			for (; *sep && *sep != '-' && *sep != ','; sep++)
+				;
+
+			min = max = 1;
+			if (sep != set) {
+				/* non-empty first thread */
+				if (isteq(ist2(set, sep-set), ist("all")))
+					max = 0;
+				else if (isteq(ist2(set, sep-set), ist("odd")))
+					max = -1;
+				else if (isteq(ist2(set, sep-set), ist("even")))
+					max = -2;
+				else if (v)
+					min = max = v;
+				else
+					max = min = 0; // throw an error below
+			}
+
+			if (min < 1 || min > MAX_THREADS || (is_rel && min > MAX_THREADS_PER_GROUP)) {
+				memprintf(err, "invalid first thread number '%s', permitted range is 1..%d, or 'all', 'odd', 'even'.",
+					  set, is_rel ? MAX_THREADS_PER_GROUP : MAX_THREADS);
+				return -1;
+			}
+
+			/* is this a range ? */
+			if (*sep == '-') {
+				if (min != max) {
+					memprintf(err, "extraneous range after 'all', 'odd' or 'even': '%s'.", set);
+					return -1;
+				}
+
+				/* this is a seemingly valid range, there may be another number  */
+				for (set = ++sep; isdigit((uchar)*sep); sep++)
+					;
+				v = atoi(set);
+
+				if (sep == set) { // no digit: to the max
+					max = is_rel ? MAX_THREADS_PER_GROUP : MAX_THREADS;
+					if (*sep && *sep != ',')
+						max = 0; // throw an error below
+				} else
+					max = v;
+
+				if (max < 1 || max > MAX_THREADS || (is_rel && max > MAX_THREADS_PER_GROUP)) {
+					memprintf(err, "invalid last thread number '%s', permitted range is 1..%d.",
+						  set, is_rel ? MAX_THREADS_PER_GROUP : MAX_THREADS);
+					return -1;
+				}
+			}
+
+			/* here sep points to the first non-digit after the thread spec,
+			 * must be a valid delimiter.
+			 */
+			if (*sep && *sep != ',') {
+				memprintf(err, "invalid character '%c' after thread set specification: '%s'.", *sep, set);
+				return -1;
+			}
+		}
+
+		/* store values */
+		if (ts) {
+			if (is_rel) {
+				/* group-relative thread numbers */
+				ts->grps |= 1UL << (tg - 1);
+
+				if (max >= min) {
+					for (v = min; v <= max; v++)
+						ts->rel[tg - 1] |= 1UL << (v - 1);
+				} else {
+					memset(&ts->rel[tg - 1],
+					       (max == 0) ? 0xff /* all */ : (max == -1) ? 0x55 /* odd */: 0xaa /* even */,
+					       sizeof(ts->rel[tg - 1]));
+				}
+			} else {
+				/* absolute thread numbers */
+				if (max >= min) {
+					for (v = min; v <= max; v++)
+						ts->abs[(v - 1) / LONGBITS] |= 1UL << ((v - 1) % LONGBITS);
+				} else {
+					memset(&ts->abs,
+					       (max == 0) ? 0xff /* all */ : (max == -1) ? 0x55 /* odd */: 0xaa /* even */,
+					       sizeof(ts->abs));
+				}
+			}
+		}
+
+		set = *sep ? sep + 1 : sep;
+		tg = 0;
+	}
+	return 0;
 }
 
 /* Parse the "nbthread" global directive, which takes an integer argument that
@@ -1201,6 +1678,11 @@ static int cfg_parse_nbthread(char **args, int section_type, struct proxy *curpx
 
 	if (too_many_args(1, args, err, NULL))
 		return -1;
+
+	if (non_global_section_parsed == 1) {
+		memprintf(err, "'%s' not allowed if a non-global section was previously defined. This parameter must be declared in the first global section", args[0]);
+		return -1;
+	}
 
 	nbthread = strtol(args[1], &errptr, 10);
 	if (!*args[1] || *errptr) {
@@ -1218,8 +1700,6 @@ static int cfg_parse_nbthread(char **args, int section_type, struct proxy *curpx
 		memprintf(err, "'%s' value must be between 1 and %d (was %ld)", args[0], MAX_THREADS, nbthread);
 		return -1;
 	}
-
-	all_threads_mask = nbits(nbthread);
 #endif
 
 	HA_DIAG_WARNING_COND(global.nbthread,
@@ -1227,6 +1707,35 @@ static int cfg_parse_nbthread(char **args, int section_type, struct proxy *curpx
 	                     file, line, args[0]);
 
 	global.nbthread = nbthread;
+	return 0;
+}
+
+/* Parse the "thread-hard-limit" global directive, which takes an integer
+ * argument that contains the desired maximum number of threads that will
+ * not be crossed.
+ */
+static int cfg_parse_thread_hard_limit(char **args, int section_type, struct proxy *curpx,
+                              const struct proxy *defpx, const char *file, int line,
+                              char **err)
+{
+	long nbthread;
+	char *errptr;
+
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	nbthread = strtol(args[1], &errptr, 10);
+	if (!*args[1] || *errptr) {
+		memprintf(err, "'%s' passed a missing or unparsable integer value in '%s'", args[0], args[1]);
+		return -1;
+	}
+
+	if (nbthread < 1 || nbthread > MAX_THREADS) {
+		memprintf(err, "'%s' value must be at least 1 (was %ld)", args[0], nbthread);
+		return -1;
+	}
+
+	global.thread_limit = nbthread;
 	return 0;
 }
 
@@ -1240,6 +1749,11 @@ static int cfg_parse_thread_group(char **args, int section_type, struct proxy *c
 	char *errptr;
 	long tnum, tend, tgroup;
 	int arg, tot;
+
+	if (non_global_section_parsed == 1) {
+		memprintf(err, "'%s' not allowed if a non-global section was previously defined. This parameter must be declared in the first global section", args[0]);
+		return -1;
+	}
 
 	tgroup = strtol(args[1], &errptr, 10);
 	if (!*args[1] || *errptr) {
@@ -1262,8 +1776,11 @@ static int cfg_parse_thread_group(char **args, int section_type, struct proxy *c
 		for (tnum = ha_tgroup_info[tgroup-1].base;
 		     tnum < ha_tgroup_info[tgroup-1].base + ha_tgroup_info[tgroup-1].count;
 		     tnum++) {
-			if (ha_thread_info[tnum-1].tg == &ha_tgroup_info[tgroup-1])
+			if (ha_thread_info[tnum-1].tg == &ha_tgroup_info[tgroup-1]) {
 				ha_thread_info[tnum-1].tg = NULL;
+				ha_thread_info[tnum-1].tgid = 0;
+				ha_thread_info[tnum-1].tg_ctx = NULL;
+			}
 		}
 		ha_tgroup_info[tgroup-1].count = ha_tgroup_info[tgroup-1].base = 0;
 	}
@@ -1302,7 +1819,9 @@ static int cfg_parse_thread_group(char **args, int section_type, struct proxy *c
 				ha_tgroup_info[tgroup-1].base = tnum - 1;
 			}
 
+			ha_thread_info[tnum-1].tgid = tgroup;
 			ha_thread_info[tnum-1].tg = &ha_tgroup_info[tgroup-1];
+			ha_thread_info[tnum-1].tg_ctx = &ha_tgroup_ctx[tgroup-1];
 			tot++;
 		}
 	}
@@ -1333,6 +1852,11 @@ static int cfg_parse_thread_groups(char **args, int section_type, struct proxy *
 	if (too_many_args(1, args, err, NULL))
 		return -1;
 
+	if (non_global_section_parsed == 1) {
+		memprintf(err, "'%s' not allowed if a non-global section was previously defined. This parameter must be declared in the first global section", args[0]);
+		return -1;
+	}
+
 	nbtgroups = strtol(args[1], &errptr, 10);
 	if (!*args[1] || *errptr) {
 		memprintf(err, "'%s' passed a missing or unparsable integer value in '%s'", args[0], args[1]);
@@ -1361,6 +1885,7 @@ static int cfg_parse_thread_groups(char **args, int section_type, struct proxy *
 
 /* config keyword parsers */
 static struct cfg_kw_list cfg_kws = {ILH, {
+	{ CFG_GLOBAL, "thread-hard-limit", cfg_parse_thread_hard_limit, 0 },
 	{ CFG_GLOBAL, "nbthread",       cfg_parse_nbthread, 0 },
 	{ CFG_GLOBAL, "thread-group",   cfg_parse_thread_group, 0 },
 	{ CFG_GLOBAL, "thread-groups",  cfg_parse_thread_groups, 0 },

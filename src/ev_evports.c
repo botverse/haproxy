@@ -65,38 +65,40 @@ static void _update_fd(int fd)
 {
 	int en;
 	int events;
+	ulong pr, ps;
 
 	en = fdtab[fd].state;
+	pr = _HA_ATOMIC_LOAD(&polled_mask[fd].poll_recv);
+	ps = _HA_ATOMIC_LOAD(&polled_mask[fd].poll_send);
 
-	if (!(fdtab[fd].thread_mask & tid_bit) || !(en & FD_EV_ACTIVE_RW)) {
-		if (!(polled_mask[fd].poll_recv & tid_bit) &&
-		    !(polled_mask[fd].poll_send & tid_bit)) {
+	if (!(fdtab[fd].thread_mask & ti->ltid_bit) || !(en & FD_EV_ACTIVE_RW)) {
+		if (!((pr | ps) & ti->ltid_bit)) {
 			/* fd was not watched, it's still not */
 			return;
 		}
 		/* fd totally removed from poll list */
 		events = 0;
-		if (polled_mask[fd].poll_recv & tid_bit)
-			_HA_ATOMIC_AND(&polled_mask[fd].poll_recv, ~tid_bit);
-		if (polled_mask[fd].poll_send & tid_bit)
-			_HA_ATOMIC_AND(&polled_mask[fd].poll_send, ~tid_bit);
+		if (pr & ti->ltid_bit)
+			_HA_ATOMIC_AND(&polled_mask[fd].poll_recv, ~ti->ltid_bit);
+		if (ps & ti->ltid_bit)
+			_HA_ATOMIC_AND(&polled_mask[fd].poll_send, ~ti->ltid_bit);
 	}
 	else {
 		/* OK fd has to be monitored, it was either added or changed */
 		events = evports_state_to_events(en);
 		if (en & FD_EV_ACTIVE_R) {
-			if (!(polled_mask[fd].poll_recv & tid_bit))
-				_HA_ATOMIC_OR(&polled_mask[fd].poll_recv, tid_bit);
+			if (!(pr & ti->ltid_bit))
+				_HA_ATOMIC_OR(&polled_mask[fd].poll_recv, ti->ltid_bit);
 		} else {
-			if (polled_mask[fd].poll_recv & tid_bit)
-				_HA_ATOMIC_AND(&polled_mask[fd].poll_recv, ~tid_bit);
+			if (pr & ti->ltid_bit)
+				_HA_ATOMIC_AND(&polled_mask[fd].poll_recv, ~ti->ltid_bit);
 		}
 		if (en & FD_EV_ACTIVE_W) {
-			if (!(polled_mask[fd].poll_send & tid_bit))
-				_HA_ATOMIC_OR(&polled_mask[fd].poll_send, tid_bit);
+			if (!(ps & ti->ltid_bit))
+				_HA_ATOMIC_OR(&polled_mask[fd].poll_send, ti->ltid_bit);
 		} else {
-			if (polled_mask[fd].poll_send & tid_bit)
-				_HA_ATOMIC_AND(&polled_mask[fd].poll_send, ~tid_bit);
+			if (ps & ti->ltid_bit)
+				_HA_ATOMIC_AND(&polled_mask[fd].poll_send, ~ti->ltid_bit);
 		}
 
 	}
@@ -124,17 +126,25 @@ static void _do_poll(struct poller *p, int exp, int wake)
 	for (i = 0; i < fd_nbupdt; i++) {
 		fd = fd_updt[i];
 
-		_HA_ATOMIC_AND(&fdtab[fd].update_mask, ~tid_bit);
-		if (fdtab[fd].owner == NULL) {
+		if (!fd_grab_tgid(fd, tgid)) {
+			/* was reassigned */
 			activity[tid].poll_drop_fd++;
 			continue;
 		}
 
-		_update_fd(fd);
+		_HA_ATOMIC_AND(&fdtab[fd].update_mask, ~ti->ltid_bit);
+
+		if (fdtab[fd].owner)
+			_update_fd(fd);
+		else
+			activity[tid].poll_drop_fd++;
+
+		fd_drop_tgid(fd);
 	}
 	fd_nbupdt = 0;
-	/* Scan the global update list */
-	for (old_fd = fd = update_list.first; fd != -1; fd = fdtab[fd].update.next) {
+
+	/* Scan the shared update list */
+	for (old_fd = fd = update_list[tgid - 1].first; fd != -1; fd = fdtab[fd].update.next) {
 		if (fd == -2) {
 			fd = old_fd;
 			continue;
@@ -143,27 +153,46 @@ static void _do_poll(struct poller *p, int exp, int wake)
 			fd = -fd -4;
 		if (fd == -1)
 			break;
-		if (fdtab[fd].update_mask & tid_bit)
-			done_update_polling(fd);
+
+		if (!fd_grab_tgid(fd, tgid)) {
+			/* was reassigned */
+			activity[tid].poll_drop_fd++;
+			continue;
+		}
+
+		if (!(fdtab[fd].update_mask & ti->ltid_bit)) {
+			fd_drop_tgid(fd);
+			continue;
+		}
+
+		done_update_polling(fd);
+
+		if (fdtab[fd].owner)
+			_update_fd(fd);
 		else
-			continue;
-		if (!fdtab[fd].owner)
-			continue;
-		_update_fd(fd);
+			activity[tid].poll_drop_fd++;
+
+		fd_drop_tgid(fd);
 	}
 
 	thread_idle_now();
 	thread_harmless_now();
 
-	/*
-	 * Determine how long to wait for events to materialise on the port.
-	 */
+	/* Now let's wait for polled events. */
 	wait_time = wake ? 0 : compute_poll_timeout(exp);
 	clock_entering_poll();
 
 	do {
 		int timeout = (global.tune.options & GTUNE_BUSY_POLLING) ? 0 : wait_time;
 		int interrupted = 0;
+		/* Note: normally we should probably expect to pass
+		 * global.tune.maxpollevents here so as to process multiple
+		 * events at once, but it appears unreliable in tests, even
+		 * starting with value 2, and it seems basically nobody's
+		 * using that anymore so it's probably not worth spending days
+		 * investigating this poller more to improve its performance,
+		 * let's switch back to 1. --WT
+		 */
 		nevlist = 1; /* desired number of events to be retrieved */
 		timeout_ts.tv_sec  = (timeout / 1000);
 		timeout_ts.tv_nsec = (timeout % 1000) * 1000000;
@@ -173,6 +202,12 @@ static void _do_poll(struct poller *p, int exp, int wake)
 				   evports_evlist_max,
 				   &nevlist, /* updated to the number of events retrieved */
 				   &timeout_ts);
+
+		/* Be careful, nevlist here is always updated by the syscall
+		 * even on status == -1, so it must always be respected
+		 * otherwise events are lost. Awkward API BTW, I wonder how
+		 * they thought ENOSYS ought to be handled... -WT
+		 */
 		if (status != 0) {
 			int e = errno;
 			switch (e) {
@@ -185,30 +220,23 @@ static void _do_poll(struct poller *p, int exp, int wake)
 				/* nevlist >= 0 */
 				break;
 			default:
-				nevlist = 0;
+				/* signal or anything else */
 				interrupted = 1;
 				break;
 			}
 		}
-		clock_update_date(timeout, nevlist);
+		clock_update_local_date(wait_time, (global.tune.options & GTUNE_BUSY_POLLING) ? 1 : nevlist);
 
 		if (nevlist || interrupted)
 			break;
 		if (timeout || !wait_time)
 			break;
-		if (signal_queue_len || wake)
-			break;
 		if (tick_isset(exp) && tick_is_expired(exp, now_ms))
 			break;
 	} while(1);
 
-	clock_leaving_poll(wait_time, nevlist);
-
-	thread_harmless_end();
-	thread_idle_end();
-
-	if (sleeping_thread_mask & tid_bit)
-		_HA_ATOMIC_AND(&sleeping_thread_mask, ~tid_bit);
+	clock_update_global_date();
+	fd_leaving_poll(wait_time, nevlist);
 
 	if (nevlist > 0)
 		activity[tid].poll_io++;
@@ -250,16 +278,9 @@ static void _do_poll(struct poller *p, int exp, int wake)
 		 */
 		ret = fd_update_events(fd, n);
 
-		/* If the FD was already dead , skip it */
-		if (ret == FD_UPDT_DEAD)
+		/* polling will be on this instance if the FD was migrated */
+		if (ret == FD_UPDT_MIGRATED)
 			continue;
-
-		/* disable polling on this instance if the FD was migrated */
-		if (ret == FD_UPDT_MIGRATED) {
-			if (!HA_ATOMIC_BTS(&fdtab[fd].update_mask, tid))
-				fd_updt[fd_nbupdt++] = fd;
-			continue;
-		}
 
 		/*
 		 * This file descriptor was closed during the processing of
@@ -290,8 +311,6 @@ static void _do_poll(struct poller *p, int exp, int wake)
 
 static int init_evports_per_thread()
 {
-	int fd;
-
 	evports_evlist_max = global.tune.maxpollevents;
 	evports_evlist = calloc(evports_evlist_max, sizeof(*evports_evlist));
 	if (evports_evlist == NULL) {
@@ -309,8 +328,7 @@ static int init_evports_per_thread()
 	 * fd for this thread. Let's just mark them as updated, the poller will
 	 * do the rest.
 	 */
-	for (fd = 0; fd < global.maxsock; fd++)
-		updt_fd_polling(fd);
+	fd_reregister_all(tgid, ti->ltid_bit);
 
 	return 1;
 
@@ -406,10 +424,8 @@ static int _do_fork(struct poller *p)
 }
 
 /*
- * This constructor must be called before main() to register the event ports
- * poller.
+ * Registers the poller.
  */
-__attribute__((constructor))
 static void _do_register(void)
 {
 	struct poller *p;
@@ -435,3 +451,5 @@ static void _do_register(void)
 	p->poll = _do_poll;
 	p->fork = _do_fork;
 }
+
+INITCALL0(STG_REGISTER, _do_register);

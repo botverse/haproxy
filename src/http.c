@@ -12,6 +12,7 @@
 
 #include <ctype.h>
 #include <haproxy/api.h>
+#include <haproxy/cfgparse.h>
 #include <haproxy/http.h>
 #include <haproxy/tools.h>
 
@@ -90,32 +91,32 @@ const unsigned char http_char_classes[256] = {
 	['>'] = HTTP_FLG_SEP,
 	['?'] = HTTP_FLG_SEP,
 	['@'] = HTTP_FLG_SEP,
-	['A'] = HTTP_FLG_TOK,
-	['B'] = HTTP_FLG_TOK,
-	['C'] = HTTP_FLG_TOK,
-	['D'] = HTTP_FLG_TOK,
-	['E'] = HTTP_FLG_TOK,
-	['F'] = HTTP_FLG_TOK,
-	['G'] = HTTP_FLG_TOK,
+	['A'] = HTTP_FLG_TOK | HTTP_FLG_VER,
+	['B'] = HTTP_FLG_TOK | HTTP_FLG_VER,
+	['C'] = HTTP_FLG_TOK | HTTP_FLG_VER,
+	['D'] = HTTP_FLG_TOK | HTTP_FLG_VER,
+	['E'] = HTTP_FLG_TOK | HTTP_FLG_VER,
+	['F'] = HTTP_FLG_TOK | HTTP_FLG_VER,
+	['G'] = HTTP_FLG_TOK | HTTP_FLG_VER,
 	['H'] = HTTP_FLG_TOK | HTTP_FLG_VER,
-	['I'] = HTTP_FLG_TOK,
-	['J'] = HTTP_FLG_TOK,
-	['K'] = HTTP_FLG_TOK,
-	['L'] = HTTP_FLG_TOK,
-	['M'] = HTTP_FLG_TOK,
-	['N'] = HTTP_FLG_TOK,
-	['O'] = HTTP_FLG_TOK,
+	['I'] = HTTP_FLG_TOK | HTTP_FLG_VER,
+	['J'] = HTTP_FLG_TOK | HTTP_FLG_VER,
+	['K'] = HTTP_FLG_TOK | HTTP_FLG_VER,
+	['L'] = HTTP_FLG_TOK | HTTP_FLG_VER,
+	['M'] = HTTP_FLG_TOK | HTTP_FLG_VER,
+	['N'] = HTTP_FLG_TOK | HTTP_FLG_VER,
+	['O'] = HTTP_FLG_TOK | HTTP_FLG_VER,
 	['P'] = HTTP_FLG_TOK | HTTP_FLG_VER,
-	['Q'] = HTTP_FLG_TOK,
+	['Q'] = HTTP_FLG_TOK | HTTP_FLG_VER,
 	['R'] = HTTP_FLG_TOK | HTTP_FLG_VER,
 	['S'] = HTTP_FLG_TOK | HTTP_FLG_VER,
 	['T'] = HTTP_FLG_TOK | HTTP_FLG_VER,
-	['U'] = HTTP_FLG_TOK,
-	['V'] = HTTP_FLG_TOK,
-	['W'] = HTTP_FLG_TOK,
-	['X'] = HTTP_FLG_TOK,
-	['Y'] = HTTP_FLG_TOK,
-	['Z'] = HTTP_FLG_TOK,
+	['U'] = HTTP_FLG_TOK | HTTP_FLG_VER,
+	['V'] = HTTP_FLG_TOK | HTTP_FLG_VER,
+	['W'] = HTTP_FLG_TOK | HTTP_FLG_VER,
+	['X'] = HTTP_FLG_TOK | HTTP_FLG_VER,
+	['Y'] = HTTP_FLG_TOK | HTTP_FLG_VER,
+	['Z'] = HTTP_FLG_TOK | HTTP_FLG_VER,
 	['['] = HTTP_FLG_SEP,
 	[ 92] = HTTP_FLG_SEP,
 	[']'] = HTTP_FLG_SEP,
@@ -166,10 +167,12 @@ const int http_err_codes[HTTP_ERR_SIZE] = {
 	[HTTP_ERR_408] = 408,
 	[HTTP_ERR_410] = 410,
 	[HTTP_ERR_413] = 413,
+	[HTTP_ERR_414] = 414,
 	[HTTP_ERR_421] = 421,
 	[HTTP_ERR_422] = 422,
 	[HTTP_ERR_425] = 425,
 	[HTTP_ERR_429] = 429,
+	[HTTP_ERR_431] = 431,
 	[HTTP_ERR_500] = 500,
 	[HTTP_ERR_501] = 501,
 	[HTTP_ERR_502] = 502,
@@ -260,6 +263,14 @@ const char *http_err_msgs[HTTP_ERR_SIZE] = {
 	"\r\n"
 	"<html><body><h1>413 Payload Too Large</h1>\nThe request entity exceeds the maximum allowed.\n</body></html>\n",
 
+	[HTTP_ERR_414] =
+	"HTTP/1.1 414 URI Too Long\r\n"
+	"Content-length: 110\r\n"
+	"Cache-Control: no-cache\r\n"
+	"Content-Type: text/html\r\n"
+	"\r\n"
+	"<html><body><h1>414 URI Too Long</h1>\nThe URI provided was too long for the server to process.\n</body></html>\n",
+
 	[HTTP_ERR_421] =
 	"HTTP/1.1 421 Misdirected Request\r\n"
 	"Content-length: 104\r\n"
@@ -291,6 +302,14 @@ const char *http_err_msgs[HTTP_ERR_SIZE] = {
 	"Content-Type: text/html\r\n"
 	"\r\n"
 	"<html><body><h1>429 Too Many Requests</h1>\nYou have sent too many requests in a given amount of time.\n</body></html>\n",
+
+	[HTTP_ERR_431] =
+	"HTTP/1.1 431 Request Header Fields Too Large\r\n"
+	"Content-length: 106\r\n"
+	"Cache-Control: no-cache\r\n"
+	"Content-Type: text/html\r\n"
+	"\r\n"
+	"<html><body><h1>431 Request Header Fields Too Large</h1>\n>Request Header Fields Too Large.\n</body></html>\n",
 
 	[HTTP_ERR_500] =
 	"HTTP/1.1 500 Internal Server Error\r\n"
@@ -344,6 +363,14 @@ const struct ist http_known_methods[HTTP_METH_OTHER] = {
 	[HTTP_METH_CONNECT] = IST("CONNECT"),
 };
 
+/* 500 bits to indicate for each status code from 100 to 599 if it participates
+ * to the error or failure class. The last 12 bits are not assigned for now.
+ * Not initialized, has to be done at boot. This is manipulated using
+ * http_status_{add,del}_range().
+ */
+long http_err_status_codes[512 / sizeof(long)] = { };
+long http_fail_status_codes[512 / sizeof(long)] = { };
+
 /*
  * returns a known method among HTTP_METH_* or HTTP_METH_OTHER for all unknown
  * ones.
@@ -352,15 +379,15 @@ enum http_meth_t find_http_meth(const char *str, const int len)
 {
 	const struct ist m = ist2(str, len);
 
-	if      (isteq(m, ist("GET")))     return HTTP_METH_GET;
-	else if (isteq(m, ist("HEAD")))    return HTTP_METH_HEAD;
-	else if (isteq(m, ist("POST")))    return HTTP_METH_POST;
-	else if (isteq(m, ist("CONNECT"))) return HTTP_METH_CONNECT;
-	else if (isteq(m, ist("PUT")))     return HTTP_METH_PUT;
-	else if (isteq(m, ist("OPTIONS"))) return HTTP_METH_OPTIONS;
-	else if (isteq(m, ist("DELETE")))  return HTTP_METH_DELETE;
-	else if (isteq(m, ist("TRACE")))   return HTTP_METH_TRACE;
-	else                               return HTTP_METH_OTHER;
+	if      (isteq(m, http_known_methods[HTTP_METH_GET]))     return HTTP_METH_GET;
+	else if (isteq(m, http_known_methods[HTTP_METH_PUT]))     return HTTP_METH_PUT;
+	else if (isteq(m, http_known_methods[HTTP_METH_HEAD]))    return HTTP_METH_HEAD;
+	else if (isteq(m, http_known_methods[HTTP_METH_POST]))    return HTTP_METH_POST;
+	else if (isteq(m, http_known_methods[HTTP_METH_TRACE]))   return HTTP_METH_TRACE;
+	else if (isteq(m, http_known_methods[HTTP_METH_DELETE]))  return HTTP_METH_DELETE;
+	else if (isteq(m, http_known_methods[HTTP_METH_CONNECT])) return HTTP_METH_CONNECT;
+	else if (isteq(m, http_known_methods[HTTP_METH_OPTIONS])) return HTTP_METH_OPTIONS;
+	else                                                      return HTTP_METH_OTHER;
 }
 
 /* This function returns HTTP_ERR_<num> (enum) matching http status code.
@@ -368,28 +395,27 @@ enum http_meth_t find_http_meth(const char *str, const int len)
  */
 int http_get_status_idx(unsigned int status)
 {
-	switch (status) {
-	case 200: return HTTP_ERR_200;
-	case 400: return HTTP_ERR_400;
-	case 401: return HTTP_ERR_401;
-	case 403: return HTTP_ERR_403;
-	case 404: return HTTP_ERR_404;
-	case 405: return HTTP_ERR_405;
-	case 407: return HTTP_ERR_407;
-	case 408: return HTTP_ERR_408;
-	case 410: return HTTP_ERR_410;
-	case 413: return HTTP_ERR_413;
-	case 421: return HTTP_ERR_421;
-	case 422: return HTTP_ERR_422;
-	case 425: return HTTP_ERR_425;
-	case 429: return HTTP_ERR_429;
-	case 500: return HTTP_ERR_500;
-	case 501: return HTTP_ERR_501;
-	case 502: return HTTP_ERR_502;
-	case 503: return HTTP_ERR_503;
-	case 504: return HTTP_ERR_504;
-	default: return HTTP_ERR_500;
-	}
+	/* This table was built using dev/phash and easily finds solutions up
+	 * to 21 different entries and produces much better code with 32
+	 * (padded with err 500 below as it's the default, though only [7] is
+	 * the real one).
+	 */
+	const uchar codes[32] = {
+		HTTP_ERR_500, HTTP_ERR_502, HTTP_ERR_429, HTTP_ERR_500,
+		HTTP_ERR_414, HTTP_ERR_404, HTTP_ERR_500, HTTP_ERR_500,
+		HTTP_ERR_500, HTTP_ERR_200, HTTP_ERR_422, HTTP_ERR_407,
+		HTTP_ERR_500, HTTP_ERR_503, HTTP_ERR_500, HTTP_ERR_500,
+		HTTP_ERR_425, HTTP_ERR_410, HTTP_ERR_405, HTTP_ERR_400,
+		HTTP_ERR_501, HTTP_ERR_500, HTTP_ERR_500, HTTP_ERR_413,
+		HTTP_ERR_408, HTTP_ERR_403, HTTP_ERR_504, HTTP_ERR_500,
+		HTTP_ERR_431, HTTP_ERR_421, HTTP_ERR_500, HTTP_ERR_401,
+	};
+	uint hash = ((status * 406) >> 5) % 32;
+	uint ret  = codes[hash];
+
+	if (http_err_codes[ret] == status)
+		return ret;
+	return HTTP_ERR_500;
 }
 
 /* This function returns a reason associated with the HTTP status.
@@ -413,7 +439,7 @@ const char *http_get_reason(unsigned int status)
 	case 226: return "IM Used";
 	case 300: return "Multiple Choices";
 	case 301: return "Moved Permanently";
-	case 302: return "Moved Temporarily";
+	case 302: return "Found";
 	case 303: return "See Other";
 	case 304: return "Not Modified";
 	case 305: return "Use Proxy";
@@ -476,6 +502,79 @@ const char *http_get_reason(unsigned int status)
 		default:          return "Other";
 		}
 	}
+}
+
+/* add status codes from low to high included to status codes array <array>
+ * which must be compatible with http_err_codes and http_fail_codes (i.e. 512
+ * bits each). This is not thread save and is meant for being called during
+ * boot only. Only status codes 100-599 are permitted.
+ */
+void http_status_add_range(long *array, uint low, uint high)
+{
+	low -= 100;
+	high -= 100;
+
+	BUG_ON(low > 499);
+	BUG_ON(high > 499);
+
+	while (low <= high)
+		ha_bit_set(low++, array);
+}
+
+/* remove status codes from low to high included to status codes array <array>
+ * which must be compatible with http_err_codes and http_fail_codes (i.e. 512
+ * bits each). This is not thread save and is meant for being called during
+ * boot only. Only status codes 100-599 are permitted.
+ */
+void http_status_del_range(long *array, uint low, uint high)
+{
+	low -= 100;
+	high -= 100;
+
+	BUG_ON(low > 499);
+	BUG_ON(high > 499);
+
+	while (low <= high)
+		ha_bit_clr(low++, array);
+}
+
+/* Returns the ist string corresponding to port part (without ':') in the host
+ * <host>, IST_NULL if no ':' is found or an empty IST if there is no digit. In
+ * the last case, the result is the original ist trimmed to 0. So be sure to test
+ * the result length before doing any pointer arithmetic.
+*/
+struct ist http_get_host_port(const struct ist host)
+{
+	char *start, *end, *ptr;
+
+	start = istptr(host);
+	end = istend(host);
+	for (ptr = end; ptr > start && isdigit((unsigned char)*--ptr););
+
+	/* no port found */
+	if (likely(*ptr != ':'))
+		return IST_NULL;
+	if (ptr+1 == end)
+		return isttrim(host, 0);
+
+	return istnext(ist2(ptr, end - ptr));
+}
+
+
+/* Return non-zero if the port <port> is a default port. If the scheme <schm> is
+ * set, it is used to detect default ports (HTTP => 80 and HTTPS => 443)
+ * port. Otherwise, both are considered as default ports.
+ */
+int http_is_default_port(const struct ist schm, const struct ist port)
+{
+	if (!istlen(port))
+		return 1;
+
+	if (!isttest(schm))
+		return (isteq(port, ist("443")) || isteq(port, ist("80")));
+	else
+		return (isteq(port, ist("443")) && isteqi(schm, ist("https://"))) ||
+			(isteq(port, ist("80")) && isteqi(schm, ist("http://")));
 }
 
 /* Returns non-zero if the scheme <schm> is syntactically correct according to
@@ -643,6 +742,110 @@ struct ist http_parse_path(struct http_uri_parser *parser)
  not_found:
 	parser->state = URI_PARSER_STATE_PATH_DONE;
 	return IST_NULL;
+}
+
+/* Parse <value> Content-Length header field of an HTTP request. The function
+ * checks all possible occurrences of a comma-delimited value, and verifies if
+ * any of them doesn't match a previous value. <value> is sanitized on return
+ * to contain a single value if several identical values were found.
+ *
+ * <body_len> must be a valid pointer and is used to return the parsed length
+ * unless values differ. Also if <not_first> is true, <body_len> is assumed to
+ * point to previously parsed value and which must be equal to the new length.
+ * This is useful if an HTTP message contains several Content-Length headers.
+ *
+ * Returns <0 if a value differs, 0 if the whole header can be dropped (i.e.
+ * already known), or >0 if the value can be indexed (first one). In the last
+ * case, the value might be adjusted and the caller must only add the updated
+ * value.
+ */
+int http_parse_cont_len_header(struct ist *value, unsigned long long *body_len,
+                               int not_first)
+{
+	char *e, *n;
+	unsigned long long cl;
+	struct ist word;
+	int check_prev = not_first;
+
+	word.ptr = value->ptr;
+	e = value->ptr + value->len;
+
+	while (1) {
+		if (word.ptr >= e) {
+			/* empty header or empty value */
+			goto fail;
+		}
+
+		/* skip leading delimiter and blanks */
+		if (unlikely(HTTP_IS_LWS(*word.ptr))) {
+			word.ptr++;
+			continue;
+		}
+
+		/* digits only now */
+		for (cl = 0, n = word.ptr; n < e; n++) {
+			unsigned int c = *n - '0';
+			if (unlikely(c > 9)) {
+				/* non-digit */
+				if (unlikely(n == word.ptr)) // spaces only
+					goto fail;
+				break;
+			}
+
+			if (unlikely(!cl && n > word.ptr)) {
+				/* There was a leading zero before this digit,
+				 * let's trim it.
+				 */
+				word.ptr = n;
+			}
+
+			if (unlikely(cl > ULLONG_MAX / 10ULL))
+				goto fail; /* multiply overflow */
+			cl = cl * 10ULL;
+			if (unlikely(cl + c < cl))
+				goto fail; /* addition overflow */
+			cl = cl + c;
+		}
+
+		/* keep a copy of the exact cleaned value */
+		word.len = n - word.ptr;
+
+		/* skip trailing LWS till next comma or EOL */
+		for (; n < e; n++) {
+			if (!HTTP_IS_LWS(*n)) {
+				if (unlikely(*n != ','))
+					goto fail;
+				break;
+			}
+		}
+
+		/* if duplicate, must be equal */
+		if (check_prev && cl != *body_len)
+			goto fail;
+
+		/* OK, store this result as the one to be indexed */
+		*body_len = cl;
+		*value = word;
+
+		/* Now either n==e and we're done, or n points to the comma,
+		 * and we skip it and continue.
+		 */
+		if (n++ == e)
+			break;
+
+		word.ptr = n;
+		check_prev = 1;
+	}
+
+	/* here we've reached the end with a single value or a series of
+	 * identical values, all matching previous series if any. The last
+	 * parsed value was sent back into <value>. We just have to decide
+	 * if this occurrence has to be indexed (it's the first one) or
+	 * silently skipped (it's not the first one)
+	 */
+	return !not_first;
+ fail:
+	return -1;
 }
 
 /*
@@ -826,6 +1029,96 @@ char *http_extract_cookie_value(char *hdr, const char *hdr_end,
 	return NULL;
 }
 
+/* Try to find the next cookie name in a cookie header given a pointer
+ * <hdr_beg> to the starting position, a pointer <hdr_end> to the ending
+ * position to search in the cookie and a boolean <is_req> of type int that
+ * indicates if the stream direction is for request or response.
+ * The lookup begins at <hdr_beg>, which is assumed to be in
+ * Cookie / Set-Cookie header, and the function returns a pointer to the next
+ * position to search from if a valid cookie k-v pair is found for Cookie
+ * request header (<is_req> is non-zero) and <hdr_end> for Set-Cookie response
+ * header (<is_req> is zero). When the next cookie name is found, <ptr> will
+ * be pointing to the start of the cookie name, and <len> will be the length
+ * of the cookie name.
+ * Otherwise if there is no valid cookie k-v pair, NULL is returned.
+ * The <hdr_end> pointer must point to the first character
+ * not part of the Cookie / Set-Cookie header.
+ */
+char *http_extract_next_cookie_name(char *hdr_beg, char *hdr_end, int is_req,
+                                    char **ptr, size_t *len)
+{
+	char *equal, *att_end, *att_beg, *val_beg;
+	char *next;
+
+	/* We search a valid cookie name between hdr_beg and hdr_end,
+	 * followed by an equal. For example for the following cookie:
+	 * Cookie:    NAME1  =  VALUE 1  ; NAME2 = VALUE2 ; NAME3 = VALUE3\r\n
+	 * We want to find NAME1, NAME2, or NAME3 depending on where we start our search
+	 * according to <hdr_beg>
+	 */
+	for (att_beg = hdr_beg; att_beg + 1 < hdr_end; att_beg = next + 1) {
+		while (att_beg < hdr_end && HTTP_IS_SPHT(*att_beg))
+			att_beg++;
+
+		/* find <att_end> : this is the first character after the last non
+		 * space before the equal. It may be equal to <hdr_end>.
+		 */
+		equal = att_end = att_beg;
+
+		while (equal < hdr_end) {
+			if (*equal == '=' || *equal == ';')
+				break;
+			if (HTTP_IS_SPHT(*equal++))
+				continue;
+			att_end = equal;
+		}
+
+		/* Here, <equal> points to '=', a delimiter or the end. <att_end>
+		 * is between <att_beg> and <equal>, both may be identical.
+		 */
+
+		/* Look for end of cookie if there is an equal sign */
+		if (equal < hdr_end && *equal == '=') {
+			/* Look for the beginning of the value */
+			val_beg = equal + 1;
+			while (val_beg < hdr_end && HTTP_IS_SPHT(*val_beg))
+				val_beg++;
+
+			/* Find the end of the value, respecting quotes */
+			next = http_find_cookie_value_end(val_beg, hdr_end);
+		} else {
+			next = equal;
+		}
+
+		/* We have nothing to do with attributes beginning with '$'. However,
+		 * they will automatically be removed if a header before them is removed,
+		 * since they're supposed to be linked together.
+		 */
+		if (*att_beg == '$')
+			continue;
+
+		/* Ignore cookies with no equal sign */
+		if (equal == next)
+			continue;
+
+		/* Now we have the cookie name between <att_beg> and <att_end>, and
+		 * <next> points to the end of cookie value
+		 */
+		*ptr = att_beg;
+		*len = att_end - att_beg;
+
+		/* Return next position for Cookie request header and <hdr_end> for
+		 * Set-Cookie response header as each Set-Cookie header is assumed to
+		 * contain only 1 cookie
+		 */
+		if (is_req)
+			return next + 1;
+		return hdr_end;
+	}
+
+	return NULL;
+}
+
 /* Parses a qvalue and returns it multiplied by 1000, from 0 to 1000. If the
  * value is larger than 1000, it is bound to 1000. The parser consumes up to
  * 1 digit, one dot and 3 digits and stops on the first invalid character.
@@ -874,7 +1167,7 @@ int http_parse_qvalue(const char *qvalue, const char **end)
  */
 const char *http_find_url_param_pos(const char **chunks,
                                     const char* url_param_name, size_t url_param_name_l,
-                                    char delim)
+                                    char delim, char insensitive)
 {
 	const char *pos, *last, *equal;
 	const char **bufs = chunks;
@@ -911,9 +1204,16 @@ const char *http_find_url_param_pos(const char **chunks,
 				if (bufs[2] + l2 > bufs[3])
 					return NULL;
 
-				if (memcmp(pos,     url_param_name,    l1) == 0 &&
-				    memcmp(bufs[2], url_param_name+l1, l2) == 0)
-					return pos;
+				if (insensitive) {
+					if (strncasecmp(pos,     url_param_name,    l1) == 0 &&
+						strncasecmp(bufs[2], url_param_name+l1, l2) == 0)
+						return pos;
+				}
+				else {
+					if (memcmp(pos,     url_param_name,    l1) == 0 &&
+						memcmp(bufs[2], url_param_name+l1, l2) == 0)
+						return pos;
+				}
 
 				/* Perform wrapping and jump the string who fail the comparison. */
 				bufs += 2;
@@ -921,9 +1221,14 @@ const char *http_find_url_param_pos(const char **chunks,
 				last = bufs[1];
 
 			} else {
-				/* process a simple comparison. */
-				if (memcmp(pos, url_param_name, url_param_name_l) == 0)
-					return pos;
+					/* process a simple comparison.*/
+				if (insensitive) {
+					if (strncasecmp(pos, url_param_name, url_param_name_l) == 0)
+						return pos;
+				} else {
+					if (memcmp(pos, url_param_name, url_param_name_l) == 0)
+						return pos;
+				}
 				pos += url_param_name_l + 1;
 				if (fix_pointer_if_wrap(chunks, &pos))
 					last = bufs[2];
@@ -957,7 +1262,7 @@ const char *http_find_url_param_pos(const char **chunks,
  */
 int http_find_next_url_param(const char **chunks,
                              const char* url_param_name, size_t url_param_name_l,
-                             const char **vstart, const char **vend, char delim)
+                             const char **vstart, const char **vend, char delim, char insensitive)
 {
 	const char *arg_start, *qs_end;
 	const char *value_start, *value_end;
@@ -968,7 +1273,7 @@ int http_find_next_url_param(const char **chunks,
 		/* Looks for an argument name. */
 		arg_start = http_find_url_param_pos(chunks,
 		                                    url_param_name, url_param_name_l,
-		                                    delim);
+		                                    delim, insensitive);
 		/* Check for wrapping. */
 		if (arg_start >= qs_end)
 			qs_end = chunks[3];
@@ -1186,3 +1491,111 @@ struct ist http_trim_trailing_spht(struct ist value)
 
 	return ret;
 }
+
+/* initialize the required structures and arrays */
+static void _http_init()
+{
+	/* preset the default status codes that count as errors and failures */
+	http_status_add_range(http_err_status_codes,  400, 499);
+	http_status_add_range(http_fail_status_codes, 500, 599);
+	http_status_del_range(http_fail_status_codes, 501, 501);
+	http_status_del_range(http_fail_status_codes, 505, 505);
+}
+INITCALL0(STG_INIT, _http_init);
+
+/*
+ * registered keywords below
+ */
+
+/* parses a global "http-err-codes" and "http-fail-codes" directive. */
+static int http_parse_http_err_fail_codes(char **args, int section_type, struct proxy *curpx,
+					  const struct proxy *defpx, const char *file, int line,
+					  char **err)
+{
+	const char *cmd = args[0];
+	const char *p, *b, *e;
+	int op, low, high;
+	long *bitfield;
+	int ret = -1;
+
+	if (strcmp(cmd, "http-err-codes") == 0)
+		bitfield = http_err_status_codes;
+	else if (strcmp(cmd, "http-fail-codes") == 0)
+		bitfield = http_fail_status_codes;
+	else
+		ABORT_NOW();
+
+	if (!*args[1]) {
+		memprintf(err, "Missing status codes range for '%s'.", cmd);
+		goto end;
+	}
+
+	/* operation: <0 = remove, 0 = replace, >0 = add. The operation is only
+	 * reset for each new arg so that we can do +200,300,400 without
+	 * changing the operation.
+	 */
+	for (; *(p = *(++args)); ) {
+		switch (*p) {
+		case '+': op =  1; p++; break;
+		case '-': op = -1; p++; break;
+		default:  op =  0; break;
+		}
+
+		if (!*p)
+			goto inval;
+
+		while (1) {
+			b = p;
+			e = p + strlen(p);
+			low = read_uint(&p, e);
+			if (b == e || p == b)
+				goto inval;
+
+			high = low;
+			if (*p == '-') {
+				p++;
+				b = p;
+				high = read_uint(&p, e);
+				if (b == e || p == b || (*p && *p != ','))
+					goto inval;
+			}
+			else if (*p && *p != ',')
+				goto inval;
+
+			if (high < low || low < 100 || high > 599) {
+				memprintf(err, "Invalid status codes range '%s' in '%s'.\n"
+					  " Codes must be between 100 and 599 and ranges in ascending order.",
+					  *args, cmd);
+				goto end;
+			}
+
+			if (!op)
+				memset(bitfield, 0, sizeof(http_err_status_codes));
+			if (op >= 0)
+				http_status_add_range(bitfield, low, high);
+			if (op < 0)
+				http_status_del_range(bitfield, low, high);
+
+			if (!*p)
+				break;
+			/* skip ',' */
+			p++;
+		}
+	}
+	ret = 0;
+ end:
+	return ret;
+ inval:
+	memprintf(err, "Invalid status codes range '%s' in '%s' at position %lu. Ranges must be in the form [+-]{low[-{high}]}[,...].",
+		  *args, cmd, (ulong)(p - *args));
+	goto end;
+
+}
+
+static struct cfg_kw_list cfg_kws = {{ },{
+	{ CFG_GLOBAL, "http-err-codes",      http_parse_http_err_fail_codes },
+	{ CFG_GLOBAL, "http-fail-codes",     http_parse_http_err_fail_codes },
+	{ /* END */ }
+}};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);

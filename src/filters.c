@@ -23,7 +23,6 @@
 #include <haproxy/namespace.h>
 #include <haproxy/proxy.h>
 #include <haproxy/stream.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/tools.h>
 #include <haproxy/trace.h>
 
@@ -58,9 +57,14 @@ static int handle_analyzer_result(struct stream *s, struct channel *chn, unsigne
 	do {								\
 		struct filter *filter;					\
 									\
-		if (strm_flt(strm)->current[CHN_IDX(chn)]) {	\
+		if (strm_flt(strm)->current[CHN_IDX(chn)]) {		\
 			filter = strm_flt(strm)->current[CHN_IDX(chn)]; \
-			strm_flt(strm)->current[CHN_IDX(chn)] = NULL; \
+			strm_flt(strm)->current[CHN_IDX(chn)] = NULL;	\
+			if (!(chn_prod(chn)->flags & SC_FL_ERROR) &&	\
+			    !(chn->flags & (CF_READ_TIMEOUT|CF_WRITE_TIMEOUT))) { \
+				(strm)->waiting_entity.type = STRM_ENTITY_NONE;	\
+				(strm)->waiting_entity.ptr = NULL;	\
+			}						\
 			goto resume_execution;				\
 		}							\
 									\
@@ -73,7 +77,15 @@ static int handle_analyzer_result(struct stream *s, struct channel *chn, unsigne
 
 #define BREAK_EXECUTION(strm, chn, label)				\
 	do {								\
-		strm_flt(strm)->current[CHN_IDX(chn)] = filter;	\
+		if (ret == 0) {						\
+			s->waiting_entity.type = STRM_ENTITY_FILTER;	\
+			s->waiting_entity.ptr  = filter;		\
+		}							\
+		else if (ret < 0) {					\
+			(strm)->last_entity.type = STRM_ENTITY_FILTER;	\
+			(strm)->last_entity.ptr = filter;		\
+		}							\
+		strm_flt(strm)->current[CHN_IDX(chn)] = filter;		\
 		goto label;						\
 	} while (0)
 
@@ -130,27 +142,44 @@ flt_find_kw(const char *kw)
 /*
  * Dumps all registered "filter" keywords to the <out> string pointer. The
  * unsupported keywords are only dumped if their supported form was not found.
+ * If <out> is NULL, the output is emitted using a more compact format on stdout.
  */
 void
 flt_dump_kws(char **out)
 {
 	struct flt_kw_list *kwl;
+	const struct flt_kw *kwp, *kw;
+	const char *scope = NULL;
 	int index;
 
-	if (!out)
-		return;
+	if (out)
+		*out = NULL;
 
-	*out = NULL;
-	list_for_each_entry(kwl, &flt_keywords.list, list) {
-		for (index = 0; kwl->kw[index].kw != NULL; index++) {
-			if (kwl->kw[index].parse ||
-			    flt_find_kw(kwl->kw[index].kw) == &kwl->kw[index]) {
-				memprintf(out, "%s[%4s] %s%s\n", *out ? *out : "",
-				          kwl->scope,
-				          kwl->kw[index].kw,
-				          kwl->kw[index].parse ? "" : " (not supported)");
+	for (kw = kwp = NULL;; kwp = kw) {
+		list_for_each_entry(kwl, &flt_keywords.list, list) {
+			for (index = 0; kwl->kw[index].kw != NULL; index++) {
+				if ((kwl->kw[index].parse ||
+				     flt_find_kw(kwl->kw[index].kw) == &kwl->kw[index])
+				    && strordered(kwp ? kwp->kw : NULL,
+						  kwl->kw[index].kw,
+						  kw != kwp ? kw->kw : NULL)) {
+					kw = &kwl->kw[index];
+					scope = kwl->scope;
+				}
 			}
 		}
+
+		if (kw == kwp)
+			break;
+
+		if (out)
+			memprintf(out, "%s[%4s] %s%s\n", *out ? *out : "",
+				  scope,
+				  kw->kw,
+				  kw->parse ? "" : " (not supported)");
+		else
+			printf("%s [%s]\n",
+			       kw->kw, scope);
 	}
 }
 
@@ -292,10 +321,9 @@ flt_init_all()
 	int err_code = ERR_NONE;
 
 	for (px = proxies_list; px; px = px->next) {
-		if (px->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) {
-			flt_deinit(px);
+		if (px->flags & (PR_FL_DISABLED|PR_FL_STOPPED))
 			continue;
-		}
+
 		err_code |= flt_init(px);
 		if (err_code & (ERR_ABORT|ERR_FATAL)) {
 			ha_alert("Failed to initialize filters for proxy '%s'.\n",
@@ -449,6 +477,7 @@ flt_stream_release(struct stream *s, int only_backend)
 
 	list_for_each_entry_safe(filter, back, &strm_flt(s)->filters, list) {
 		if (!only_backend || (filter->flags & FLT_FL_IS_BACKEND_FILTER)) {
+			filter->calls++;
 			if (FLT_OPS(filter)->detach)
 				FLT_OPS(filter)->detach(s, filter);
 			LIST_DELETE(&filter->list);
@@ -470,10 +499,13 @@ flt_stream_start(struct stream *s)
 	struct filter *filter;
 
 	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
-		if (FLT_OPS(filter)->stream_start && FLT_OPS(filter)->stream_start(s, filter) < 0)
-			return -1;
+		if (FLT_OPS(filter)->stream_start) {
+			filter->calls++;
+			if (FLT_OPS(filter)->stream_start(s, filter) < 0)
+				return -1;
+		}
 	}
-	if (strm_li(s) && (strm_li(s)->analysers & AN_REQ_FLT_START_FE)) {
+	if (strm_li(s) && (strm_li(s)->bind_conf->analysers & AN_REQ_FLT_START_FE)) {
 		s->req.flags |= CF_FLT_ANALYZE;
 		s->req.analysers |= AN_REQ_FLT_END;
 	}
@@ -490,8 +522,10 @@ flt_stream_stop(struct stream *s)
 	struct filter *filter;
 
 	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
-		if (FLT_OPS(filter)->stream_stop)
+		if (FLT_OPS(filter)->stream_stop) {
+			filter->calls++;
 			FLT_OPS(filter)->stream_stop(s, filter);
+		}
 	}
 }
 
@@ -505,8 +539,10 @@ flt_stream_check_timeouts(struct stream *s)
 	struct filter *filter;
 
 	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
-		if (FLT_OPS(filter)->check_timeouts)
+		if (FLT_OPS(filter)->check_timeouts) {
+			filter->calls++;
 			FLT_OPS(filter)->check_timeouts(s, filter);
+		}
 	}
 }
 
@@ -531,9 +567,14 @@ flt_set_stream_backend(struct stream *s, struct proxy *be)
 
   end:
 	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
-		if (FLT_OPS(filter)->stream_set_backend &&
-		    FLT_OPS(filter)->stream_set_backend(s, filter, be) < 0)
-			return -1;
+		if (FLT_OPS(filter)->stream_set_backend) {
+			filter->calls++;
+			if (FLT_OPS(filter)->stream_set_backend(s, filter, be) < 0) {
+				s->last_entity.type = STRM_ENTITY_FILTER;
+				s->last_entity.ptr = filter;
+				return -1;
+			}
+		}
 	}
 	if (be->be_req_ana & AN_REQ_FLT_START_BE) {
 		s->req.flags |= CF_FLT_ANALYZE;
@@ -575,6 +616,7 @@ flt_http_end(struct stream *s, struct http_msg *msg)
 
 		if (FLT_OPS(filter)->http_end) {
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			ret = FLT_OPS(filter)->http_end(s, filter, msg);
 			if (ret <= 0)
 				BREAK_EXECUTION(s, msg->chn, end);
@@ -602,6 +644,7 @@ flt_http_reset(struct stream *s, struct http_msg *msg)
 	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
 		if (FLT_OPS(filter)->http_reset) {
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			FLT_OPS(filter)->http_reset(s, filter, msg);
 		}
 	}
@@ -621,6 +664,7 @@ flt_http_reply(struct stream *s, short status, const struct buffer *msg)
 	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
 		if (FLT_OPS(filter)->http_reply) {
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			FLT_OPS(filter)->http_reply(s, filter, status, msg);
 		}
 	}
@@ -640,6 +684,7 @@ int
 flt_http_payload(struct stream *s, struct http_msg *msg, unsigned int len)
 {
 	struct filter *filter;
+	struct htx *htx;
 	unsigned long long *strm_off = &FLT_STRM_OFF(s, msg->chn);
 	unsigned int out = co_data(msg->chn);
 	int ret, data;
@@ -662,9 +707,13 @@ flt_http_payload(struct stream *s, struct http_msg *msg, unsigned int len)
 
 		if (FLT_OPS(filter)->http_payload) {
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			ret = FLT_OPS(filter)->http_payload(s, filter, msg, out + offset, data - offset);
-			if (ret < 0)
+			if (ret < 0) {
+				s->last_entity.type = STRM_ENTITY_FILTER;
+				s->last_entity.ptr = filter;
 				goto end;
+			}
 			data = ret + *flt_off - *strm_off;
 			*flt_off += ret;
 		}
@@ -687,6 +736,10 @@ flt_http_payload(struct stream *s, struct http_msg *msg, unsigned int len)
 	ret = data;
 	*strm_off += ret;
  end:
+	htx = htxbuf(&msg->chn->buf);
+	htx->flags |= HTX_FL_ALTERED_PAYLOAD;
+	if (msg->flags & HTTP_MSGF_XFER_LEN)
+		htx->extra = 0;
 	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
 	return ret;
 }
@@ -729,6 +782,7 @@ flt_start_analyze(struct stream *s, struct channel *chn, unsigned int an_bit)
 		FLT_OFF(filter, chn) = 0;
 		if (FLT_OPS(filter)->channel_start_analyze) {
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			ret = FLT_OPS(filter)->channel_start_analyze(s, filter, chn);
 			if (ret <= 0)
 				BREAK_EXECUTION(s, chn, end);
@@ -761,6 +815,7 @@ flt_pre_analyze(struct stream *s, struct channel *chn, unsigned int an_bit)
 	RESUME_FILTER_LOOP(s, chn) {
 		if (FLT_OPS(filter)->channel_pre_analyze && (filter->pre_analyzers & an_bit)) {
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			ret = FLT_OPS(filter)->channel_pre_analyze(s, filter, chn, an_bit);
 			if (ret <= 0)
 				BREAK_EXECUTION(s, chn, check_result);
@@ -794,9 +849,13 @@ flt_post_analyze(struct stream *s, struct channel *chn, unsigned int an_bit)
 	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
 		if (FLT_OPS(filter)->channel_post_analyze &&  (filter->post_analyzers & an_bit)) {
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			ret = FLT_OPS(filter)->channel_post_analyze(s, filter, chn, an_bit);
-			if (ret < 0)
+			if (ret < 0) {
+				s->last_entity.type = STRM_ENTITY_FILTER;
+				s->last_entity.ptr = filter;
 				break;
+			}
 			filter->post_analyzers &= ~an_bit;
 		}
 	}
@@ -822,6 +881,7 @@ flt_analyze_http_headers(struct stream *s, struct channel *chn, unsigned int an_
 	RESUME_FILTER_LOOP(s, chn) {
 		if (FLT_OPS(filter)->http_headers) {
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			ret = FLT_OPS(filter)->http_headers(s, filter, msg);
 			if (ret <= 0)
 				BREAK_EXECUTION(s, chn, check_result);
@@ -867,6 +927,7 @@ flt_end_analyze(struct stream *s, struct channel *chn, unsigned int an_bit)
 
 		if (FLT_OPS(filter)->channel_end_analyze) {
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			ret = FLT_OPS(filter)->channel_end_analyze(s, filter, chn);
 			if (ret <= 0)
 				BREAK_EXECUTION(s, chn, end);
@@ -945,9 +1006,13 @@ flt_tcp_payload(struct stream *s, struct channel *chn, unsigned int len)
 		if (FLT_OPS(filter)->tcp_payload) {
 
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_TCP_ANA|STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			ret = FLT_OPS(filter)->tcp_payload(s, filter, chn, out + offset, data - offset);
-			if (ret < 0)
+			if (ret < 0) {
+				s->last_entity.type = STRM_ENTITY_FILTER;
+				s->last_entity.ptr = filter;
 				goto end;
+			}
 			data = ret + *flt_off - *strm_off;
 			*flt_off += ret;
 		}
@@ -983,12 +1048,6 @@ flt_xfer_data(struct stream *s, struct channel *chn, unsigned int an_bit)
 	if (!HAS_DATA_FILTERS(s, chn))
 		goto end;
 
-	/* Be sure that the output is still opened. Else we stop the data
-	 * filtering. */
-	if ((chn->flags & (CF_READ_ERROR|CF_READ_TIMEOUT|CF_WRITE_ERROR|CF_WRITE_TIMEOUT)) ||
-	    ((chn->flags & CF_SHUTW) && (chn->to_forward || co_data(chn))))
-		goto end;
-
 	if (s->flags & SF_HTX) {
 		struct htx *htx = htxbuf(&chn->buf);
 		len = htx->data;
@@ -1001,17 +1060,24 @@ flt_xfer_data(struct stream *s, struct channel *chn, unsigned int an_bit)
 		goto end;
 	c_adv(chn, ret);
 
-	/* Stop waiting data if the input in closed and no data is pending or if
-	 * the output is closed. */
-	if (chn->flags & CF_SHUTW) {
+	/* Stop waiting data if:
+	 *  - it the output is closed
+	 *  - the input in closed and no data is pending
+	 *  - There is a READ/WRITE timeout
+	 */
+	if (chn_cons(chn)->flags & SC_FL_SHUT_DONE) {
 		ret = 1;
 		goto end;
 	}
-	if (chn->flags & CF_SHUTR) {
+	if (chn_prod(chn)->flags & (SC_FL_ABRT_DONE|SC_FL_EOS)) {
 		if (((s->flags & SF_HTX) && htx_is_empty(htxbuf(&chn->buf))) || c_empty(chn)) {
 			ret = 1;
 			goto end;
 		}
+	}
+	if (chn->flags & (CF_READ_TIMEOUT|CF_WRITE_TIMEOUT)) {
+		ret = 1;
+		goto end;
 	}
 
 	/* Wait for data */
@@ -1033,9 +1099,6 @@ static int
 handle_analyzer_result(struct stream *s, struct channel *chn,
 		       unsigned int an_bit, int ret)
 {
-	int finst;
-	int status = 0;
-
 	if (ret < 0)
 		goto return_bad_req;
 	else if (!ret)
@@ -1050,36 +1113,27 @@ handle_analyzer_result(struct stream *s, struct channel *chn,
 
  return_bad_req:
 	/* An error occurs */
-	channel_abort(&s->req);
-	channel_abort(&s->res);
-
-	if (!(chn->flags & CF_ISRESP)) {
-		s->req.analysers &= AN_REQ_FLT_END;
-		finst = SF_FINST_R;
-		status = 400;
-		/* FIXME: incr counters */
-	}
-	else {
-		s->res.analysers &= AN_RES_FLT_END;
-		finst = SF_FINST_H;
-		status = 502;
-		/* FIXME: incr counters */
-	}
-
 	if (IS_HTX_STRM(s)) {
-		/* Do not do that when we are waiting for the next request */
+		http_set_term_flags(s);
+
 		if (s->txn->status > 0)
 			http_reply_and_close(s, s->txn->status, NULL);
 		else {
-			s->txn->status = status;
-			http_reply_and_close(s, status, http_error_message(s));
+			s->txn->status = (!(chn->flags & CF_ISRESP)) ? 400 : 502;
+			http_reply_and_close(s, s->txn->status, http_error_message(s));
 		}
 	}
+	else {
+		sess_set_term_flags(s);
+		stream_retnclose(s, NULL);
+	}
 
-	if (!(s->flags & SF_ERR_MASK))
-		s->flags |= SF_ERR_PRXCOND;
-	if (!(s->flags & SF_FINST_MASK))
-		s->flags |= finst;
+	if (!(chn->flags & CF_ISRESP))
+		s->req.analysers &= AN_REQ_FLT_END;
+	else
+		s->res.analysers &= AN_RES_FLT_END;
+
+
 	DBG_TRACE_DEVEL("leaving on error", STRM_EV_FLT_ANA|STRM_EV_FLT_ERR, s);
 	return 0;
 

@@ -2,6 +2,18 @@
 #define _HAPROXY_OPENSSL_COMPAT_H
 #ifdef USE_OPENSSL
 
+#ifdef USE_OPENSSL_WOLFSSL
+#define TLSEXT_MAXLEN_host_name 255
+#include <wolfssl/options.h>
+#endif
+
+#ifdef USE_OPENSSL_AWSLC
+#include <openssl/base.h>
+#if !defined(OPENSSL_IS_AWSLC)
+#error "USE_OPENSSL_AWSLC is set but OPENSSL_IS_AWSLC is not defined, wrong header files detected"
+#endif
+#endif
+
 #include <openssl/bn.h>
 #include <openssl/crypto.h>
 #include <openssl/ssl.h>
@@ -10,19 +22,37 @@
 #include <openssl/err.h>
 #include <openssl/rand.h>
 #include <openssl/hmac.h>
+#include <openssl/rsa.h>
 #if (defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP)
 #include <openssl/ocsp.h>
 #endif
 #ifndef OPENSSL_NO_DH
 #include <openssl/dh.h>
 #endif
-#ifndef OPENSSL_NO_ENGINE
+#if defined(USE_ENGINE) && !defined(OPENSSL_NO_ENGINE)
 #include <openssl/engine.h>
 #endif
 
 #ifdef SSL_MODE_ASYNC
 #include <openssl/async.h>
 #endif
+
+#if (OPENSSL_VERSION_NUMBER >= 0x3000000fL)
+#include <openssl/core_names.h>
+#include <openssl/decoder.h>
+#include <openssl/param_build.h>
+#include <openssl/provider.h>
+#endif
+
+#ifdef USE_QUIC_OPENSSL_COMPAT
+#include <haproxy/quic_openssl_compat.h>
+#endif
+
+#if defined(OPENSSL_IS_AWSLC)
+#define OPENSSL_NO_DH
+#define SSL_CTX_set1_sigalgs_list SSL_CTX_set1_sigalgs_list
+#endif
+
 
 #if defined(LIBRESSL_VERSION_NUMBER)
 /* LibreSSL is a fork of OpenSSL 1.0.1g but pretends to be 2.0.0, thus
@@ -45,16 +75,16 @@
 #define HAVE_SSL_EXTRACT_RANDOM
 #endif
 
-#if ((OPENSSL_VERSION_NUMBER >= 0x10101000L) && !defined(OPENSSL_IS_BORINGSSL) && !defined(LIBRESSL_VERSION_NUMBER))
+#if ((OPENSSL_VERSION_NUMBER >= 0x10101000L) && !defined(OPENSSL_IS_BORINGSSL) && !defined(OPENSSL_IS_AWSLC) && !defined(LIBRESSL_VERSION_NUMBER))
 #define HAVE_SSL_RAND_KEEP_RANDOM_DEVICES_OPEN
 #endif
 
-#if ((OPENSSL_VERSION_NUMBER >= 0x10101000L) && !defined(LIBRESSL_VERSION_NUMBER) && !defined(OPENSSL_IS_BORINGSSL))
+#if ((OPENSSL_VERSION_NUMBER >= 0x10101000L) && !defined(LIBRESSL_VERSION_NUMBER) && !defined(OPENSSL_IS_BORINGSSL)) || defined(USE_OPENSSL_WOLFSSL)
 #define HAVE_SSL_CTX_SET_CIPHERSUITES
 #define HAVE_ASN1_TIME_TO_TM
 #endif
 
-#if (defined(SSL_CLIENT_HELLO_CB) || defined(OPENSSL_IS_BORINGSSL))
+#if (defined(SSL_CLIENT_HELLO_CB) || defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC))
 #define HAVE_SSL_CLIENT_HELLO_CB
 #endif
 
@@ -66,7 +96,7 @@
 #define HAVE_SSL_CTX_get0_privatekey
 #endif
 
-#if HA_OPENSSL_VERSION_NUMBER >= 0x1000104fL
+#if HA_OPENSSL_VERSION_NUMBER >= 0x1000104fL || defined(USE_OPENSSL_WOLFSSL) || defined(OPENSSL_IS_AWSLC)
 /* CRYPTO_memcmp() is present since openssl 1.0.1d */
 #define HAVE_CRYPTO_memcmp
 #endif
@@ -75,71 +105,60 @@
 #define HAVE_SSL_SCTL
 #endif
 
-#if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L)
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L) || defined(OPENSSL_IS_AWSLC) || (defined(USE_OPENSSL_WOLFSSL) && defined(HAVE_SECRET_CALLBACK))
 #define HAVE_SSL_KEYLOG
 #endif
 
-#if (HA_OPENSSL_VERSION_NUMBER < 0x0090800fL)
-/* Functions present in OpenSSL 0.9.8, older not tested */
-static inline const unsigned char *SSL_SESSION_get_id(const SSL_SESSION *sess, unsigned int *sid_length)
-{
-	*sid_length = sess->session_id_length;
-	return sess->session_id;
-}
+/* minimum OpenSSL 1.1.1 & libreSSL 3.3.6 */
+#if (defined(LIBRESSL_VERSION_NUMBER) && (LIBRESSL_VERSION_NUMBER >= 0x3030600L)) || (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L) || defined(USE_OPENSSL_WOLFSSL)
+#define HAVE_SSL_get0_verified_chain
+#endif
 
-static inline X509_NAME_ENTRY *X509_NAME_get_entry(const X509_NAME *name, int loc)
-{
-	return sk_X509_NAME_ENTRY_value(name->entries, loc);
-}
+#if defined(SSL_OP_NO_ANTI_REPLAY) || defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
+#define HAVE_SSL_0RTT
+#endif
 
-static inline ASN1_OBJECT *X509_NAME_ENTRY_get_object(const X509_NAME_ENTRY *ne)
-{
-	return ne->object;
-}
+/* At this time, wolfssl, libressl and the openssl QUIC compatibility do not support 0-RTT */
+#if defined(HAVE_SSL_0RTT) && !defined(USE_QUIC_OPENSSL_COMPAT) && !defined(LIBRESSL_VERSION_NUMBER) && !defined(USE_OPENSSL_WOLFSSL)
+#define HAVE_SSL_0RTT_QUIC
+#endif
 
-static inline ASN1_STRING *X509_NAME_ENTRY_get_data(const X509_NAME_ENTRY *ne)
-{
-	return ne->value;
-}
 
-static inline int ASN1_STRING_length(const ASN1_STRING *x)
-{
-	return x->length;
-}
+#if (defined(SSL_CTX_set_security_level) || HA_OPENSSL_VERSION_NUMBER >= 0x1010100fL) && !defined(OPENSSL_IS_AWSLC)
+#define HAVE_SSL_SET_SECURITY_LEVEL
+#endif
 
-static inline int X509_NAME_entry_count(X509_NAME *name)
-{
-	return sk_X509_NAME_ENTRY_num(name->entries)
-}
+#if !defined(HAVE_SSL_SET_SECURITY_LEVEL)
+/* define a nope function for set_security_level */
+#define SSL_CTX_set_security_level(ctx, level) ({})
+#endif
 
-static inline void X509_ALGOR_get0(ASN1_OBJECT **paobj, int *pptype, const void **ppval, const X509_ALGOR *algor)
-{
-	*paobj = algor->algorithm;
-}
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x3000000fL)
+#define HAVE_OSSL_PARAM
+#define MAC_CTX EVP_MAC_CTX
+#define HASSL_DH EVP_PKEY
+#define HASSL_DH_free EVP_PKEY_free
+#define HASSL_DH_up_ref EVP_PKEY_up_ref
 
-#endif // OpenSSL < 0.9.8
+#define HAVE_SSL_PROVIDERS
 
-#if (((HA_OPENSSL_VERSION_NUMBER < 0x1000000fL) || defined(OPENSSL_IS_BORINGSSL)) && !defined(X509_get_X509_PUBKEY))
+#else /* HA_OPENSSL_VERSION_NUMBER >= 0x3000000fL */
+#define MAC_CTX HMAC_CTX
+#define HASSL_DH DH
+#define HASSL_DH_free DH_free
+#define HASSL_DH_up_ref DH_up_ref
+#endif
+
+#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB || AWSLC_API_VERSION >= 29) && (!defined(OPENSSL_NO_OCSP)))
+#define HAVE_SSL_OCSP
+#else
+typedef void OCSP_CERTID;
+#endif
+
+#if ((HA_OPENSSL_VERSION_NUMBER < 0x1000000fL) && !defined(X509_get_X509_PUBKEY))
 #define X509_get_X509_PUBKEY(x) ((x)->cert_info->key)
 #endif
 
-#if (HA_OPENSSL_VERSION_NUMBER < 0x1000000fL)
-/* Functions introduced in OpenSSL 1.0.0 */
-static inline int EVP_PKEY_base_id(const EVP_PKEY *pkey)
-{
-	return EVP_PKEY_type(pkey->type);
-}
-
-/* minimal implementation based on the fact that the only known call place
- * doesn't make use of other arguments.
- */
-static inline int X509_PUBKEY_get0_param(ASN1_OBJECT **ppkalg, const unsigned char **pk, int *ppklen, X509_ALGOR **pa, X509_PUBKEY *pub)
-{
-	*ppkalg = pub->algor->algorithm;
-	return 1;
-}
-
-#endif
 
 #if (HA_OPENSSL_VERSION_NUMBER < 0x1000100fL)
 /*
@@ -154,7 +173,7 @@ static inline int SSL_SESSION_set1_id_context(SSL_SESSION *s, const unsigned cha
 #endif
 
 
-#if (HA_OPENSSL_VERSION_NUMBER < 0x1000200fL) && (LIBRESSL_VERSION_NUMBER < 0x2070500fL)
+#if (HA_OPENSSL_VERSION_NUMBER < 0x1000200fL) && (!defined(LIBRESSL_VERSION_NUMBER) || LIBRESSL_VERSION_NUMBER < 0x2070500fL)
 /* introduced in openssl 1.0.2 */
 
 static inline STACK_OF(X509) *X509_chain_up_ref(STACK_OF(X509) *chain)
@@ -296,6 +315,41 @@ static inline X509 *X509_STORE_CTX_get0_cert(X509_STORE_CTX *ctx)
 {
     return ctx->cert;
 }
+
+static inline int ECDSA_SIG_set0(ECDSA_SIG *sig, BIGNUM *r, BIGNUM *s)
+{
+	if (r == NULL || s == NULL)
+		return 0;
+	BN_clear_free(sig->r);
+	BN_clear_free(sig->s);
+
+	sig->r = r;
+	sig->s = s;
+	return 1;
+}
+
+#endif
+
+#if (HA_OPENSSL_VERSION_NUMBER < 0x3000000fL)
+#if defined(SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB)
+#define SSL_CTX_set_tlsext_ticket_key_evp_cb SSL_CTX_set_tlsext_ticket_key_cb
+#endif
+
+/*
+ * Functions introduced in OpenSSL 3.0.0
+ */
+static inline unsigned long ERR_peek_error_func(const char **func)
+{
+	unsigned long ret = ERR_peek_error();
+	if (ret == 0)
+		return ret;
+
+	if (func)
+		*func = ERR_func_error_string(ret);
+
+	return ret;
+}
+
 #endif
 
 #if (HA_OPENSSL_VERSION_NUMBER >= 0x1010000fL) || (defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER >= 0x2070200fL)
@@ -348,6 +402,10 @@ static inline X509 *X509_STORE_CTX_get0_cert(X509_STORE_CTX *ctx)
 #define EVP_CTRL_AEAD_SET_TAG   EVP_CTRL_GCM_SET_TAG
 #endif
 
+#if !defined(EVP_CTRL_AEAD_GET_TAG)
+#define EVP_CTRL_AEAD_GET_TAG EVP_CTRL_GCM_GET_TAG
+#endif
+
 /* Supported hash function for TLS tickets */
 #ifdef OPENSSL_NO_SHA256
 #define TLS_TICKET_HASH_FUNCT EVP_sha1
@@ -359,8 +417,12 @@ static inline X509 *X509_STORE_CTX_get0_cert(X509_STORE_CTX *ctx)
 #define SSL_OP_CIPHER_SERVER_PREFERENCE 0
 #endif
 
-#ifndef SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION   /* needs OpenSSL >= 0.9.7 */
+/* needs OpenSSL >= 0.9.7 and renegotation options on WolfSSL */
+#if !defined(SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION) || \
+	 (defined(USE_OPENSSL_WOLFSSL) && !defined(HAVE_SECURE_RENEGOTIATION) && !defined(HAVE_SERVER_RENEGOTIATION_INFO))
+#undef  SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION
 #define SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION 0
+#undef  SSL_renegotiate_pending
 #define SSL_renegotiate_pending(arg) 0
 #endif
 
@@ -417,7 +479,7 @@ static inline X509 *X509_STORE_CTX_get0_cert(X509_STORE_CTX *ctx)
 #define SSL_CTX_get_extra_chain_certs(ctx, chain) do { *(chain) = (ctx)->extra_certs; } while (0)
 #endif
 
-#if HA_OPENSSL_VERSION_NUMBER < 0x10100000L
+#if HA_OPENSSL_VERSION_NUMBER < 0x10100000L && (!defined(LIBRESSL_VERSION_NUMBER) || LIBRESSL_VERSION_NUMBER < 0x2070000fL)
 #define BIO_get_data(b)            (b)->ptr
 #define BIO_set_data(b, v)         do { (b)->ptr  = (v); } while (0)
 #define BIO_set_init(b, v)         do { (b)->init = (v); } while (0)
@@ -453,6 +515,15 @@ static inline X509 *X509_STORE_CTX_get0_cert(X509_STORE_CTX *ctx)
  */
 #if !defined(SSL_CTX_set1_curves_list) && defined(SSL_CTRL_SET_CURVES_LIST)
 #define SSL_CTX_set1_curves_list SSL_CTX_set1_curves_list
+#endif
+
+#if !defined(SSL_CTX_set1_sigalgs_list) && defined(SSL_CTRL_SET_SIGALGS_LIST)
+#define SSL_CTX_set1_sigalgs_list SSL_CTX_set1_sigalgs_list
+#endif
+
+#ifndef SSL_CTX_get_tlsext_status_cb
+# define SSL_CTX_get_tlsext_status_cb(ctx, cb) \
+	*(cb) = (void (*) (void))ctx->tlsext_status_cb
 #endif
 
 #endif /* USE_OPENSSL */

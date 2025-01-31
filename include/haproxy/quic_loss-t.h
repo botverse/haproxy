@@ -2,7 +2,7 @@
  * include/types/quic_loss.h
  * This file contains definitions for QUIC loss detection.
  *
- * Copyright 2019 HAProxy Technologies, Frédéric Lécaille <flecaille@haproxy.com>
+ * Copyright 2019 HAProxy Technologies, Frederic Lecaille <flecaille@haproxy.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -26,28 +26,36 @@
 #error "Must define USE_OPENSSL"
 #endif
 
-#include <stdint.h>
+#include <inttypes.h>
 
 /* Maximum reordering in packets. */
 #define QUIC_LOSS_PACKET_THRESHOLD         3
 #define QUIC_TIMER_GRANULARITY            1U /* 1ms   */
 #define QUIC_LOSS_INITIAL_RTT           333U /* 333ms */
 
-/* Note that all the unit of variables for QUIC LOSS dectections
+/* QUIC loss time threshold expressed an RTT multiplier
+ * (QUIC_LOSS_TIME_THRESHOLD_MULTIPLICAND / QUIC_LOSS_TIME_THRESHOLD_DIVISOR)
+ */
+#define QUIC_LOSS_TIME_THRESHOLD_MULTIPLICAND 9
+#define QUIC_LOSS_TIME_THRESHOLD_DIVISOR      8
+
+/* Note that all the unit of variables for QUIC LOSS detections
  * is the tick.
  */
 
 struct quic_loss {
-	/* The most recent RTT measurement. */
+	/* The most recent RTT measurement (ms) */
 	unsigned int latest_rtt;
-	/* Smoothed RTT << 4*/
+	/* Smoothed RTT (ms) */
 	unsigned int srtt;
-	/* RTT variation << 2 */
+	/* RTT variation (ms) */
 	unsigned int rtt_var;
-	/* Minimum RTT. */
+	/* Minimum RTT (ms) */
 	unsigned int rtt_min;
 	/* Number of NACKed sent PTO. */
 	unsigned int pto_count;
+	unsigned long nb_lost_pkt;
+	unsigned long nb_reordered_pkt;
 };
 
 #endif /* USE_QUIC */

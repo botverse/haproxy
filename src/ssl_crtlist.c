@@ -20,15 +20,40 @@
 #include <import/ebpttree.h>
 #include <import/ebsttree.h>
 
+#include <haproxy/applet.h>
 #include <haproxy/channel.h>
 #include <haproxy/cli.h>
 #include <haproxy/errors.h>
+#include <haproxy/sc_strm.h>
 #include <haproxy/ssl_ckch.h>
 #include <haproxy/ssl_crtlist.h>
+#include <haproxy/ssl_ocsp.h>
 #include <haproxy/ssl_sock.h>
-#include <haproxy/stream_interface.h>
+#include <haproxy/stconn.h>
 #include <haproxy/tools.h>
 
+/* CLI context for "show ssl crt-list" or "dump ssl crt-list" */
+struct show_crtlist_ctx {
+	struct ebmb_node *crtlist_node;  /* ebmb_node for the current crtlist */
+	struct crtlist_entry *entry;     /* current entry */
+	int mode;                        /* 'd' for dump, 's' for show */
+};
+
+/* CLI context for "add ssl crt-list" */
+struct add_crtlist_ctx {
+	struct crtlist *crtlist;
+	struct crtlist_entry *entry;
+	struct bind_conf_list *bind_conf_node;
+	char *err;
+	enum {
+		ADDCRT_ST_INIT = 0,
+		ADDCRT_ST_GEN,
+		ADDCRT_ST_INSERT,
+		ADDCRT_ST_SUCCESS,
+		ADDCRT_ST_ERROR,
+		ADDCRT_ST_FIN,
+	} state;
+};
 
 /* release ssl bind conf */
 void ssl_sock_free_ssl_conf(struct ssl_bind_conf *conf)
@@ -49,6 +74,12 @@ void ssl_sock_free_ssl_conf(struct ssl_bind_conf *conf)
 #endif
 		ha_free(&conf->curves);
 		ha_free(&conf->ecdhe);
+#if defined(SSL_CTX_set1_sigalgs_list)
+		ha_free(&conf->sigalgs);
+#endif
+#if defined(SSL_CTX_set1_client_sigalgs_list)
+		ha_free(&conf->client_sigalgs);
+#endif
 	}
 }
 
@@ -117,6 +148,29 @@ struct ssl_bind_conf *crtlist_dup_ssl_conf(struct ssl_bind_conf *src)
 		if (!dst->ecdhe)
 			goto error;
 	}
+
+	dst->ssl_methods_cfg.flags = src->ssl_methods_cfg.flags;
+	dst->ssl_methods_cfg.min = src->ssl_methods_cfg.min;
+	dst->ssl_methods_cfg.max = src->ssl_methods_cfg.max;
+
+	dst->ssl_methods.flags = src->ssl_methods.flags;
+	dst->ssl_methods.min = src->ssl_methods.min;
+	dst->ssl_methods.max = src->ssl_methods.max;
+
+#if defined(SSL_CTX_set1_sigalgs_list)
+	if (src->sigalgs) {
+		dst->sigalgs = strdup(src->sigalgs);
+		if (!dst->sigalgs)
+			goto error;
+	}
+#endif
+#if defined(SSL_CTX_set1_client_sigalgs_list)
+	if (src->client_sigalgs) {
+		dst->client_sigalgs = strdup(src->client_sigalgs);
+		if (!dst->client_sigalgs)
+			goto error;
+	}
+#endif
 	return dst;
 
 error:
@@ -302,7 +356,7 @@ struct crtlist *crtlist_new(const char *filename, int unique)
  *  <crt_path> is a ptr in <line>
  *  Return an error code
  */
-int crtlist_parse_line(char *line, char **crt_path, struct crtlist_entry *entry, const char *file, int linenum, int from_cli, char **err)
+int crtlist_parse_line(char *line, char **crt_path, struct crtlist_entry *entry, struct ckch_conf *cc, const char *file, int linenum, int from_cli, char **err)
 {
 	int cfgerr = 0;
 	int arg, newarg, cur_arg, i, ssl_b = 0, ssl_e = 0;
@@ -379,31 +433,52 @@ int crtlist_parse_line(char *line, char **crt_path, struct crtlist_entry *entry,
 	*crt_path = args[0];
 
 	if (ssl_b) {
-		ssl_conf = calloc(1, sizeof *ssl_conf);
-		if (!ssl_conf) {
-			memprintf(err, "not enough memory!");
-			cfgerr |= ERR_ALERT | ERR_FATAL;
-			goto error;
+		if (ssl_b > 1) {
+			memprintf(err, "parsing [%s:%d]: malformated line, filters can't be between filename and options!", file, linenum);
+			cfgerr |= ERR_WARN;
 		}
+
 	}
 
 	cur_arg = ssl_b ? ssl_b : 1;
 	while (cur_arg < ssl_e) {
 		newarg = 0;
-		for (i = 0; ssl_bind_kws[i].kw != NULL; i++) {
-			if (strcmp(ssl_bind_kws[i].kw, args[cur_arg]) == 0) {
+		/* look for ssl_conf keywords */
+		for (i = 0; ssl_crtlist_kws[i].kw != NULL; i++) {
+			if (strcmp(ssl_crtlist_kws[i].kw, args[cur_arg]) == 0) {
+				if (!ssl_conf)
+					ssl_conf = calloc(1, sizeof *ssl_conf);
+				if (!ssl_conf) {
+					memprintf(err, "not enough memory!");
+					cfgerr |= ERR_ALERT | ERR_FATAL;
+					goto error;
+				}
+
 				newarg = 1;
-				cfgerr |= ssl_bind_kws[i].parse(args, cur_arg, NULL, ssl_conf, from_cli, err);
-				if (cur_arg + 1 + ssl_bind_kws[i].skip > ssl_e) {
+				cfgerr |= ssl_crtlist_kws[i].parse(args, cur_arg, NULL, ssl_conf, from_cli, err);
+				if (cur_arg + 1 + ssl_crtlist_kws[i].skip > ssl_e) {
 					memprintf(err, "parsing [%s:%d]: ssl args out of '[]' for %s",
 					          file, linenum, args[cur_arg]);
 					cfgerr |= ERR_ALERT | ERR_FATAL;
 					goto error;
 				}
-				cur_arg += 1 + ssl_bind_kws[i].skip;
-				break;
+				cur_arg += 1 + ssl_crtlist_kws[i].skip;
+				goto out;
 			}
 		}
+		if (cc) {
+			/* look for ckch_conf keywords */
+			cfgerr |= ckch_conf_parse(args, cur_arg, cc, &newarg, file, linenum, err);
+			if (cfgerr & ERR_FATAL)
+				goto error;
+
+			if (newarg) {
+				cur_arg += 2;  /* skip 2 words if the keyword was found */
+				cc->used = CKCH_CONF_SET_CRTLIST; /* if they are options they must be used everywhere */
+			}
+
+		}
+out:
 		if (!cfgerr && !newarg) {
 			memprintf(err, "parsing [%s:%d]: unknown ssl keyword %s",
 				  file, linenum, args[cur_arg]);
@@ -462,6 +537,7 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 		char *crt_path;
 		char path[MAXPATHLEN+1];
 		struct ckch_store *ckchs;
+		struct ckch_conf cc = {};
 		int found = 0;
 
 		if (missing_lf != -1) {
@@ -503,7 +579,7 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 			goto error;
 		}
 
-		cfgerr |= crtlist_parse_line(thisline, &crt_path, entry, file, linenum, 0, err);
+		cfgerr |= crtlist_parse_line(thisline, &crt_path, entry, &cc, file, linenum, 0, err);
 		if (cfgerr & ERR_CODE)
 			goto error;
 
@@ -514,14 +590,14 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 			continue;
 		}
 
-		if (*crt_path != '/' && global_ssl.crt_base) {
-			if ((strlen(global_ssl.crt_base) + 1 + strlen(crt_path)) > MAXPATHLEN) {
+		if (*crt_path != '@' && *crt_path != '/' && global_ssl.crt_base) {
+			if ((strlen(global_ssl.crt_base) + 1 + strlen(crt_path)) > sizeof(path) ||
+			    snprintf(path, sizeof(path), "%s/%s",  global_ssl.crt_base, crt_path) > sizeof(path)) {
 				memprintf(err, "parsing [%s:%d]: '%s' : path too long",
 					  file, linenum, crt_path);
 				cfgerr |= ERR_ALERT | ERR_FATAL;
 				goto error;
 			}
-			snprintf(path, sizeof(path), "%s/%s",  global_ssl.crt_base, crt_path);
 			crt_path = path;
 		}
 
@@ -530,12 +606,20 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 		if (ckchs == NULL) {
 			if (stat(crt_path, &buf) == 0) {
 				found++;
+				free(cc.crt);
+				cc.crt = strdup(crt_path);
+				if (cc.crt == NULL) {
+					cfgerr |= ERR_ALERT | ERR_FATAL;
+					goto error;
+				}
 
-				ckchs = ckchs_load_cert_file(crt_path, err);
+				ckchs = ckch_store_new_load_files_conf(crt_path, &cc, err);
 				if (ckchs == NULL) {
 					cfgerr |= ERR_ALERT | ERR_FATAL;
 					goto error;
 				}
+
+				ckchs->conf = cc;
 
 				entry->node.key = ckchs;
 				entry->crtlist = newlist;
@@ -553,6 +637,7 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 				char fp[MAXPATHLEN+1] = {0};
 				int n = 0;
 				struct crtlist_entry *entry_dup = entry; /* use the previous created entry */
+
 				for (n = 0; n < SSL_SOCK_NUM_KEYTYPES; n++) {
 					struct stat buf;
 					int ret;
@@ -564,7 +649,13 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 					ckchs = ckchs_lookup(fp);
 					if (!ckchs) {
 						if (stat(fp, &buf) == 0) {
-							ckchs = ckchs_load_cert_file(fp, err);
+
+							if (cc.used) {
+								memprintf(err, "%sCan't load '%s'. Using crt-store keyword is not compatible with multi certificates bundle.\n",
+								          err && *err ? *err : "", crt_path);
+								cfgerr |= ERR_ALERT | ERR_FATAL;
+							}
+							ckchs = ckch_store_new_load_files_path(fp, err);
 							if (!ckchs) {
 								cfgerr |= ERR_ALERT | ERR_FATAL;
 								goto error;
@@ -587,6 +678,7 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 
 					entry_dup->node.key = ckchs;
 					entry_dup->crtlist = newlist;
+
 					ebpt_insert(&newlist->entries, &entry_dup->node);
 					LIST_APPEND(&newlist->ord_entries, &entry_dup->by_crtlist);
 					LIST_APPEND(&ckchs->crtlist_entry, &entry_dup->by_ckch_store);
@@ -608,8 +700,15 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 			}
 
 		} else {
+			if (ckch_conf_cmp(&ckchs->conf, &cc, err) != 0) {
+				memprintf(err, "'%s' in crt-list '%s' line %d, is already defined with incompatible parameters:\n %s", crt_path, file, linenum, err ? *err : "");
+				cfgerr |= ERR_ALERT | ERR_FATAL;
+				goto error;
+			}
+
 			entry->node.key = ckchs;
 			entry->crtlist = newlist;
+
 			ebpt_insert(&newlist->entries, &entry->node);
 			LIST_APPEND(&newlist->ord_entries, &entry->by_crtlist);
 			LIST_APPEND(&ckchs->crtlist_entry, &entry->by_ckch_store);
@@ -635,6 +734,8 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 	return cfgerr;
 error:
 	crtlist_entry_free(entry);
+
+	/* FIXME: free cc */
 
 	fclose(f);
 	crtlist_free(newlist);
@@ -675,7 +776,9 @@ int crtlist_load_cert_dir(char *path, struct bind_conf *bind_conf, struct crtlis
 			struct dirent *de = de_list[i];
 
 			end = strrchr(de->d_name, '.');
-			if (end && (strcmp(end, ".issuer") == 0 || strcmp(end, ".ocsp") == 0 || strcmp(end, ".sctl") == 0 || strcmp(end, ".key") == 0))
+			if (end && (de->d_name[0] == '.' ||
+			            strcmp(end, ".issuer") == 0 || strcmp(end, ".ocsp") == 0 ||
+			            strcmp(end, ".sctl") == 0 || strcmp(end, ".key") == 0))
 				goto ignore_entry;
 
 			snprintf(fp, sizeof(fp), "%s/%s", path, de->d_name);
@@ -697,7 +800,7 @@ int crtlist_load_cert_dir(char *path, struct bind_conf *bind_conf, struct crtlis
 
 			ckchs = ckchs_lookup(fp);
 			if (ckchs == NULL)
-				ckchs = ckchs_load_cert_file(fp, err);
+				ckchs = ckch_store_new_load_files_path(fp, err);
 			if (ckchs == NULL) {
 				free(de);
 				free(entry);
@@ -731,21 +834,27 @@ end:
  * Take an ssl_bind_conf structure and append the configuration line used to
  * create it in the buffer
  */
-static void dump_crtlist_sslconf(struct buffer *buf, const struct ssl_bind_conf *conf)
+static void dump_crtlist_conf(struct buffer *buf, const struct ssl_bind_conf *conf, const struct ckch_conf *cc)
 {
 	int space = 0;
 
-	if (conf == NULL)
+	if (conf == NULL && cc->used == 0)
 		return;
 
 	chunk_appendf(buf, " [");
+
+
+	if (conf == NULL)
+		goto dump_ckch;
+
+	/* first dump all ssl_conf keywords */
+
 #ifdef OPENSSL_NPN_NEGOTIATED
 	if (conf->npn_str) {
 		int len = conf->npn_len;
 		char *ptr = conf->npn_str;
 		int comma = 0;
 
-		if (space) chunk_appendf(buf, " ");
 		chunk_appendf(buf, "npn ");
 		while (len) {
 			unsigned short size;
@@ -770,7 +879,10 @@ static void dump_crtlist_sslconf(struct buffer *buf, const struct ssl_bind_conf 
 		int comma = 0;
 
 		if (space) chunk_appendf(buf, " ");
-		chunk_appendf(buf, "alpn ");
+		if (len)
+			chunk_appendf(buf, "alpn ");
+		else
+			chunk_appendf(buf, "no-alpn");
 		while (len) {
 			unsigned short size;
 
@@ -861,6 +973,23 @@ static void dump_crtlist_sslconf(struct buffer *buf, const struct ssl_bind_conf 
 		space++;
 	}
 
+	/* then dump the ckch_conf */
+dump_ckch:
+	if (!cc->used)
+		goto end;
+
+	if (cc->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_OFF) {
+		if (space) chunk_appendf(buf, " ");
+		chunk_appendf(buf, "ocsp-update off");
+		space++;
+	} else if (cc->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_ON) {
+		if (space) chunk_appendf(buf, " ");
+		chunk_appendf(buf, "ocsp-update on");
+		space++;
+	}
+
+end:
+
 	chunk_appendf(buf, "]");
 
 	return;
@@ -883,32 +1012,32 @@ static void dump_crtlist_filters(struct buffer *buf, struct crtlist_entry *entry
 /************************** CLI functions ****************************/
 
 
-/* CLI IO handler for '(show|dump) ssl crt-list' */
+/* CLI IO handler for '(show|dump) ssl crt-list'.
+ * It uses show_crtlist_ctx for the context.
+ */
 static int cli_io_handler_dump_crtlist(struct appctx *appctx)
 {
+	struct show_crtlist_ctx *ctx = appctx->svcctx;
 	struct buffer *trash = alloc_trash_chunk();
-	struct stream_interface *si = appctx->owner;
 	struct ebmb_node *lnode;
 
 	if (trash == NULL)
 		return 1;
 
 	/* dump the list of crt-lists */
-	lnode = appctx->ctx.cli.p1;
+	lnode = ctx->crtlist_node;
 	if (lnode == NULL)
 		lnode = ebmb_first(&crtlists_tree);
 	while (lnode) {
 		chunk_appendf(trash, "%s\n", lnode->key);
-		if (ci_putchk(si_ic(si), trash) == -1) {
-			si_rx_room_blk(si);
+		if (applet_putchk(appctx, trash) == -1)
 			goto yield;
-		}
 		lnode = ebmb_next(lnode);
 	}
 	free_trash_chunk(trash);
 	return 1;
 yield:
-	appctx->ctx.cli.p1 = lnode;
+	ctx->crtlist_node = lnode;
 	free_trash_chunk(trash);
 	return 0;
 }
@@ -916,24 +1045,22 @@ yield:
 /* CLI IO handler for '(show|dump) ssl crt-list <filename>' */
 static int cli_io_handler_dump_crtlist_entries(struct appctx *appctx)
 {
+	struct show_crtlist_ctx *ctx = appctx->svcctx;
 	struct buffer *trash = alloc_trash_chunk();
 	struct crtlist *crtlist;
-	struct stream_interface *si = appctx->owner;
 	struct crtlist_entry *entry;
 
 	if (trash == NULL)
 		return 1;
 
-	crtlist = ebmb_entry(appctx->ctx.cli.p0, struct crtlist, node);
+	crtlist = ebmb_entry(ctx->crtlist_node, struct crtlist, node);
 
-	entry = appctx->ctx.cli.p1;
+	entry = ctx->entry;
 	if (entry == NULL) {
 		entry = LIST_ELEM((crtlist->ord_entries).n, typeof(entry), by_crtlist);
 		chunk_appendf(trash, "# %s\n", crtlist->node.key);
-		if (ci_putchk(si_ic(si), trash) == -1) {
-			si_rx_room_blk(si);
+		if (applet_putchk(appctx, trash) == -1)
 			goto yield;
-		}
 	}
 
 	list_for_each_entry_from(entry, &crtlist->ord_entries, by_crtlist) {
@@ -943,21 +1070,19 @@ static int cli_io_handler_dump_crtlist_entries(struct appctx *appctx)
 		store = entry->node.key;
 		filename = store->path;
 		chunk_appendf(trash, "%s", filename);
-		if (appctx->ctx.cli.i0 == 's') /* show */
+		if (ctx->mode == 's') /* show */
 			chunk_appendf(trash, ":%d", entry->linenum);
-		dump_crtlist_sslconf(trash, entry->ssl_conf);
+		dump_crtlist_conf(trash, entry->ssl_conf, &store->conf);
 		dump_crtlist_filters(trash, entry);
 		chunk_appendf(trash, "\n");
 
-		if (ci_putchk(si_ic(si), trash) == -1) {
-			si_rx_room_blk(si);
+		if (applet_putchk(appctx, trash) == -1)
 			goto yield;
-		}
 	}
 	free_trash_chunk(trash);
 	return 1;
 yield:
-	appctx->ctx.cli.p1 = entry;
+	ctx->entry = entry;
 	free_trash_chunk(trash);
 	return 0;
 }
@@ -965,6 +1090,7 @@ yield:
 /* CLI argument parser for '(show|dump) ssl crt-list' */
 static int cli_parse_dump_crtlist(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_crtlist_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	struct ebmb_node *lnode;
 	char *filename = NULL;
 	int mode;
@@ -972,9 +1098,6 @@ static int cli_parse_dump_crtlist(char **args, char *payload, struct appctx *app
 
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 		return 1;
-
-	appctx->ctx.cli.p0 = NULL;
-	appctx->ctx.cli.p1 = NULL;
 
 	if (*args[3] && strcmp(args[3], "-n") == 0) {
 		mode = 's';
@@ -998,22 +1121,25 @@ static int cli_parse_dump_crtlist(char **args, char *payload, struct appctx *app
 		if (lnode == NULL)
 			return cli_err(appctx, "didn't find the specified filename\n");
 
-		appctx->ctx.cli.p0 = lnode;
+		ctx->crtlist_node = lnode;
 		appctx->io_handler = cli_io_handler_dump_crtlist_entries;
 	}
-	appctx->ctx.cli.i0 = mode;
+	ctx->mode = mode;
 
 	return 0;
 }
 
 /* release function of the  "add ssl crt-list' command, free things and unlock
- the spinlock */
+ * the spinlock. It uses the add_crtlist_ctx.
+ */
 static void cli_release_add_crtlist(struct appctx *appctx)
 {
-	struct crtlist_entry *entry = appctx->ctx.cli.p1;
+	struct add_crtlist_ctx *ctx = appctx->svcctx;
+	struct crtlist_entry *entry = ctx->entry;
 
-	if (appctx->st2 != SETCERT_ST_FIN) {
+	if (entry) {
 		struct ckch_inst *inst, *inst_s;
+
 		/* upon error free the ckch_inst and everything inside */
 		ebpt_delete(&entry->node);
 		LIST_DELETE(&entry->by_crtlist);
@@ -1027,8 +1153,8 @@ static void cli_release_add_crtlist(struct appctx *appctx)
 		free(entry->ssl_conf);
 		free(entry);
 	}
-
 	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
+	ha_free(&ctx->err);
 }
 
 
@@ -1037,127 +1163,135 @@ static void cli_release_add_crtlist(struct appctx *appctx)
  *
  * The logic is the same as the "commit ssl cert" command but without the
  * freeing of the old structures, because there are none.
+ *
+ * It uses the add_crtlist_ctx for the context.
  */
 static int cli_io_handler_add_crtlist(struct appctx *appctx)
 {
+	struct add_crtlist_ctx *ctx = appctx->svcctx;
 	struct bind_conf_list *bind_conf_node;
-	struct stream_interface *si = appctx->owner;
-	struct crtlist *crtlist = appctx->ctx.cli.p0;
-	struct crtlist_entry *entry = appctx->ctx.cli.p1;
+	struct crtlist *crtlist = ctx->crtlist;
+	struct crtlist_entry *entry = ctx->entry;
 	struct ckch_store *store = entry->node.key;
-	struct buffer *trash = alloc_trash_chunk();
 	struct ckch_inst *new_inst;
-	char *err = NULL;
 	int i = 0;
 	int errcode = 0;
-
-	if (trash == NULL)
-		goto error;
 
 	/* for each bind_conf which use the crt-list, a new ckch_inst must be
 	 * created.
 	 */
-	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
-		goto error;
+	switch (ctx->state) {
+	case ADDCRT_ST_INIT:
+		/* This state just print the update message */
+		chunk_printf(&trash, "Inserting certificate '%s' in crt-list '%s'", store->path, crtlist->node.key);
+		if (applet_putchk(appctx, &trash) == -1)
+			goto yield;
+		ctx->state = ADDCRT_ST_GEN;
+		__fallthrough;
+	case ADDCRT_ST_GEN:
+		bind_conf_node = ctx->bind_conf_node; /* get the previous ptr from the yield */
+		if (bind_conf_node == NULL)
+			bind_conf_node = crtlist->bind_conf;
+		for (; bind_conf_node; bind_conf_node = bind_conf_node->next) {
+			struct bind_conf *bind_conf = bind_conf_node->bind_conf;
+			struct sni_ctx *sni;
 
-	while (1) {
-		switch (appctx->st2) {
-			case SETCERT_ST_INIT:
-				/* This state just print the update message */
-				chunk_printf(trash, "Inserting certificate '%s' in crt-list '%s'", store->path, crtlist->node.key);
-				if (ci_putchk(si_ic(si), trash) == -1) {
-					si_rx_room_blk(si);
-					goto yield;
-				}
-				appctx->st2 = SETCERT_ST_GEN;
-				/* fallthrough */
-			case SETCERT_ST_GEN:
-				bind_conf_node = appctx->ctx.cli.p2; /* get the previous ptr from the yield */
-				if (bind_conf_node == NULL)
-					bind_conf_node = crtlist->bind_conf;
-				for (; bind_conf_node; bind_conf_node = bind_conf_node->next) {
-					struct bind_conf *bind_conf = bind_conf_node->bind_conf;
-					struct sni_ctx *sni;
+			ctx->bind_conf_node = bind_conf_node;
 
-					/* yield every 10 generations */
-					if (i > 10) {
-						appctx->ctx.cli.p2 = bind_conf_node;
-						goto yield;
-					}
+			/* yield every 10 generations */
+			if (i > 10) {
+				applet_have_more_data(appctx); /* let's come back later */
+				goto yield;
+			}
 
-					/* we don't support multi-cert bundles, only simple ones */
-					errcode |= ckch_inst_new_load_store(store->path, store, bind_conf, entry->ssl_conf, entry->filters, entry->fcount, &new_inst, &err);
-					if (errcode & ERR_CODE)
+			/* display one dot for each new instance */
+			if (applet_putstr(appctx, ".") == -1)
+				goto yield;
+
+			/* we don't support multi-cert bundles, only simple ones */
+			ctx->err = NULL;
+			errcode |= ckch_inst_new_load_store(store->path, store, bind_conf, entry->ssl_conf, entry->filters, entry->fcount, 0, &new_inst, &ctx->err);
+			if (errcode & ERR_CODE) {
+				ctx->state = ADDCRT_ST_ERROR;
+				goto error;
+			}
+
+			/* we need to initialize the SSL_CTX generated */
+			/* this iterate on the newly generated SNIs in the new instance to prepare their SSL_CTX */
+			list_for_each_entry(sni, &new_inst->sni_ctx, by_ckch_inst) {
+				if (!sni->order) { /* we initialized only the first SSL_CTX because it's the same in the other sni_ctx's */
+					ctx->err = NULL;
+					errcode |= ssl_sock_prep_ctx_and_inst(bind_conf, new_inst->ssl_conf, sni->ctx, sni->ckch_inst, &ctx->err);
+					if (errcode & ERR_CODE) {
+						ctx->state = ADDCRT_ST_ERROR;
 						goto error;
-
-					/* we need to initialize the SSL_CTX generated */
-					/* this iterate on the newly generated SNIs in the new instance to prepare their SSL_CTX */
-					list_for_each_entry(sni, &new_inst->sni_ctx, by_ckch_inst) {
-						if (!sni->order) { /* we initialized only the first SSL_CTX because it's the same in the other sni_ctx's */
-							errcode |= ssl_sock_prep_ctx_and_inst(bind_conf, new_inst->ssl_conf, sni->ctx, sni->ckch_inst, &err);
-							if (errcode & ERR_CODE)
-								goto error;
-						}
 					}
-					/* display one dot for each new instance */
-					chunk_appendf(trash, ".");
-					i++;
-					LIST_APPEND(&store->ckch_inst, &new_inst->by_ckchs);
-					LIST_APPEND(&entry->ckch_inst, &new_inst->by_crtlist_entry);
-					new_inst->crtlist_entry = entry;
 				}
-				appctx->st2 = SETCERT_ST_INSERT;
-				/* fallthrough */
-			case SETCERT_ST_INSERT:
-				/* insert SNIs in bind_conf */
-				list_for_each_entry(new_inst, &store->ckch_inst, by_ckchs) {
-					HA_RWLOCK_WRLOCK(SNI_LOCK, &new_inst->bind_conf->sni_lock);
-					ssl_sock_load_cert_sni(new_inst, new_inst->bind_conf);
-					HA_RWLOCK_WRUNLOCK(SNI_LOCK, &new_inst->bind_conf->sni_lock);
-				}
-				entry->linenum = ++crtlist->linecount;
-				appctx->st2 = SETCERT_ST_FIN;
-				goto end;
+			}
+
+			i++;
+			LIST_APPEND(&store->ckch_inst, &new_inst->by_ckchs);
+			LIST_APPEND(&entry->ckch_inst, &new_inst->by_crtlist_entry);
+			new_inst->crtlist_entry = entry;
 		}
+		ctx->state = ADDCRT_ST_INSERT;
+		__fallthrough;
+	case ADDCRT_ST_INSERT:
+		/* the insertion is called for every instance of the store, not
+		 * only the one we generated.
+		 * But the ssl_sock_load_cert_sni() skip the sni already
+		 * inserted. Not every instance has a bind_conf, it could be
+		 * the store of a server so we should be careful */
+
+		list_for_each_entry(new_inst, &store->ckch_inst, by_ckchs) {
+			if (!new_inst->bind_conf) /* this is a server instance */
+				continue;
+			HA_RWLOCK_WRLOCK(SNI_LOCK, &new_inst->bind_conf->sni_lock);
+			ssl_sock_load_cert_sni(new_inst, new_inst->bind_conf);
+			HA_RWLOCK_WRUNLOCK(SNI_LOCK, &new_inst->bind_conf->sni_lock);
+		}
+		entry->linenum = ++crtlist->linecount;
+		ctx->entry = NULL;
+		ctx->state = ADDCRT_ST_SUCCESS;
+		__fallthrough;
+	case ADDCRT_ST_SUCCESS:
+		chunk_reset(&trash);
+		chunk_appendf(&trash, "\n");
+		if (ctx->err)
+			chunk_appendf(&trash, "%s", ctx->err);
+		chunk_appendf(&trash, "Success!\n");
+		if (applet_putchk(appctx, &trash) == -1)
+			goto yield;
+		ctx->state = ADDCRT_ST_FIN;
+		break;
+
+	case ADDCRT_ST_ERROR:
+	  error:
+		chunk_printf(&trash, "\n%sFailed!\n", ctx->err);
+		if (applet_putchk(appctx, &trash) == -1)
+			goto yield;
+		break;
+
+	default:
+		break;
 	}
 
 end:
-	chunk_appendf(trash, "\n");
-	if (errcode & ERR_WARN)
-		chunk_appendf(trash, "%s", err);
-	chunk_appendf(trash, "Success!\n");
-	if (ci_putchk(si_ic(si), trash) == -1)
-		si_rx_room_blk(si);
-	free_trash_chunk(trash);
 	/* success: call the release function and don't come back */
 	return 1;
 yield:
-	/* store the state */
-	if (ci_putchk(si_ic(si), trash) == -1)
-		si_rx_room_blk(si);
-	free_trash_chunk(trash);
-	si_rx_endp_more(si); /* let's come back later */
 	return 0; /* should come back */
-
-error:
-	/* spin unlock and free are done in the release function */
-	if (trash) {
-		chunk_appendf(trash, "\n%sFailed!\n", err);
-		if (ci_putchk(si_ic(si), trash) == -1)
-			si_rx_room_blk(si);
-		free_trash_chunk(trash);
-	}
-	/* error: call the release function and don't come back */
-	return 1;
 }
 
 
 /*
  * Parse a "add ssl crt-list <crt-list> <certfile>" line.
- * Filters and option must be passed through payload:
+ * Filters and option must be passed through payload.
+ * It sets a struct add_crtlist_ctx.
  */
 static int cli_parse_add_crtlist(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct add_crtlist_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	int cfgerr = 0;
 	struct ckch_store *store;
 	char *err = NULL;
@@ -1168,6 +1302,7 @@ static int cli_parse_add_crtlist(char **args, char *payload, struct appctx *appc
 	struct ebpt_node *inserted;
 	struct crtlist *crtlist;
 	struct crtlist_entry *entry = NULL;
+	struct ckch_conf cc = {};
 	char *end;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
@@ -1198,6 +1333,7 @@ static int cli_parse_add_crtlist(char **args, char *payload, struct appctx *appc
 		goto error;
 	}
 
+
 	if (payload) {
 		char *lf;
 
@@ -1207,7 +1343,7 @@ static int cli_parse_add_crtlist(char **args, char *payload, struct appctx *appc
 			goto error;
 		}
 		/* cert_path is filled here */
-		cfgerr |= crtlist_parse_line(payload, &cert_path, entry, "CLI", 1, 1, &err);
+		cfgerr |= crtlist_parse_line(payload, &cert_path, entry, &cc, "CLI", 1, 1, &err);
 		if (cfgerr & ERR_CODE)
 			goto error;
 	} else {
@@ -1238,13 +1374,13 @@ static int cli_parse_add_crtlist(char **args, char *payload, struct appctx *appc
 		*slash = '/';
 	}
 
-	if (*cert_path != '/' && global_ssl.crt_base) {
-		if ((strlen(global_ssl.crt_base) + 1 + strlen(cert_path)) > MAXPATHLEN) {
+	if (*cert_path != '@' && *cert_path != '/' && global_ssl.crt_base) {
+		if ((strlen(global_ssl.crt_base) + 1 + strlen(cert_path)) > sizeof(path) ||
+		    snprintf(path, sizeof(path), "%s/%s",  global_ssl.crt_base, cert_path) > sizeof(path)) {
 			memprintf(&err, "'%s' : path too long", cert_path);
 			cfgerr |= ERR_ALERT | ERR_FATAL;
 			goto error;
 		}
-		snprintf(path, sizeof(path), "%s/%s",  global_ssl.crt_base, cert_path);
 		cert_path = path;
 	}
 
@@ -1253,8 +1389,26 @@ static int cli_parse_add_crtlist(char **args, char *payload, struct appctx *appc
 		memprintf(&err, "certificate '%s' does not exist!", cert_path);
 		goto error;
 	}
-	if (store->ckch == NULL || store->ckch->cert == NULL) {
+	if (store->data == NULL || store->data->cert == NULL) {
 		memprintf(&err, "certificate '%s' is empty!", cert_path);
+		goto error;
+	}
+
+	/* We can use a crt-store keyword when:
+	 * - no ckch_inst are linked OR
+	 * - ckch_inst are linked but exact same ckch_conf is used.
+	 */
+	if (LIST_ISEMPTY(&store->ckch_inst)) {
+
+		store->conf = cc;
+		/* fresh new, run more init (for example init ocsp-update tasks) */
+		cfgerr |= ckch_store_load_files(&cc, store, 1, &err);
+		if (cfgerr & ERR_FATAL)
+			goto error;
+
+	} else if (ckch_conf_cmp(&store->conf, &cc, &err) != 0) {
+		memprintf(&err, "'%s' is already instantiated with incompatible parameters:\n %s", cert_path, err ? err : "");
+		cfgerr |= ERR_ALERT | ERR_FATAL;
 		goto error;
 	}
 
@@ -1267,8 +1421,8 @@ static int cli_parse_add_crtlist(char **args, char *payload, struct appctx *appc
 	}
 
 	/* this is supposed to be a directory (EB_ROOT_UNIQUE), so no ssl_conf are allowed */
-	if ((entry->ssl_conf || entry->filters) && eb_gettag(crtlist->entries.b[EB_RGHT])) {
-		memprintf(&err, "this is a directory, SSL configuration and filters are not allowed");
+	if ((entry->ssl_conf || entry->filters || cc.used) && eb_gettag(crtlist->entries.b[EB_RGHT])) {
+		memprintf(&err, "this is a directory, SSL configuration, crt-store keywords and filters are not allowed");
 		goto error;
 	}
 
@@ -1276,14 +1430,15 @@ static int cli_parse_add_crtlist(char **args, char *payload, struct appctx *appc
 	entry->crtlist = crtlist;
 	LIST_APPEND(&store->crtlist_entry, &entry->by_ckch_store);
 
-	appctx->st2 = SETCERT_ST_INIT;
-	appctx->ctx.cli.p0 = crtlist;
-	appctx->ctx.cli.p1 = entry;
+	ctx->state = ADDCRT_ST_INIT;
+	ctx->crtlist = crtlist;
+	ctx->entry = entry;
 
 	/* unlock is done in the release handler */
 	return 0;
 
 error:
+	ckch_conf_clean(&cc);
 	crtlist_entry_free(entry);
 	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
 	err = memprintf(&err, "Can't edit the crt-list: %s\n", err ? err : "");
@@ -1348,7 +1503,7 @@ static int cli_parse_del_crtlist(char **args, char *payload, struct appctx *appc
 		memprintf(&err, "certificate '%s' does not exist!", cert_path);
 		goto error;
 	}
-	if (store->ckch == NULL || store->ckch->cert == NULL) {
+	if (store->data == NULL || store->data->cert == NULL) {
 		memprintf(&err, "certificate '%s' is empty!", cert_path);
 		goto error;
 	}
@@ -1407,7 +1562,6 @@ static int cli_parse_del_crtlist(char **args, char *payload, struct appctx *appc
 
 	list_for_each_entry_safe(inst, inst_s, &entry->ckch_inst, by_crtlist_entry) {
 		struct sni_ctx *sni, *sni_s;
-		struct ckch_inst_link_ref *link_ref, *link_ref_s;
 
 		HA_RWLOCK_WRLOCK(SNI_LOCK, &inst->bind_conf->sni_lock);
 		list_for_each_entry_safe(sni, sni_s, &inst->sni_ctx, by_ckch_inst) {
@@ -1417,13 +1571,7 @@ static int cli_parse_del_crtlist(char **args, char *payload, struct appctx *appc
 			free(sni);
 		}
 		HA_RWLOCK_WRUNLOCK(SNI_LOCK, &inst->bind_conf->sni_lock);
-		LIST_DELETE(&inst->by_ckchs);
-		list_for_each_entry_safe(link_ref, link_ref_s, &inst->cafile_link_refs, list) {
-			LIST_DELETE(&link_ref->link->list);
-			LIST_DELETE(&link_ref->list);
-			free(link_ref);
-		}
-		free(inst);
+		ckch_inst_free(inst);
 	}
 
 	crtlist_free_filters(entry->filters);
@@ -1467,4 +1615,3 @@ static struct cli_kw_list cli_kws = {{ },{
 };
 
 INITCALL1(STG_REGISTER, cli_register_kw, &cli_kws);
-

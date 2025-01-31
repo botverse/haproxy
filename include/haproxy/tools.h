@@ -23,10 +23,11 @@
 #define _HAPROXY_TOOLS_H
 
 #ifdef USE_BACKTRACE
+// for backtrace() on Linux
 #define _GNU_SOURCE
-#include <execinfo.h>
 #endif
 
+#include <errno.h>
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
@@ -42,9 +43,14 @@
 #include <haproxy/api.h>
 #include <haproxy/chunk.h>
 #include <haproxy/intops.h>
+#include <haproxy/global.h>
 #include <haproxy/namespace-t.h>
 #include <haproxy/protocol-t.h>
 #include <haproxy/tools-t.h>
+
+#if defined(USE_BACKTRACE) && defined(HA_HAVE_WORKING_BACKTRACE)
+#include <execinfo.h>
+#endif
 
 /****** string-specific macros and functions ******/
 /* if a > max, then bound <a> to <max>. The macro returns the new <a> */
@@ -54,6 +60,19 @@
 #define LBOUND(a, min)	({ typeof(a) b = (min); if ((a) < b) (a) = b; (a); })
 
 #define SWAP(a, b) do { typeof(a) t; t = a; a = b; b = t; } while(0)
+
+/* use if you want to return a simple hash. Key 0 doesn't hash. */
+#define HA_ANON_STR(key, str) hash_anon(key, str, "", "")
+
+/* use if you want to return a hash like : ID('hash'). Key 0 doesn't hash. */
+#define HA_ANON_ID(key, str) hash_anon(key, str, "ID(", ")")
+
+/* use if you want to return a hash like : PATH('hash'). Key 0 doesn't hash. */
+#define HA_ANON_PATH(key, str) hash_anon(key, str, "PATH(", ")")
+
+/* use only in a function that contains an appctx (key comes from appctx). */
+#define HA_ANON_CLI(str) hash_anon(appctx->cli_anon_key, str, "", "")
+
 
 /*
  * copies at most <size-1> chars from <src> to <dst>. Last char is always
@@ -65,11 +84,27 @@
 extern int strlcpy2(char *dst, const char *src, int size);
 
 /*
+ * portable equivalent to POSIX strnlen():
+ * returns the number of bytes in the string pointed to by <s>, excluding
+ * the terminating null byte, but at most <maxlen>. The function does not
+ * look at characters passed <maxlen>.
+ */
+static inline size_t strnlen2(const char *s, size_t maxlen)
+{
+	size_t len;
+
+	for (len = 0; len < maxlen && s[len]; len++)
+		;
+	return len;
+}
+
+/*
  * This function simply returns a locally allocated string containing
  * the ascii representation for number 'n' in decimal.
  */
 extern THREAD_LOCAL int itoa_idx; /* index of next itoa_str to use */
 extern THREAD_LOCAL char itoa_str[][171];
+extern int build_is_static;
 extern char *ultoa_r(unsigned long n, char *buffer, int size);
 extern char *lltoa_r(long long int n, char *buffer, int size);
 extern char *sltoa_r(long n, char *buffer, int size);
@@ -79,6 +114,18 @@ char *ftoa_r(double n, char *buffer, int size);
 static inline const char *ultoa(unsigned long n)
 {
 	return ultoa_r(n, itoa_str[0], sizeof(itoa_str[0]));
+}
+
+/* file names management */
+const char *copy_file_name(const char *name);
+void free_all_file_names();
+
+/* This is only used as a marker for call places where a free() of a file name
+ * is expected to be performed, and to reset the pointer.
+ */
+static inline void drop_file_name(const char **name)
+{
+	*name = NULL;
 }
 
 /*
@@ -270,8 +317,8 @@ static inline int is_idchar(char c)
  * address (typically the path to a unix socket).
  */
 struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int *high, int *fd,
-                                      struct protocol **proto, char **err,
-                                      const char *pfx, char **fqdn, unsigned int opts);
+                                      struct protocol **proto, struct net_addr_type *sa_type,
+                                      char **err, const char *pfx, char **fqdn, int *alt, unsigned int opts);
 
 
 /* converts <addr> and <port> into a string representation of the address and port. This is sort
@@ -385,13 +432,14 @@ int addr_is_local(const struct netns_entry *ns,
  * <map> with the hexadecimal representation of their ASCII-code (2 digits)
  * prefixed by <escape>, and will store the result between <start> (included)
  * and <stop> (excluded), and will always terminate the string with a '\0'
- * before <stop>. The position of the '\0' is returned if the conversion
- * completes. If bytes are missing between <start> and <stop>, then the
- * conversion will be incomplete and truncated. If <stop> <= <start>, the '\0'
- * cannot even be stored so we return <start> without writing the 0.
+ * before <stop>. If bytes are missing between <start> and <stop>, then the
+ * conversion will be incomplete and truncated.
  * The input string must also be zero-terminated.
+ *
+ * Return the address of the \0 character, or NULL on error
  */
 extern const char hextab[];
+extern long query_encode_map[];
 char *encode_string(char *start, char *stop,
 		    const char escape, const long *map,
 		    const char *string);
@@ -405,27 +453,36 @@ char *encode_chunk(char *start, char *stop,
 
 /*
  * Tries to prefix characters tagged in the <map> with the <escape>
- * character. The input <string> must be zero-terminated. The result will
+ * character. The input <string> is processed until string_stop
+ * is reached or NULL-byte is encountered. The result will
  * be stored between <start> (included) and <stop> (excluded). This
  * function will always try to terminate the resulting string with a '\0'
- * before <stop>, and will return its position if the conversion
- * completes.
+ * before <stop>.
+ *
+ * Return the address of the \0 character, or NULL on error
  */
 char *escape_string(char *start, char *stop,
 		    const char escape, const long *map,
-		    const char *string);
+		    const char *string, const char *string_stop);
 
-/*
- * Tries to prefix characters tagged in the <map> with the <escape>
- * character. <chunk> contains the input to be escaped. The result will be
- * stored between <start> (included) and <stop> (excluded). The function
- * will always try to terminate the resulting string with a '\0' before
- * <stop>, and will return its position if the conversion completes.
+/* Below are RFC8949 compliant cbor encode helper functions, see source
+ * file for functions descriptions
  */
-char *escape_chunk(char *start, char *stop,
-                   const char escape, const long *map,
-                   const struct buffer *chunk);
-
+char *cbor_encode_uint64_prefix(struct cbor_encode_ctx *ctx,
+                                char *start, char *stop,
+                                uint64_t value, uint8_t prefix);
+char *cbor_encode_int64(struct cbor_encode_ctx *ctx,
+                        char *start, char *stop, int64_t value);
+char *cbor_encode_bytes_prefix(struct cbor_encode_ctx *ctx,
+                               char *start, char *stop,
+                               const char *bytes, size_t len,
+                               uint8_t prefix);
+char *cbor_encode_bytes(struct cbor_encode_ctx *ctx,
+                        char *start, char *stop,
+                        const char *bytes, size_t len);
+char *cbor_encode_text(struct cbor_encode_ctx *ctx,
+                       char *start, char *stop,
+                       const char *text, size_t len);
 
 /* Check a string for using it in a CSV output format. If the string contains
  * one of the following four char <">, <,>, CR or LF, the string is
@@ -437,10 +494,18 @@ char *escape_chunk(char *start, char *stop,
  * It is useful if the escaped string is used between double quotes in the
  * format.
  *
- *    printf("..., \"%s\", ...\r\n", csv_enc(str, 0, &trash));
+ *    printf("..., \"%s\", ...\r\n", csv_enc(str, 0, 0, &trash));
  *
  * If <quote> is 1, the converter puts the quotes only if any character is
  * escaped. If <quote> is 2, the converter always puts the quotes.
+ *
+ * If <oneline> is not 0, CRs are skipped and LFs are replaced by spaces.
+ * This re-format multi-lines strings to only one line. The purpose is to
+ * allow a line by line parsing but also to keep the output compliant with
+ * the CLI witch uses LF to defines the end of the response.
+ *
+ * If <oneline> is 2, In addition to previous action, the trailing spaces are
+ * removed.
  *
  * <output> is a struct chunk used for storing the output string.
  *
@@ -454,14 +519,15 @@ char *escape_chunk(char *start, char *stop,
  * This function appends the encoding to the existing output chunk. Please
  * use csv_enc() instead if you want to replace the output chunk.
  */
-const char *csv_enc_append(const char *str, int quote, struct buffer *output);
+const char *csv_enc_append(const char *str, int quote, int online,
+			   struct buffer *output);
 
 /* same as above but the output chunk is reset first */
-static inline const char *csv_enc(const char *str, int quote,
+static inline const char *csv_enc(const char *str, int quote, int oneline,
 				  struct buffer *output)
 {
 	chunk_reset(output);
-	return csv_enc_append(str, quote, output);
+	return csv_enc_append(str, quote, oneline, output);
 }
 
 /* Decode an URL-encoded string in-place. The resulting string might
@@ -478,6 +544,12 @@ int url_decode(char *string, int in_form);
 unsigned int inetaddr_host(const char *text);
 unsigned int inetaddr_host_lim(const char *text, const char *stop);
 unsigned int inetaddr_host_lim_ret(char *text, char *stop, char **ret);
+
+/* Function that hashes or not a string according to the anonymizing key (scramble). */
+const char *hash_anon(uint32_t scramble, const char *string2hash, const char *prefix, const char *suffix);
+
+/* Function that hashes or not an ip according to the ipstring entered */
+const char * hash_ipanon(uint32_t scramble, char *ipstring, int hasport);
 
 static inline char *cut_crlf(char *s) {
 
@@ -571,7 +643,26 @@ extern time_t my_timegm(const struct tm *tm);
  * <ret> is left untouched.
  */
 extern const char *parse_time_err(const char *text, unsigned *ret, unsigned unit_flags);
-extern const char *parse_size_err(const char *text, unsigned *ret);
+extern const char *parse_size_ui(const char *text, unsigned *ret);
+extern const char *parse_size_ull(const char *text, ullong *ret);
+
+/* Parse a size from <_test> into <_ret> which must be compatible with a
+ * uint or ullong. The return value is a pointer to the first unparsable
+ * character (if any) or NULL if everything's OK.
+ */
+#define parse_size_err(_text, _ret) ({			\
+	const char *_err;				\
+	if (sizeof(*(_ret)) > sizeof(int)) {		\
+		unsigned long long _tmp;		\
+		_err = parse_size_ull(_text, &_tmp);	\
+		*_ret = _tmp;				\
+	} else {					\
+		unsigned int _tmp;			\
+		_err = parse_size_ui(_text, &_tmp);	\
+		*_ret = _tmp;				\
+	}						\
+	_err;						\
+})
 
 /*
  * Parse binary string written in hexadecimal (source) and store the decoded
@@ -614,6 +705,10 @@ unsigned int get_next_id(struct eb_root *root, unsigned int key);
  */
 void eb32sc_to_file(FILE *file, struct eb_root *root, const struct eb32sc_node *subj,
                     int op, const char *desc);
+
+/* same but for ebmb */
+void ebmb_to_file(FILE *file, struct eb_root *root, const struct ebmb_node *subj,
+                  int op, const char *desc);
 
 /* This function compares a sample word possibly followed by blanks to another
  * clean word. The compare is case-insensitive. 1 is returned if both are equal,
@@ -666,7 +761,11 @@ static inline int is_inet_addr(const struct sockaddr_storage *addr)
  */
 static inline int is_addr(const struct sockaddr_storage *addr)
 {
-	if (addr->ss_family == AF_UNIX || addr->ss_family == AF_CUST_SOCKPAIR)
+	/* WT: ideally we should use real_family(addr->ss_family) here, but we
+	 * have so few custom addresses that it's simple enough to test them all.
+	 */
+	if (addr->ss_family == AF_UNIX || addr->ss_family == AF_CUST_ABNS ||
+	    addr->ss_family == AF_CUST_ABNSZ || addr->ss_family == AF_CUST_SOCKPAIR)
 		return 1;
 	else
 		return is_inet_addr(addr);
@@ -705,7 +804,16 @@ static inline int get_addr_len(const struct sockaddr_storage *addr)
 	case AF_INET6:
 		return sizeof(struct sockaddr_in6);
 	case AF_UNIX:
+	case AF_CUST_ABNS:
 		return sizeof(struct sockaddr_un);
+	case AF_CUST_ABNSZ:
+		{
+			const struct sockaddr_un *un = (struct sockaddr_un *)addr;
+
+			/* stop at first NULL-byte */
+			return offsetof(struct sockaddr_un, sun_path) + 1 +
+			       strnlen2(un->sun_path + 1, sizeof(un->sun_path) - 1);
+		}
 	}
 	return 0;
 }
@@ -738,6 +846,21 @@ static inline int set_host_port(struct sockaddr_storage *addr, int port)
 	return 0;
 }
 
+/* Returns true if <addr> port is forbidden as client source using <proto>. */
+static inline int port_is_restricted(const struct sockaddr_storage *addr,
+                                     enum ha_proto proto)
+{
+	const uint16_t port = get_host_port(addr);
+
+	BUG_ON_HOT(proto != HA_PROTO_TCP && proto != HA_PROTO_QUIC);
+
+	/* RFC 6335 6. Port Number Ranges */
+	if (unlikely(port < 1024 && port > 0))
+		return !(global.clt_privileged_ports & proto);
+
+	return 0;
+}
+
 /* Convert mask from bit length form to in_addr form.
  * This function never fails.
  */
@@ -762,11 +885,13 @@ extern void v4tov6(struct in6_addr *sin6_addr, struct in_addr *sin_addr);
  */
 extern int v6tov4(struct in_addr *sin_addr, struct in6_addr *sin6_addr);
 
-/* compare two struct sockaddr_storage and return:
+/* compare two struct sockaddr_storage, including port if <check_port> is true,
+ * and return:
  *  0 (true)  if the addr is the same in both
  *  1 (false) if the addr is not the same in both
+ *  -1 (unable) if one of the addr is not AF_INET*
  */
-int ipcmp(struct sockaddr_storage *ss1, struct sockaddr_storage *ss2);
+int ipcmp(const struct sockaddr_storage *ss1, const struct sockaddr_storage *ss2, int check_port);
 
 /* compare a struct sockaddr_storage to a struct net_addr and return :
  *  0 (true)  if <addr> is matching <net>
@@ -779,7 +904,12 @@ int ipcmp2net(const struct sockaddr_storage *addr, const struct net_addr *net);
  * the caller must clear <dest> before calling.
  * Returns a pointer to the destination
  */
-struct sockaddr_storage *ipcpy(struct sockaddr_storage *source, struct sockaddr_storage *dest);
+struct sockaddr_storage *ipcpy(const struct sockaddr_storage *source, struct sockaddr_storage *dest);
+
+/* Copy only the IP address from <saddr> socket address data into <buf> buffer. *
+ * Return the number of bytes copied.
+ */
+size_t ipaddrcpy(unsigned char *buf, const struct sockaddr_storage *saddr);
 
 char *human_time(int t, short hz_div);
 
@@ -891,16 +1021,38 @@ int my_unsetenv(const char *name);
  * some expansion is made.
  */
 char *env_expand(char *in);
+int is_path_mode(mode_t mode, const char *path_fmt, ...);
+int is_file_present(const char *path_fmt, ...);
+int is_dir_present(const char *path_fmt, ...);
 uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbargs, uint32_t opts, const char **errptr);
+ssize_t read_line_to_trash(const char *path_fmt, ...);
 size_t sanitize_for_printing(char *line, size_t pos, size_t width);
 void update_word_fingerprint(uint8_t *fp, const char *word);
 void make_word_fingerprint(uint8_t *fp, const char *word);
 int word_fingerprint_distance(const uint8_t *fp1, const uint8_t *fp2);
 
 /* debugging macro to emit messages using write() on fd #-1 so that strace sees
- * them.
+ * them. It relies on variadic macros with optional arguments so that any
+ * number of argument is accepted. If at least one argument is passed, the
+ * first one is a format string and the other ones are the arguments, exactly
+ * like printf(). The macro always prepends the function name and the location
+ * as file:line between square brackets on any line. If no format string is
+ * passed, then "\n" is used. Otherwise the caller has to deal with \n itself
+ * (format or data).
  */
-#define fddebug(msg...) do { char *_m = NULL; memprintf(&_m, ##msg); if (_m) write(-1, _m, strlen(_m)); free(_m); } while (0)
+#define fddebug(...) __fddebug(__VA_ARGS__)
+#define _fddebug(fmt, msg...) __fddebug("" ##fmt, ##msg)
+#define __fddebug(fmt, msg...) do {					\
+		char *_m = NULL;					\
+		memprintf(&_m,						\
+			  (""fmt)[0] ?					\
+			  ("[%s@%s:%d] " fmt) :				\
+			  ("[%s@%s:%d]\n"), __func__,			\
+			  __FILE__, __LINE__, ##msg);			\
+		if (_m)							\
+			write(-1, _m, strlen(_m));			\
+		free(_m);						\
+	} while (0)
 
 /* displays a <len> long memory block at <buf>, assuming first byte of <buf>
  * has address <baseaddr>. String <pfx> may be placed as a prefix in front of
@@ -914,6 +1066,8 @@ void calltrace(char *fmt, ...);
 
 /* same as strstr() but case-insensitive */
 const char *strnistr(const char *str1, int len_str1, const char *str2, int len_str2);
+
+int strordered(const char *s1, const char *s2, const char *s3);
 
 /* after increasing a pointer value, it can exceed the first buffer
  * size. This function transform the value of <ptr> according with
@@ -970,20 +1124,22 @@ static inline unsigned long long rdtsc()
  * The caller is responsible for freeing the <err> and <str> copy
  * memory area using free()
  */
-struct list;
-int list_append_word(struct list *li, const char *str, char **err);
 
 int dump_text(struct buffer *out, const char *buf, int bsize);
 int dump_binary(struct buffer *out, const char *buf, int bsize);
 int dump_text_line(struct buffer *out, const char *buf, int bsize, int len,
                    int *line, int ptr);
 void dump_addr_and_bytes(struct buffer *buf, const char *pfx, const void *addr, int n);
+void dump_area_with_syms(struct buffer *output, const void *base, const void *addr,
+                         const void *special, const char *spec_type, const char *spec_name);
 void dump_hex(struct buffer *out, const char *pfx, const void *buf, int len, int unsafe);
 int may_access(const void *ptr);
 const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *addr);
+const void *resolve_dso_name(struct buffer *buf, const char *pfx, const void *addr);
 const char *get_exec_path(void);
 void *get_sym_curr_addr(const char *name);
 void *get_sym_next_addr(const char *name);
+int dump_libs(struct buffer *output, int with_addr);
 
 /* Note that this may result in opening libgcc() on first call, so it may need
  * to have been called once before chrooting.
@@ -1024,7 +1180,8 @@ static inline void *my_realloc2(void *ptr, size_t size)
 int parse_dotted_uints(const char *s, unsigned int **nums, size_t *sz);
 
 /* PRNG */
-void ha_generate_uuid(struct buffer *output);
+void ha_generate_uuid_v4(struct buffer *output);
+void ha_generate_uuid_v7(struct buffer *output);
 void ha_random_seed(const unsigned char *seed, size_t len);
 void ha_random_jump96(uint32_t dist);
 uint64_t ha_random64(void);
@@ -1059,8 +1216,56 @@ static inline unsigned int statistical_prng()
  */
 static inline uint statistical_prng_range(uint range)
 {
-	return mul32hi(statistical_prng(), range);
+	return mul32hi(statistical_prng(), range ? range - 1 : 0);
 }
+
+/* returns a hash on <bits> bits of pointer <p> that is suitable for being used
+ * to compute statistic buckets, in that it's fast and reasonably distributed
+ * thanks to mixing the bits via a multiplication by a prime number and using
+ * the middle bits on 64-bit platforms or remixing the topmost with lowest ones
+ * on 32-bit. The distribution is smooth enough for the hash to provide on
+ * average 1/e non-colliding entries per input, and use on average 1-1/e
+ * entries total. Thus for example hashing 1024 random valid pointers will
+ * result on average in ~647 distinct keys, 377 of which are unique. It was
+ * carefully selected to deliver optimal distribution for low bit counts so
+ * that hashing on 2,3,4 or 5 bits delivers good results.
+ */
+static forceinline uint ptr_hash(const void *p, const int bits)
+{
+	unsigned long long x = (unsigned long)p;
+
+	if (!bits)
+		return 0;
+
+	x *= 0xacd1be85U;
+	if (sizeof(long) == 4)
+		x ^= x >> 32;
+	else
+		x >>= 31 - (bits + 1) / 2;
+	return x & (~0U >> (-bits & 31));
+}
+
+/* Same as above but works on two pointers. It will return the same values
+ * if the second pointer is NULL.
+ */
+static forceinline uint ptr2_hash(const void *p1, const void *p2, const int bits)
+{
+	unsigned long long x = (unsigned long)p1;
+	unsigned long long y = (unsigned long)p2;
+
+	if (!bits)
+		return 0;
+
+	x *= 0xacd1be85U;
+	y *= 0x9d28e4e9U;
+	x ^= y;
+	if (sizeof(long) == 4)
+		x ^= x >> 32;
+	else
+		x >>= 33 - bits / 2;
+	return x & (~0U >> (-bits & 31));
+}
+
 
 /* Update array <fp> with the character transition <prev> to <curr>. If <prev>
  * is zero, it's assumed that <curr> is the first character. If <curr> is zero
@@ -1076,7 +1281,7 @@ static inline void update_char_fingerprint(uint8_t *fp, char prev, char curr)
 	switch (prev) {
 	case 0:         from = 28; break; // begin
 	case 'a'...'z': from = prev - 'a' + 1; break;
-	case 'A'...'Z': from = tolower(prev) - 'a' + 1; break;
+	case 'A'...'Z': from = tolower((unsigned char)prev) - 'a' + 1; break;
 	case '0'...'9': from = 27; break;
 	default:        from = 28; break;
 	}
@@ -1084,7 +1289,7 @@ static inline void update_char_fingerprint(uint8_t *fp, char prev, char curr)
 	switch (curr) {
 	case 0:         to = 28; break; // end
 	case 'a'...'z': to = curr - 'a' + 1; break;
-	case 'A'...'Z': to = tolower(curr) - 'a' + 1; break;
+	case 'A'...'Z': to = tolower((unsigned char)curr) - 'a' + 1; break;
 	case '0'...'9': to = 27; break;
 	default:        to = 28; break;
 	}
@@ -1093,10 +1298,93 @@ static inline void update_char_fingerprint(uint8_t *fp, char prev, char curr)
 	fp[32 * from + to]++;
 }
 
+/* checks that the numerical argument, if passed without units and is non-zero,
+ * is at least as large as value <min>. It returns 1 if the value is too small,
+ * otherwise zero. This is used to warn about the use of small values without
+ * units.
+ */
+static inline int warn_if_lower(const char *text, long min)
+{
+	int digits;
+	long value;
+
+	digits = strspn(text, "0123456789");
+	if (digits < strlen(text))
+		return 0; // there are non-digits here.
+
+	value = atol(text);
+	return value && value < min;
+}
 
 /* compare the current OpenSSL version to a string */
 int openssl_compare_current_version(const char *version);
 /* compare the current OpenSSL name to a string */
 int openssl_compare_current_name(const char *name);
+
+/* vma helpers */
+void vma_set_name(void *addr, size_t size, const char *type, const char *name);
+void vma_set_name_id(void *addr, size_t size, const char *type, const char *name, unsigned int id);
+
+/* cfgparse helpers */
+char *fgets_from_mem(char* buf, int size, const char **position, const char *end);
+
+/* helpers to backup/clean/restore process env */
+int backup_env(void);
+int clean_env(void);
+int restore_env(void);
+
+/* helper to print the name of errno's corresponding macro (for example "EINVAL"
+ * for errno=22) instead of calling strerror(errno).
+ */
+#define CASE_ERR(err) \
+	case err: return #err
+
+static inline const char *errname(int err_num, char **out)
+{
+	/* only currently used errno values, please, add a new one, if you
+	 * start using it in the code.
+	 */
+	switch (err_num) {
+	case 0: return "SUCCESS";
+	CASE_ERR(EPERM);
+	CASE_ERR(ENOENT);
+	CASE_ERR(EINTR);
+	CASE_ERR(EIO);
+	CASE_ERR(E2BIG);
+	CASE_ERR(EBADF);
+	CASE_ERR(ECHILD);
+	CASE_ERR(EAGAIN);
+	CASE_ERR(ENOMEM);
+	CASE_ERR(EACCES);
+	CASE_ERR(EFAULT);
+	CASE_ERR(EINVAL);
+	CASE_ERR(ENFILE);
+	CASE_ERR(EMFILE);
+	CASE_ERR(ENOSPC);
+	CASE_ERR(ERANGE);
+	CASE_ERR(ENOSYS);
+	CASE_ERR(EADDRINUSE);
+	CASE_ERR(ECONNABORTED);
+	CASE_ERR(ECONNRESET);
+	CASE_ERR(EINPROGRESS);
+	CASE_ERR(ENOTCONN);
+	CASE_ERR(EADDRNOTAVAIL);
+	CASE_ERR(ECONNREFUSED);
+	CASE_ERR(ENETUNREACH);
+	CASE_ERR(EPROTO);
+	CASE_ERR(ENOTSOCK);
+	CASE_ERR(EMSGSIZE);
+	CASE_ERR(EPROTONOSUPPORT);
+	CASE_ERR(EAFNOSUPPORT);
+	CASE_ERR(ENOBUFS);
+	CASE_ERR(EISCONN);
+	CASE_ERR(ETIMEDOUT);
+	CASE_ERR(EALREADY);
+
+	default:
+		memprintf(out, "%d", err_num);
+		return *out;
+	}
+}
 
 #endif /* _HAPROXY_TOOLS_H */

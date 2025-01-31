@@ -12,7 +12,6 @@
 
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,13 +50,14 @@ struct protocol proto_uxst = {
 	.name           = "unix_stream",
 
 	/* connection layer */
-	.ctrl_type      = SOCK_STREAM,
+	.xprt_type      = PROTO_TYPE_STREAM,
 	.listen         = uxst_bind_listener,
 	.enable         = uxst_enable_listener,
 	.disable        = uxst_disable_listener,
 	.add            = default_add_listener,
 	.unbind         = default_unbind_listener,
 	.suspend        = default_suspend_listener,
+	.resume         = default_resume_listener,
 	.accept_conn    = sock_accept_conn,
 	.ctrl_init      = sock_conn_ctrl_init,
 	.ctrl_close     = sock_conn_ctrl_close,
@@ -81,11 +81,91 @@ struct protocol proto_uxst = {
 	.rx_unbind      = sock_unbind,
 	.rx_listening   = sock_accepting_conn,
 	.default_iocb   = sock_accept_iocb,
-	.receivers      = LIST_HEAD_INIT(proto_uxst.receivers),
+};
+
+/* Note: must not be declared <const> as its list will be overwritten */
+struct protocol proto_abns_stream = {
+	.name           = "abns_stream",
+
+	/* connection layer */
+	.xprt_type      = PROTO_TYPE_STREAM,
+	.listen         = uxst_bind_listener,
+	.enable         = uxst_enable_listener,
+	.disable        = uxst_disable_listener,
+	.add            = default_add_listener,
+	.unbind         = default_unbind_listener,
+	.suspend        = default_suspend_listener,
+	.resume         = default_resume_listener,
+	.accept_conn    = sock_accept_conn,
+	.ctrl_init      = sock_conn_ctrl_init,
+	.ctrl_close     = sock_conn_ctrl_close,
+	.connect        = uxst_connect_server,
+	.drain          = sock_drain,
+	.check_events   = sock_check_events,
+	.ignore_events  = sock_ignore_events,
+
+	/* binding layer */
+	.rx_suspend     = uxst_suspend_receiver,
+
+	/* address family */
+	.fam            = &proto_fam_abns,
+
+	/* socket layer */
+	.proto_type     = PROTO_TYPE_STREAM,
+	.sock_type      = SOCK_STREAM,
+	.sock_prot      = 0,
+	.rx_enable      = sock_enable,
+	.rx_disable     = sock_disable,
+	.rx_unbind      = sock_unbind,
+	.rx_listening   = sock_accepting_conn,
+	.default_iocb   = sock_accept_iocb,
+
+	.nb_receivers   = 0,
+};
+
+/* Note: must not be declared <const> as its list will be overwritten */
+struct protocol proto_abnsz_stream = {
+	.name           = "abnsz_stream",
+
+	/* connection layer */
+	.xprt_type      = PROTO_TYPE_STREAM,
+	.listen         = uxst_bind_listener,
+	.enable         = uxst_enable_listener,
+	.disable        = uxst_disable_listener,
+	.add            = default_add_listener,
+	.unbind         = default_unbind_listener,
+	.suspend        = default_suspend_listener,
+	.resume         = default_resume_listener,
+	.accept_conn    = sock_accept_conn,
+	.ctrl_init      = sock_conn_ctrl_init,
+	.ctrl_close     = sock_conn_ctrl_close,
+	.connect        = uxst_connect_server,
+	.drain          = sock_drain,
+	.check_events   = sock_check_events,
+	.ignore_events  = sock_ignore_events,
+
+	/* binding layer */
+	.rx_suspend     = uxst_suspend_receiver,
+
+	/* address family */
+	.fam            = &proto_fam_abnsz,
+
+	/* socket layer */
+	.proto_type     = PROTO_TYPE_STREAM,
+	.sock_type      = SOCK_STREAM,
+	.sock_prot      = 0,
+	.rx_enable      = sock_enable,
+	.rx_disable     = sock_disable,
+	.rx_unbind      = sock_unbind,
+	.rx_listening   = sock_accepting_conn,
+	.default_iocb   = sock_accept_iocb,
+
 	.nb_receivers   = 0,
 };
 
 INITCALL1(STG_REGISTER, protocol_register, &proto_uxst);
+INITCALL1(STG_REGISTER, protocol_register, &proto_abns_stream);
+INITCALL1(STG_REGISTER, protocol_register, &proto_abnsz_stream);
 
 /********************************
  * 1) low-level socket functions
@@ -107,9 +187,15 @@ static int uxst_bind_listener(struct listener *listener, char *errmsg, int errle
 {
 	int fd, err;
 	int ready;
-	char *msg = NULL;
+	struct buffer *msg = alloc_trash_chunk();
 
 	err = ERR_NONE;
+
+	if (!msg) {
+		if (errlen)
+			snprintf(errmsg, errlen, "out of memory");
+		return ERR_ALERT | ERR_FATAL;
+	}
 
 	/* ensure we never return garbage */
 	if (errlen)
@@ -119,9 +205,13 @@ static int uxst_bind_listener(struct listener *listener, char *errmsg, int errle
 		return ERR_NONE; /* already bound */
 
 	if (!(listener->rx.flags & RX_F_BOUND)) {
-		msg = "receiving socket not bound";
+		chunk_appendf(msg, "receiving socket not bound");
+		err |= ERR_FATAL | ERR_ALERT;
 		goto uxst_return;
 	}
+
+	if (listener->rx.flags & RX_F_MUST_DUP)
+		goto done;
 
 	fd = listener->rx.fd;
 	ready = sock_accepting_conn(&listener->rx) > 0;
@@ -129,21 +219,27 @@ static int uxst_bind_listener(struct listener *listener, char *errmsg, int errle
 	if (!ready && /* only listen if not already done by external process */
 	    listen(fd, listener_backlog(listener)) < 0) {
 		err |= ERR_FATAL | ERR_ALERT;
-		msg = "cannot listen to UNIX socket";
+		chunk_appendf(msg, "cannot listen on UNIX socket (%s)", strerror(errno));
 		goto uxst_close_return;
 	}
 
+ done:
 	/* the socket is now listening */
 	listener_set_state(listener, LI_LISTEN);
-	return err;
+	goto uxst_return;
 
  uxst_close_return:
-	close(fd);
+	fd_delete(fd);
  uxst_return:
 	if (msg && errlen) {
-		const char *path = ((struct sockaddr_un *)&listener->rx.addr)->sun_path;
-		snprintf(errmsg, errlen, "%s for [%s]", msg, path);
+		char *path_str;
+
+		path_str = sa2str((struct sockaddr_storage *)&listener->rx.addr, 0, 0);
+		snprintf(errmsg, errlen, "%s for [%s]", msg->area, ((path_str) ? path_str : ""));
+		ha_free(&path_str);
 	}
+	free_trash_chunk(msg);
+	msg = NULL;
 	return err;
 }
 
@@ -164,17 +260,20 @@ static void uxst_disable_listener(struct listener *l)
 }
 
 /* Suspend a receiver. Returns < 0 in case of failure, 0 if the receiver
- * was totally stopped, or > 0 if correctly suspended. Nothing is done for
- * plain unix sockets since currently it's the new process which handles
- * the renaming. Abstract sockets are completely unbound and closed so
- * there's no need to stop the poller.
+ * was totally stopped, or > 0 if correctly suspended. For plain unix sockets
+ * we only disable the listener to prevent data from being handled but nothing
+ * more is done since currently it's the new process which handles the renaming.
+ * Abstract sockets are completely unbound and closed so there's no need to stop
+ * the poller.
  */
 static int uxst_suspend_receiver(struct receiver *rx)
 {
 	struct listener *l = LIST_ELEM(rx, struct listener *, rx);
 
-	if (((struct sockaddr_un *)&rx->addr)->sun_path[0])
+	if (((struct sockaddr_un *)&rx->addr)->sun_path[0]) {
+		uxst_disable_listener(l);
 		return 1;
+	}
 
 	/* Listener's lock already held. Call lockless version of
 	 * unbind_listener. */
@@ -208,17 +307,19 @@ static int uxst_suspend_receiver(struct receiver *rx)
  */
 static int uxst_connect_server(struct connection *conn, int flags)
 {
-	int fd;
+	int fd, stream_err;
 	struct server *srv;
 	struct proxy *be;
 
+	BUG_ON(!conn->dst);
+
 	switch (obj_type(conn->target)) {
 	case OBJ_TYPE_PROXY:
-		be = objt_proxy(conn->target);
+		be = __objt_proxy(conn->target);
 		srv = NULL;
 		break;
 	case OBJ_TYPE_SERVER:
-		srv = objt_server(conn->target);
+		srv = __objt_server(conn->target);
 		be = srv->proxy;
 		break;
 	default:
@@ -226,65 +327,12 @@ static int uxst_connect_server(struct connection *conn, int flags)
 		return SF_ERR_INTERNAL;
 	}
 
-	if ((fd = conn->handle.fd = socket(PF_UNIX, SOCK_STREAM, 0)) == -1) {
-		qfprintf(stderr, "Cannot get a server socket.\n");
+	/* perform common checks on obtained socket FD, return appropriate Stream Error Flag in case of failure */
+	fd = conn->handle.fd = sock_create_server_socket(conn, be, &stream_err);
+	if (fd == -1)
+		return stream_err;
 
-		if (errno == ENFILE) {
-			conn->err_code = CO_ER_SYS_FDLIM;
-			send_log(be, LOG_EMERG,
-				 "Proxy %s reached system FD limit (maxsock=%d). Please check system tunables.\n",
-				 be->id, global.maxsock);
-		}
-		else if (errno == EMFILE) {
-			conn->err_code = CO_ER_PROC_FDLIM;
-			send_log(be, LOG_EMERG,
-				 "Proxy %s reached process FD limit (maxsock=%d). Please check 'ulimit-n' and restart.\n",
-				 be->id, global.maxsock);
-		}
-		else if (errno == ENOBUFS || errno == ENOMEM) {
-			conn->err_code = CO_ER_SYS_MEMLIM;
-			send_log(be, LOG_EMERG,
-				 "Proxy %s reached system memory limit (maxsock=%d). Please check system tunables.\n",
-				 be->id, global.maxsock);
-		}
-		else if (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT) {
-			conn->err_code = CO_ER_NOPROTO;
-		}
-		else
-			conn->err_code = CO_ER_SOCK_ERR;
-
-		/* this is a resource error */
-		conn->flags |= CO_FL_ERROR;
-		return SF_ERR_RESOURCE;
-	}
-
-	if (fd >= global.maxsock) {
-		/* do not log anything there, it's a normal condition when this option
-		 * is used to serialize connections to a server !
-		 */
-		ha_alert("socket(): not enough free sockets. Raise -n argument. Giving up.\n");
-		close(fd);
-		conn->err_code = CO_ER_CONF_FDLIM;
-		conn->flags |= CO_FL_ERROR;
-		return SF_ERR_PRXCOND; /* it is a configuration limit */
-	}
-
-	if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1) {
-		qfprintf(stderr,"Cannot set client socket to non blocking mode.\n");
-		close(fd);
-		conn->err_code = CO_ER_SOCK_ERR;
-		conn->flags |= CO_FL_ERROR;
-		return SF_ERR_INTERNAL;
-	}
-
-	if (master == 1 && (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1)) {
-		ha_alert("Cannot set CLOEXEC on client socket.\n");
-		close(fd);
-		conn->err_code = CO_ER_SOCK_ERR;
-		conn->flags |= CO_FL_ERROR;
-		return SF_ERR_INTERNAL;
-	}
-
+	/* FD is ok, continue with protocol specific settings */
 	if (global.tune.server_sndbuf)
                 setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &global.tune.server_sndbuf, sizeof(global.tune.server_sndbuf));
 
@@ -298,9 +346,9 @@ static int uxst_connect_server(struct connection *conn, int flags)
 		else if (errno == EISCONN) {
 			conn->flags &= ~CO_FL_WAIT_L4_CONN;
 		}
-		else if (errno == EAGAIN || errno == EADDRINUSE || errno == EADDRNOTAVAIL) {
+		else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EADDRINUSE || errno == EADDRNOTAVAIL) {
 			char *msg;
-			if (errno == EAGAIN || errno == EADDRNOTAVAIL) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EADDRNOTAVAIL) {
 				msg = "can't connect to destination unix socket, check backlog size on the server";
 				conn->err_code = CO_ER_FREE_PORTS;
 			}
@@ -309,9 +357,9 @@ static int uxst_connect_server(struct connection *conn, int flags)
 				conn->err_code = CO_ER_ADDR_INUSE;
 			}
 
-			qfprintf(stderr,"Connect() failed for backend %s: %s.\n", be->id, msg);
+			qfprintf(stderr,"Connect() failed for backend %s: %s (%s).\n", be->id, msg, strerror(errno));
 			close(fd);
-			send_log(be, LOG_ERR, "Connect() failed for backend %s: %s.\n", be->id, msg);
+			send_log(be, LOG_ERR, "Connect() failed for backend %s: %s (%s).\n", be->id, msg, strerror(errno));
 			conn->flags |= CO_FL_ERROR;
 			return SF_ERR_RESOURCE;
 		}
@@ -334,8 +382,6 @@ static int uxst_connect_server(struct connection *conn, int flags)
 		 */
 		conn->flags &= ~CO_FL_WAIT_L4_CONN;
 	}
-
-	conn->flags |= CO_FL_ADDR_TO_SET;
 
 	/* Prepare to send a few handshakes related to the on-wire protocol. */
 	if (conn->send_proxy_ofs)

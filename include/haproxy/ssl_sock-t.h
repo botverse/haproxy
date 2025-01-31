@@ -49,17 +49,22 @@
 #define SSL_SOCK_ST_FL_16K_WBFSIZE  0x00000002
 #define SSL_SOCK_SEND_UNLIMITED     0x00000004
 #define SSL_SOCK_RECV_HEARTBEAT     0x00000008
+#define SSL_SOCK_SEND_MORE          0x00000010  /* set MSG_MORE at lower levels */
 
-/* bits 0xFFFF0000 are reserved to store verify errors */
+/* bits 0xFFFFFF00 are reserved to store verify errors.
+ * The CA en CRT error codes will be stored on 7 bits each
+ * (since the max verify error code does not exceed 127)
+ * and the CA error depth will be stored on 4 bits.
+ */
 
 /* Verify errors macros */
-#define SSL_SOCK_CA_ERROR_TO_ST(e) (((e > 63) ? 63 : e) << (16))
-#define SSL_SOCK_CAEDEPTH_TO_ST(d) (((d > 15) ? 15 : d) << (6+16))
-#define SSL_SOCK_CRTERROR_TO_ST(e) (((e > 63) ? 63 : e) << (4+6+16))
+#define SSL_SOCK_CA_ERROR_TO_ST(e) (((e > 127) ? 127 : e) << (8))
+#define SSL_SOCK_CAEDEPTH_TO_ST(d) (((d > 15) ? 15 : d) << (7+8))
+#define SSL_SOCK_CRTERROR_TO_ST(e) (((e > 127) ? 127 : e) << (4+7+8))
 
-#define SSL_SOCK_ST_TO_CA_ERROR(s) ((s >> (16)) & 63)
-#define SSL_SOCK_ST_TO_CAEDEPTH(s) ((s >> (6+16)) & 15)
-#define SSL_SOCK_ST_TO_CRTERROR(s) ((s >> (4+6+16)) & 63)
+#define SSL_SOCK_ST_TO_CA_ERROR(s) ((s >> (8)) & 127)
+#define SSL_SOCK_ST_TO_CAEDEPTH(s) ((s >> (7+8)) & 15)
+#define SSL_SOCK_ST_TO_CRTERROR(s) ((s >> (4+7+8)) & 127)
 
 /* ssl_methods flags for ssl options */
 #define MC_SSL_O_ALL            0x0000
@@ -98,6 +103,11 @@ enum {
 	SSL_SOCK_VERIFY_OPTIONAL = 2,
 	SSL_SOCK_VERIFY_NONE     = 3,
 };
+
+/* bind ocsp update mode */
+#define	SSL_SOCK_OCSP_UPDATE_OFF   -1
+#define	SSL_SOCK_OCSP_UPDATE_DFLT   0
+#define	SSL_SOCK_OCSP_UPDATE_ON     1
 
 /* states of the CLI IO handler for 'set ssl cert' */
 enum {
@@ -209,6 +219,10 @@ struct ssl_capture {
 	uint ec_offset;
 	uint ec_formats_offset;
 	uchar ec_formats_len;
+	uchar supver_len;
+	uint supver_offset;
+	ushort sigalgs_len;
+	uint sigalgs_offset;
 	char data[VAR_ARRAY];
 };
 
@@ -245,10 +259,14 @@ struct ssl_sock_ctx {
 	struct buffer early_buf;      /* buffer to store the early data received */
 	int sent_early_data;          /* Amount of early data we sent so far */
 
+#ifdef USE_QUIC
+	struct quic_conn *qc;
+#endif
 };
 
 struct global_ssl {
 	char *crt_base;             /* base directory path for certificates */
+	char *key_base;             /* base directory path for private keys */
 	char *ca_base;              /* base directory path for CAs and CRLs */
 	char *issuers_chain_path;   /* from "issuers-chain-path" */
 	int  skip_self_issued_ca;
@@ -263,6 +281,15 @@ struct global_ssl {
 #endif
 #if defined(SSL_CTX_set1_curves_list)
 	char *listen_default_curves;
+	char *connect_default_curves;
+#endif
+#if defined(SSL_CTX_set1_sigalgs_list)
+	char *listen_default_sigalgs;
+	char *connect_default_sigalgs;
+#endif
+#if defined(SSL_CTX_set1_sigalgs_list)
+	char *listen_default_client_sigalgs;
+	char *connect_default_client_sigalgs;
 #endif
 	int listen_default_ssloptions;
 	int connect_default_ssloptions;
@@ -272,12 +299,23 @@ struct global_ssl {
 	int private_cache; /* Force to use a private session cache even if nbproc > 1 */
 	unsigned int life_time;   /* SSL session lifetime in seconds */
 	unsigned int max_record; /* SSL max record size */
+	unsigned int hard_max_record; /* SSL max record size hard limit */
 	unsigned int default_dh_param; /* SSL maximum DH parameter size */
 	int ctx_cache; /* max number of entries in the ssl_ctx cache. */
 	int capture_buffer_size; /* Size of the capture buffer. */
 	int keylog; /* activate keylog  */
 	int extra_files; /* which files not defined in the configuration file are we looking for */
 	int extra_files_noext; /* whether we remove the extension when looking up a extra file */
+	int security_level;    /* configure the openssl security level */
+
+#ifndef OPENSSL_NO_OCSP
+	struct {
+		unsigned int delay_max;
+		unsigned int delay_min;
+		int mode; /* default mode used for ocsp auto-update (off, on) */
+		int disable;
+	} ocsp_update;
+#endif
 };
 
 /* The order here matters for picking a default context,
@@ -286,6 +324,16 @@ struct global_ssl {
 extern const char *SSL_SOCK_KEYTYPE_NAMES[];
 
 #define SSL_SOCK_NUM_KEYTYPES 3
+
+extern struct pool_head *ssl_sock_client_sni_pool;
+
+struct ssl_counters {
+	long long sess;
+	long long reused_sess;
+	long long failed_handshake;
+	long long ocsp_staple;
+	long long failed_ocsp_staple;
+};
 
 #endif /* USE_OPENSSL */
 #endif /* _HAPROXY_SSL_SOCK_T_H */

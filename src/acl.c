@@ -28,6 +28,7 @@
 #include <haproxy/sample.h>
 #include <haproxy/stick_table.h>
 #include <haproxy/tools.h>
+#include <haproxy/cfgparse.h>
 
 /* List head of all known ACL keywords */
 static struct acl_kw_list acl_keywords = {
@@ -138,8 +139,6 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 	struct sample_expr *smp = NULL;
 	int idx = 0;
 	char *ckw = NULL;
-	const char *begw;
-	const char *endw;
 	const char *endt;
 	int cur_type;
 	int nbargs;
@@ -209,106 +208,18 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 			memprintf(err, "in argument to '%s', %s", aclkw->kw, *err);
 			goto out_free_smp;
 		}
-		arg = endt;
 
 		/* look for the beginning of the converters list. Those directly attached
-		 * to the ACL keyword are found just after <arg> which points to the comma.
+		 * to the ACL keyword are found just after the comma.
 		 * If we find any converter, then we don't use the ACL keyword's match
 		 * anymore but the one related to the converter's output type.
 		 */
-		cur_type = smp->fetch->out_type;
-		while (*arg) {
-			struct sample_conv *conv;
-			struct sample_conv_expr *conv_expr;
-			int err_arg;
-			int argcnt;
-
-			if (*arg && *arg != ',') {
-				if (ckw)
-					memprintf(err, "ACL keyword '%s' : missing comma after converter '%s'.",
-						  aclkw->kw, ckw);
-				else
-					memprintf(err, "ACL keyword '%s' : missing comma after fetch keyword.",
-						  aclkw->kw);
-				goto out_free_smp;
-			}
-
-			/* FIXME: how long should we support such idiocies ? Maybe we
-			 * should already warn ?
-			 */
-			while (*arg == ',') /* then trailing commas */
-				arg++;
-
-			begw = arg; /* start of converter keyword */
-
-			if (!*begw)
-				/* none ? end of converters */
-				break;
-
-			for (endw = begw; is_idchar(*endw); endw++)
-				;
-
-			free(ckw);
-			ckw = my_strndup(begw, endw - begw);
-
-			conv = find_sample_conv(begw, endw - begw);
-			if (!conv) {
-				/* Unknown converter method */
-				memprintf(err, "ACL keyword '%s' : unknown converter '%s'.",
-					  aclkw->kw, ckw);
-				goto out_free_smp;
-			}
-
-			arg = endw;
-
-			if (conv->in_type >= SMP_TYPES || conv->out_type >= SMP_TYPES) {
-				memprintf(err, "ACL keyword '%s' : returns type of converter '%s' is unknown.",
-					  aclkw->kw, ckw);
-				goto out_free_smp;
-			}
-
-			/* If impossible type conversion */
-			if (!sample_casts[cur_type][conv->in_type]) {
-				memprintf(err, "ACL keyword '%s' : converter '%s' cannot be applied.",
-					  aclkw->kw, ckw);
-				goto out_free_smp;
-			}
-
-			cur_type = conv->out_type;
-			conv_expr = calloc(1, sizeof(*conv_expr));
-			if (!conv_expr)
-				goto out_free_smp;
-
-			LIST_APPEND(&(smp->conv_exprs), &(conv_expr->list));
-			conv_expr->conv = conv;
-			acl_conv_found = 1;
-
-			if (al) {
-				al->kw = smp->fetch->kw;
-				al->conv = conv_expr->conv->kw;
-			}
-			argcnt = make_arg_list(endw, -1, conv->arg_mask, &conv_expr->arg_p, err, &arg, &err_arg, al);
-			if (argcnt < 0) {
-				memprintf(err, "ACL keyword '%s' : invalid arg %d in converter '%s' : %s.",
-				          aclkw->kw, err_arg+1, ckw, *err);
-				goto out_free_smp;
-			}
-
-			if (argcnt && !conv->arg_mask) {
-				memprintf(err, "converter '%s' does not support any args", ckw);
-				goto out_free_smp;
-			}
-
-			if (!conv_expr->arg_p)
-				conv_expr->arg_p = empty_arg_list;
-
-			if (conv->val_args && !conv->val_args(conv_expr->arg_p, conv, file, line, err)) {
-				memprintf(err, "ACL keyword '%s' : invalid args in converter '%s' : %s.",
-					  aclkw->kw, ckw, *err);
-				goto out_free_smp;
-			}
+		if (!sample_parse_expr_cnv((char **)args, NULL, NULL, err, al, file, line, smp, endt)) {
+			if (err)
+				memprintf(err, "ACL keyword '%s' : %s", aclkw->kw, *err);
+			goto out_free_smp;
 		}
-		ha_free(&ckw);
+		acl_conv_found = !LIST_ISEMPTY(&smp->conv_exprs);
 	}
 	else {
 		/* This is not an ACL keyword, so we hope this is a sample fetch
@@ -321,8 +232,10 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 			memprintf(err, "%s in ACL expression '%s'", *err, *args);
 			goto out_return;
 		}
-		cur_type = smp_expr_output_type(smp);
 	}
+
+	/* get last effective output type for smp */
+	cur_type = smp_expr_output_type(smp);
 
 	expr = calloc(1, sizeof(*expr));
 	if (!expr) {
@@ -601,7 +514,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 
 				case STD_OP_GT:
 					value++; /* gt = ge + 1 */
-					/* fall through */
+					__fallthrough;
 
 				case STD_OP_GE:
 					if (expr->pat.parse == pat_parse_int)
@@ -614,7 +527,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 
 				case STD_OP_LT:
 					value--; /* lt = le - 1 */
-					/* fall through */
+					__fallthrough;
 
 				case STD_OP_LE:
 					if (expr->pat.parse == pat_parse_int)
@@ -633,6 +546,25 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 		 */
 		if (!pat_ref_add(ref, arg, NULL, err))
 			goto out_free_expr;
+
+		if (global.mode & MODE_DIAG) {
+			if (strcmp(arg, "&&") == 0 || strcmp(arg, "and") == 0 ||
+			    strcmp(arg, "||") == 0 ||  strcmp(arg, "or") == 0)
+				ha_diag_warning("parsing [%s:%d] : pattern '%s' looks like a failed attempt at using an operator inside a pattern list\n", file, line, arg);
+			else if (strcmp(arg, "#") == 0 || strcmp(arg, "//") == 0)
+				ha_diag_warning("parsing [%s:%d] : pattern '%s' looks like a failed attempt at commenting an end of line\n", file, line, arg);
+			else if (find_acl_kw(arg))
+				ha_diag_warning("parsing [%s:%d] : pattern '%s' suspiciously looks like a known acl keyword\n", file, line, arg);
+			else {
+				const char *begw = arg, *endw;
+
+				for (endw = begw; is_idchar(*endw); endw++)
+					;
+
+				if (endw != begw && find_sample_fetch(begw, endw - begw))
+					ha_diag_warning("parsing [%s:%d] : pattern '%s' suspiciously looks like a known sample fetch keyword\n", file, line, arg);
+			}
+		}
 		args++;
 	}
 
@@ -662,6 +594,35 @@ struct acl *prune_acl(struct acl *acl) {
 	}
 
 	return acl;
+}
+
+/* Walk the ACL tree, following nested acl() sample fetches, for no more than
+ * max_recurse evaluations. Returns -1 if a recursive loop is detected, 0 if
+ * the max_recurse was reached, otherwise the number of max_recurse left.
+ */
+static int parse_acl_recurse(struct acl *acl, struct acl_expr *expr, int max_recurse)
+{
+	struct acl_term *term;
+	struct acl_sample *sample;
+
+	if (strcmp(expr->smp->fetch->kw, "acl") != 0)
+		return max_recurse;
+
+	if (--max_recurse <= 0)
+		return 0;
+
+	sample = (struct acl_sample *)expr->smp->arg_p->data.ptr;
+	list_for_each_entry(term, &sample->suite.terms, list) {
+		if (term->acl == acl)
+			return -1;
+		list_for_each_entry(expr, &term->acl->expr, list) {
+			max_recurse = parse_acl_recurse(acl, expr, max_recurse);
+			if (max_recurse <= 0)
+				return max_recurse;
+		}
+	}
+
+	return max_recurse;
 }
 
 /* Parse an ACL with the name starting at <args>[0], and with a list of already
@@ -711,7 +672,16 @@ struct acl *parse_acl(const char **args, struct list *known_acl, char **err, str
 	else
 		cur_acl = NULL;
 
-	if (!cur_acl) {
+	if (cur_acl) {
+		int ret = parse_acl_recurse(cur_acl, acl_expr, ACL_MAX_RECURSE);
+		if (ret <= 0) {
+			if (ret < 0)
+				memprintf(err, "have a recursive loop");
+			else
+				memprintf(err, "too deep acl() tree");
+			goto out_free_acl_expr;
+		}
+	} else {
 		name = strdup(args[0]);
 		if (!name) {
 			memprintf(err, "out of memory when parsing ACL");
@@ -759,6 +729,7 @@ const struct {
 	{ .name = "HTTP_1.0",       .expr = {"req.ver","1.0",""}},
 	{ .name = "HTTP_1.1",       .expr = {"req.ver","1.1",""}},
 	{ .name = "HTTP_2.0",       .expr = {"req.ver","2.0",""}},
+	{ .name = "HTTP_3.0",       .expr = {"req.ver","3.0",""}},
 	{ .name = "METH_CONNECT",   .expr = {"method","CONNECT",""}},
 	{ .name = "METH_DELETE",    .expr = {"method","DELETE",""}},
 	{ .name = "METH_GET",       .expr = {"method","GET","HEAD",""}},
@@ -786,9 +757,9 @@ const struct {
  * to report missing dependencies. It may be NULL if such dependencies are not
  * allowed.
  */
-static struct acl *find_acl_default(const char *acl_name, struct list *known_acl,
-                                    char **err, struct arg_list *al,
-                                    const char *file, int line)
+struct acl *find_acl_default(const char *acl_name, struct list *known_acl,
+                             char **err, struct arg_list *al,
+                             const char *file, int line)
 {
 	__label__ out_return, out_free_acl_expr, out_free_name;
 	struct acl *cur_acl;
@@ -841,21 +812,6 @@ static struct acl *find_acl_default(const char *acl_name, struct list *known_acl
 	free(acl_expr);
  out_return:
 	return NULL;
-}
-
-/* Purge everything in the acl_cond <cond>, then return <cond>. */
-struct acl_cond *prune_acl_cond(struct acl_cond *cond)
-{
-	struct acl_term_suite *suite, *tmp_suite;
-	struct acl_term *term, *tmp_term;
-
-	/* iterate through all term suites and free all terms and all suites */
-	list_for_each_entry_safe(suite, tmp_suite, &cond->suites, list) {
-		list_for_each_entry_safe(term, tmp_term, &suite->terms, list)
-			free(term);
-		free(suite);
-	}
-	return cond;
 }
 
 /* Parse an ACL condition starting at <args>[0], relying on a list of already
@@ -1007,8 +963,7 @@ struct acl_cond *parse_acl_cond(const char **args, struct list *known_acl,
  out_free_term:
 	free(cur_term);
  out_free_suite:
-	prune_acl_cond(cond);
-	free(cond);
+	free_acl_cond(cond);
  out_return:
 	return NULL;
 }
@@ -1017,7 +972,7 @@ struct acl_cond *parse_acl_cond(const char **args, struct list *known_acl,
  * condition is returned. NULL is returned in case of error or if the first
  * word is neither "if" nor "unless". It automatically sets the file name and
  * the line number in the condition for better error reporting, and sets the
- * HTTP intiailization requirements in the proxy. If <err> is not NULL, it will
+ * HTTP initialization requirements in the proxy. If <err> is not NULL, it will
  * be filled with a pointer to an error message in case of error, that the
  * caller is responsible for freeing. The initial location must either be
  * freeable or NULL.
@@ -1308,6 +1263,36 @@ int init_acl()
 	return err;
 }
 
+/* dump known ACL keywords on stdout */
+void acl_dump_kwd(void)
+{
+	struct acl_kw_list *kwl;
+	const struct acl_keyword *kwp, *kw;
+	const char *name;
+	int index;
+
+	for (kw = kwp = NULL;; kwp = kw) {
+		list_for_each_entry(kwl, &acl_keywords.list, list) {
+			for (index = 0; kwl->kw[index].kw != NULL; index++) {
+				if (strordered(kwp ? kwp->kw : NULL,
+					       kwl->kw[index].kw,
+					       kw != kwp ? kw->kw : NULL))
+					kw = &kwl->kw[index];
+			}
+		}
+
+		if (kw == kwp)
+			break;
+
+		name = kw->fetch_kw;
+		if (!name)
+			name = kw->kw;
+
+		printf("%s = %s -m %s\n", kw->kw, name, pat_match_names[kw->match_type]);
+	}
+}
+
+/* Purge everything in the acl_cond <cond>, then free <cond> */
 void free_acl_cond(struct acl_cond *cond)
 {
 	struct acl_term_suite *suite, *suiteb;
@@ -1328,6 +1313,65 @@ void free_acl_cond(struct acl_cond *cond)
 	free(cond);
 }
 
+
+static int smp_fetch_acl(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct acl_sample *acl_sample = (struct acl_sample *)args->data.ptr;
+	enum acl_test_res ret;
+
+	ret = acl_exec_cond(&acl_sample->cond, smp->px, smp->sess, smp->strm, smp->opt);
+	if (ret == ACL_TEST_MISS)
+		return 0;
+	smp->data.u.sint = ret == ACL_TEST_PASS;
+	smp->data.type = SMP_T_BOOL;
+	return 1;
+}
+
+int smp_fetch_acl_parse(struct arg *args, char **err_msg)
+{
+	struct acl_sample *acl_sample;
+	char *name;
+	int i;
+
+	for (i = 0; args[i].type != ARGT_STOP; i++)
+		;
+	acl_sample = calloc(1, sizeof(struct acl_sample) + sizeof(struct acl_term) * i);
+	LIST_INIT(&acl_sample->suite.terms);
+	LIST_INIT(&acl_sample->cond.suites);
+	LIST_APPEND(&acl_sample->cond.suites, &acl_sample->suite.list);
+	acl_sample->cond.val = ~0U; // the keyword is valid everywhere for now.
+
+	args->data.ptr = acl_sample;
+
+	for (i = 0; args[i].type != ARGT_STOP; i++) {
+		name = args[i].data.str.area;
+		if (name[0] == '!') {
+			acl_sample->terms[i].neg = 1;
+			name++;
+		}
+
+
+		if (
+			!(acl_sample->terms[i].acl = find_acl_by_name(name, &curproxy->acl)) &&
+			!(acl_sample->terms[i].acl = find_acl_default(name, &curproxy->acl, err_msg, NULL, NULL, 0))
+			) {
+			memprintf(err_msg, "ACL '%s' not found", name);
+			goto err;
+		}
+
+		acl_sample->cond.use |= acl_sample->terms[i].acl->use;
+		acl_sample->cond.val &= acl_sample->terms[i].acl->val;
+
+		LIST_APPEND(&acl_sample->suite.terms, &acl_sample->terms[i].list);
+	}
+
+	return 1;
+
+err:
+	free(acl_sample);
+	return 0;
+}
+
 /************************************************************************/
 /*      All supported sample and ACL keywords must be declared here.    */
 /************************************************************************/
@@ -1340,6 +1384,13 @@ static struct acl_kw_list acl_kws = {ILH, {
 }};
 
 INITCALL1(STG_REGISTER, acl_register_keywords, &acl_kws);
+
+static struct sample_fetch_kw_list smp_kws = {ILH, {
+	{ "acl", smp_fetch_acl, ARG12(1,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR), smp_fetch_acl_parse, SMP_T_BOOL, SMP_USE_CONST },
+	{ /* END */ },
+}};
+
+INITCALL1(STG_REGISTER, sample_register_fetches, &smp_kws);
 
 /*
  * Local variables:

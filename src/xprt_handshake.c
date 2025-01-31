@@ -11,7 +11,6 @@
  */
 
 #include <haproxy/connection.h>
-#include <haproxy/stream_interface.h>
 
 struct xprt_handshake_ctx {
 	struct connection *conn;
@@ -21,7 +20,7 @@ struct xprt_handshake_ctx {
 	void *xprt_ctx;
 };
 
-DECLARE_STATIC_POOL(xprt_handshake_ctx_pool, "xprt_handshake_ctx_pool", sizeof(struct xprt_handshake_ctx));
+DECLARE_STATIC_POOL(xprt_handshake_ctx_pool, "xprt_handshake_ctx", sizeof(struct xprt_handshake_ctx));
 
 /* This XPRT doesn't take care of sending or receiving data, once its handshake
  * is done, it just removes itself
@@ -72,7 +71,7 @@ struct task *xprt_handshake_io_cb(struct task *t, void *bctx, unsigned int state
 		}
 
 	if (conn->flags & CO_FL_SEND_PROXY)
-		if (!conn_si_send_proxy(conn, CO_FL_SEND_PROXY)) {
+		if (!conn_send_proxy(conn, CO_FL_SEND_PROXY)) {
 			ctx->xprt->subscribe(conn, ctx->xprt_ctx, SUB_RETRY_SEND,
 			    &ctx->wait_event);
 			goto out;
@@ -292,8 +291,9 @@ struct xprt_ops xprt_handshake = {
 	.name     = "HS",
 };
 
-__attribute__((constructor))
 static void __xprt_handshake_init(void)
 {
 	xprt_register(XPRT_HANDSHAKE, &xprt_handshake);
 }
+
+INITCALL0(STG_REGISTER, __xprt_handshake_init);

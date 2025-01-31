@@ -86,6 +86,7 @@ struct slz_stream {
 /* Functions specific to rfc1951 (deflate) */
 long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsigned char *in, long ilen, int more);
 int slz_rfc1951_init(struct slz_stream *strm, int level);
+int slz_rfc1951_flush(struct slz_stream *strm, unsigned char *buf);
 int slz_rfc1951_finish(struct slz_stream *strm, unsigned char *buf);
 
 /* Functions specific to rfc1952 (gzip) */
@@ -94,6 +95,7 @@ uint32_t slz_crc32_by4(uint32_t crc, const unsigned char *buf, int len);
 long slz_rfc1952_encode(struct slz_stream *strm, unsigned char *out, const unsigned char *in, long ilen, int more);
 int slz_rfc1952_send_header(struct slz_stream *strm, unsigned char *buf);
 int slz_rfc1952_init(struct slz_stream *strm, int level);
+int slz_rfc1952_flush(struct slz_stream *strm, unsigned char *buf);
 int slz_rfc1952_finish(struct slz_stream *strm, unsigned char *buf);
 
 /* Functions specific to rfc1950 (zlib) */
@@ -102,6 +104,7 @@ uint32_t slz_adler32_block(uint32_t crc, const unsigned char *buf, long len);
 long slz_rfc1950_encode(struct slz_stream *strm, unsigned char *out, const unsigned char *in, long ilen, int more);
 int slz_rfc1950_send_header(struct slz_stream *strm, unsigned char *buf);
 int slz_rfc1950_init(struct slz_stream *strm, int level);
+int slz_rfc1950_flush(struct slz_stream *strm, unsigned char *buf);
 int slz_rfc1950_finish(struct slz_stream *strm, unsigned char *buf);
 
 /* generic functions */
@@ -152,7 +155,9 @@ static inline long slz_encode(struct slz_stream *strm, void *out,
  * possibly pending bits from the queue (up to 24 bits), rounding to the next
  * byte, then 4 bytes for the CRC when doing zlib/gzip, then another 4 bytes
  * for the input length for gzip. That may about to 4+4+4 = 12 bytes, that the
- * caller must ensure are available before calling the function.
+ * caller must ensure are available before calling the function. Note that if
+ * the initial header was never sent, it will be sent first as well (up to 10
+ * extra bytes).
  */
 static inline int slz_finish(struct slz_stream *strm, void *buf)
 {
@@ -164,6 +169,30 @@ static inline int slz_finish(struct slz_stream *strm, void *buf)
 		ret = slz_rfc1950_finish(strm, (unsigned char *) buf);
 	else /* deflate for other ones */
 		ret = slz_rfc1951_finish(strm, (unsigned char *) buf);
+
+	return ret;
+}
+
+/* Flushes any pending data for stream <strm> into buffer <buf>, then emits an
+ * empty literal block to byte-align the output, allowing to completely flush
+ * the queue. Note that if the initial header was never sent, it will be sent
+ * first as well (0, 2 or 10 extra bytes). This requires that the output buffer
+ * still has this plus the size of the queue available (up to 4 bytes), plus
+ * one byte for (BFINAL,BTYPE), plus 4 bytes for LEN+NLEN, or a total of 19
+ * bytes in the worst case. The number of bytes emitted is returned. It is
+ * guaranteed that the queue is empty on return. This may cause some overhead
+ * by adding needless 5-byte blocks if called to often.
+ */
+static inline int slz_flush(struct slz_stream *strm, void *buf)
+{
+	int ret;
+
+	if (strm->format == SLZ_FMT_GZIP)
+		ret = slz_rfc1952_flush(strm, (unsigned char *) buf);
+	else if (strm->format == SLZ_FMT_ZLIB)
+		ret = slz_rfc1950_flush(strm, (unsigned char *) buf);
+	else /* deflate for other ones */
+		ret = slz_rfc1951_flush(strm, (unsigned char *) buf);
 
 	return ret;
 }

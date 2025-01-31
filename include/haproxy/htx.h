@@ -30,6 +30,11 @@
 #include <haproxy/http-t.h>
 #include <haproxy/htx-t.h>
 
+/* ->extra field value when the payload length is unknown (non-chunked message
+ * with no "Content-length" header)
+ */
+#define HTX_UNKOWN_PAYLOAD_LENGTH ULLONG_MAX
+
 extern struct htx htx_empty;
 
 struct htx_blk *htx_defrag(struct htx *htx, struct htx_blk *blk, uint32_t info);
@@ -187,6 +192,16 @@ static inline struct htx_blk *htx_get_head_blk(const struct htx *htx)
 	int32_t head = htx_get_head(htx);
 
 	return ((head == -1) ? NULL : htx_get_blk(htx, head));
+}
+
+/* same as above but unchecked, may only be used when certain that a block
+ * exists.
+ */
+static inline struct htx_blk *__htx_get_head_blk(const struct htx *htx)
+{
+	int32_t head = htx_get_head(htx);
+
+	return htx_get_blk(htx, head);
 }
 
 /* Returns the type of the oldest HTX block (head) if the HTX message is not
@@ -658,10 +673,10 @@ static inline size_t buf_room_for_htx_data(const struct buffer *buf)
 	size_t room;
 
 	room = b_room(buf);
-	if (room <= sizeof(struct htx) + 2 * sizeof(struct htx_blk))
+	if (room <= HTX_BUF_OVERHEAD)
 		room = 0;
 	else
-		room -= sizeof(struct htx) + 2 * sizeof(struct htx_blk);
+		room -= HTX_BUF_OVERHEAD;
 
 	return room;
 }
@@ -685,6 +700,8 @@ static inline struct htx *htxbuf(const struct buffer *buf)
 		htx->size = buf->size - sizeof(*htx);
 		htx_reset(htx);
 	}
+	if (htx->flags & HTX_FL_ALTERED_PAYLOAD)
+		htx->extra = 0;
 	return htx;
 }
 
@@ -743,14 +760,32 @@ static inline int htx_expect_more(const struct htx *htx)
 	return !(htx->flags & HTX_FL_EOM);
 }
 
+/* Set EOM flag in <htx>. This function is useful if the HTX message is empty.
+ * In this case, an EOT block is appended first to ensure the EOM will be
+ * forwarded as expected. This is a workaround as it is not possibly currently
+ * to push an empty HTX DATA block.
+ *
+ * Returns 1 on success else 0.
+ */
+static inline int htx_set_eom(struct htx *htx)
+{
+	if (htx_is_empty(htx)) {
+		if (!htx_add_endof(htx, HTX_BLK_EOT))
+			return 0;
+	}
+
+	htx->flags |= HTX_FL_EOM;
+	return 1;
+}
+
 /* Copy an HTX message stored in the buffer <msg> to <htx>. We take care to
  * not overwrite existing data. All the message is copied or nothing. It returns
  * 1 on success and 0 on error.
  */
 static inline int htx_copy_msg(struct htx *htx, const struct buffer *msg)
 {
-	/* The destination HTX message is empty, we can do a raw copy */
-	if (htx_is_empty(htx)) {
+	/* The destination HTX message is allocated and empty, we can do a raw copy */
+	if (htx_is_empty(htx) && htx_free_space(htx)) {
 		memcpy(htx, msg->area, msg->size);
 		return 1;
 	}

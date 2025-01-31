@@ -67,6 +67,7 @@ const char *get_check_status_description(short check_status);
 const char *get_check_status_info(short check_status);
 int httpchk_build_status_header(struct server *s, struct buffer *buf);
 void __health_adjust(struct server *s, short status);
+void check_append_info(struct buffer *msg, struct check *check);
 void set_server_check_status(struct check *check, short status, const char *desc);
 void chk_report_conn_err(struct check *check, int errno_bck, int expired);
 void check_notify_failure(struct check *check);
@@ -74,24 +75,35 @@ void check_notify_stopping(struct check *check);
 void check_notify_success(struct check *check);
 struct task *process_chk(struct task *t, void *context, unsigned int state);
 
+struct task *srv_chk_io_cb(struct task *t, void *ctx, unsigned int state);
+
 int check_buf_available(void *target);
 struct buffer *check_get_buf(struct check *check, struct buffer *bptr);
 void check_release_buf(struct check *check, struct buffer *bptr);
 const char *init_check(struct check *check, int type);
 void free_check(struct check *check);
 void check_purge(struct check *check);
+int wake_srv_chk(struct stconn *sc);
 
 int init_srv_check(struct server *srv);
 int init_srv_agent_check(struct server *srv);
 int start_check_task(struct check *check, int mininter, int nbcheck, int srvpos);
 
-/* Declared here, but the definitions are in flt_spoe.c */
-int spoe_prepare_healthcheck_request(char **req, int *len);
-int spoe_handle_healthcheck_response(char *frame, size_t size, char *err, int errlen);
-
 int set_srv_agent_send(struct server *srv, const char *send);
-void set_srv_agent_addr(struct server *srv, struct sockaddr_storage *sk);
-void set_srv_agent_port(struct server *srv, int port);
+
+/* set agent addr and appropriate flag */
+static inline void set_srv_agent_addr(struct server *srv, struct sockaddr_storage *sk)
+{
+	srv->agent.addr = *sk;
+	srv->flags |= SRV_F_AGENTADDR;
+}
+
+/* set agent port and appropriate flag */
+static inline void set_srv_agent_port(struct server *srv, int port)
+{
+	srv->agent.port = port;
+	srv->flags |= SRV_F_AGENTPORT;
+}
 
 /* Use this one only. This inline version only ensures that we don't
  * call the function when the observe mode is disabled.

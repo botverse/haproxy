@@ -24,6 +24,7 @@ const char *arg_type_names[ARGT_NBTYPES] = {
 	[ARGT_STOP] = "end of arguments",
 	[ARGT_SINT] = "integer",
 	[ARGT_STR]  = "string",
+	[ARGT_ID]   = "identifier",
 	[ARGT_IPV4] = "IPv4 address",
 	[ARGT_MSK4] = "IPv4 mask",
 	[ARGT_IPV6] = "IPv6 address",
@@ -182,7 +183,7 @@ int make_arg_list(const char *in, int len, uint64_t mask, struct arg **argp,
 			}
 			else if (*in == '\\' && !squote && len != 1) {
 				/* '\', ', ' ', '"' support being escaped by '\' */
-				if (len == 1 || in[1] == 0)
+				if (in[1] == 0)
 					goto unquote_err;
 
 				if (in[1] == '\\' || in[1] == ' ' || in[1] == '"' || in[1] == '\'') {
@@ -237,6 +238,7 @@ int make_arg_list(const char *in, int len, uint64_t mask, struct arg **argp,
 			arg->type = ARGT_SINT;
 			break;
 
+		case ARGT_ID:
 		case ARGT_FE:
 		case ARGT_BE:
 		case ARGT_TAB:
@@ -250,8 +252,8 @@ int make_arg_list(const char *in, int len, uint64_t mask, struct arg **argp,
 				goto resolve_err;
 			arg->unresolved = 1;
 			new_al = arg_list_add(al, arg, pos);
+			__fallthrough;
 
-			/* fall through */
 		case ARGT_STR:
 			/* all types that must be resolved are stored as strings
 			 * during the parsing. The caller must at one point resolve

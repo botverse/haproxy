@@ -46,27 +46,43 @@
  * This structure is the base one, in the case of a multi-cert bundle, we
  *  allocate 1 structure per type.
  */
-struct cert_key_and_chain {
+struct ckch_data {
 	X509 *cert;
 	EVP_PKEY *key;
 	STACK_OF(X509) *chain;
-	DH *dh;
+	HASSL_DH *dh;
 	struct buffer *sctl;
 	struct buffer *ocsp_response;
 	X509 *ocsp_issuer;
+	OCSP_CERTID *ocsp_cid;
+	struct issuer_chain *extra_chain; /* chain from 'issuers-chain-path' */
+};
+
+/* configuration for the ckch_store */
+struct ckch_conf {
+	int used;
+	char *crt;
+	char *key;
+	char *ocsp;
+	char *issuer;
+	char *sctl;
+	int ocsp_update_mode;
 };
 
 /*
  * this is used to store 1 to SSL_SOCK_NUM_KEYTYPES cert_key_and_chain and
  * metadata.
  *
+ * "ckch" for cert, key and chain.
+ *
  * XXX: Once we remove the multi-cert bundle support, we could merge this structure
  * with the cert_key_and_chain one.
  */
 struct ckch_store {
-	struct cert_key_and_chain *ckch;
+	struct ckch_data *data;
 	struct list ckch_inst; /* list of ckch_inst which uses this ckch_node */
 	struct list crtlist_entry; /* list of entries which use this store */
+	struct ckch_conf conf;
 	struct ebmb_node node;
 	char path[VAR_ARRAY];
 };
@@ -132,6 +148,54 @@ struct cafile_entry {
 	struct ebmb_node node;
 	char path[0];
 };
+
+enum {
+	CERT_TYPE_PEM = 0,
+	CERT_TYPE_KEY,
+#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) || defined OPENSSL_IS_BORINGSSL)
+	CERT_TYPE_OCSP,
+#endif
+	CERT_TYPE_ISSUER,
+#ifdef HAVE_SSL_SCTL
+	CERT_TYPE_SCTL,
+#endif
+	CERT_TYPE_MAX,
+};
+
+/*
+ * When crt-store options are set from a crt-list, the crt-store options must be explicit everywhere.
+ * When crt-store options are set from a crt-store, the crt-store options can be empty, or the exact same
+ */
+enum {
+	CKCH_CONF_SET_EMPTY    = 0,     /* config is empty */
+	CKCH_CONF_SET_CRTLIST  = 1,     /* config is set from a crt-list */
+	CKCH_CONF_SET_CRTSTORE = 2,     /* config is defined in a crt-store */
+};
+
+struct cert_exts {
+	const char *ext;
+	int type;
+	int (*load)(const char *path, char *payload, struct ckch_data *data, char **err);
+	/* add a parsing callback */
+};
+
+/* argument types */
+enum parse_type_t {
+	PARSE_TYPE_NONE = 0,
+	PARSE_TYPE_INT,
+	PARSE_TYPE_STR,         /* string which is strdup() */
+	PARSE_TYPE_ONOFF,       /* "on" or "off" keyword */
+};
+
+struct ckch_conf_kws {
+	const char *name;
+	ssize_t offset;
+	enum parse_type_t type;
+	int (*func)(void *value, char *buf, struct ckch_data *d, int cli, char **err);
+	char **base; /* ptr to the base path */
+};
+
+extern struct ckch_conf_kws ckch_conf_kws[];
 
 #endif /* USE_OPENSSL */
 #endif /* _HAPROXY_SSL_CKCH_T_H */

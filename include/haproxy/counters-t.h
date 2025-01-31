@@ -23,11 +23,14 @@
 #ifndef _HAPROXY_COUNTERS_T_H
 #define _HAPROXY_COUNTERS_T_H
 
+#include <haproxy/freq_ctr-t.h>
+
 /* counters used by listeners and frontends */
 struct fe_counters {
 	unsigned int conn_max;                  /* max # of active sessions */
 	long long    cum_conn;                  /* cumulated number of received connections */
 	long long    cum_sess;                  /* cumulated number of accepted connections */
+	long long    cum_sess_ver[3];           /* cumulated number of h1/h2/h3 sessions */
 
 	unsigned int cps_max;                   /* maximum of new connections received per second */
 	unsigned int sps_max;                   /* maximum of new connections accepted per second (sessions) */
@@ -35,9 +38,10 @@ struct fe_counters {
 	long long bytes_in;                     /* number of bytes transferred from the client to the server */
 	long long bytes_out;                    /* number of bytes transferred from the server to the client */
 
-	long long comp_in;                      /* input bytes fed to the compressor */
-	long long comp_out;                     /* output bytes emitted by the compressor */
-	long long comp_byp;                     /* input bytes that bypassed the compressor (cpu/ram/bw limitation) */
+	/* compression counters, index 0 for requests, 1 for responses */
+	long long comp_in[2];                   /* input bytes fed to the compressor */
+	long long comp_out[2];                  /* output bytes emitted by the compressor */
+	long long comp_byp[2];                  /* input bytes that bypassed the compressor (cpu/ram/bw limitation) */
 
 	long long denied_req;                   /* blocked requests because of security concerns */
 	long long denied_resp;                  /* blocked responses because of security concerns */
@@ -53,7 +57,7 @@ struct fe_counters {
 
 	union {
 		struct {
-			long long cum_req;      /* cumulated number of processed HTTP requests */
+			long long cum_req[4];   /* cumulated number of processed other/h1/h2/h3 requests */
 			long long comp_rsp;     /* number of compressed responses */
 			unsigned int rps_max;   /* maximum of new HTTP requests second observed */
 			long long rsp[6];       /* http response codes */
@@ -61,15 +65,19 @@ struct fe_counters {
 			long long cache_hits;   /* cache hits */
 		} http;
 	} p;                                    /* protocol-specific stats */
+
+	struct freq_ctr sess_per_sec;           /* sessions per second on this server */
+	struct freq_ctr req_per_sec;            /* HTTP requests per second on the frontend */
+	struct freq_ctr conn_per_sec;           /* received connections per second on the frontend */
+
+	unsigned long last_change;              /* last time, when the state was changed */
 };
 
 /* counters used by servers and backends */
 struct be_counters {
 	unsigned int conn_max;                  /* max # of active sessions */
-	long long    cum_conn;                  /* cumulated number of received connections */
 	long long    cum_sess;                  /* cumulated number of accepted connections */
 	long long  cum_lbconn;                  /* cumulated number of sessions processed by load balancing (BE only) */
-	unsigned long last_sess;                /* last session time */
 
 	unsigned int cps_max;                   /* maximum of new connections received per second */
 	unsigned int sps_max;                   /* maximum of new connections accepted per second (sessions) */
@@ -79,9 +87,10 @@ struct be_counters {
 	long long bytes_in;                     /* number of bytes transferred from the client to the server */
 	long long bytes_out;                    /* number of bytes transferred from the server to the client */
 
-	long long comp_in;                      /* input bytes fed to the compressor */
-	long long comp_out;                     /* output bytes emitted by the compressor */
-	long long comp_byp;                     /* input bytes that bypassed the compressor (cpu/ram/bw limitation) */
+	/* compression counters, index 0 for requests, 1 for responses */
+	long long comp_in[2];                   /* input bytes fed to the compressor */
+	long long comp_out[2];                  /* output bytes emitted by the compressor */
+	long long comp_byp[2];                  /* input bytes that bypassed the compressor (cpu/ram/bw limitation) */
 
 	long long denied_req;                   /* blocked requests because of security concerns */
 	long long denied_resp;                  /* blocked responses because of security concerns */
@@ -113,6 +122,11 @@ struct be_counters {
 			long long cache_hits;   /* cache hits */
 		} http;
 	} p;                                    /* protocol-specific stats */
+
+	struct freq_ctr sess_per_sec;           /* sessions per second on this server */
+
+	unsigned long last_sess;                /* last session time */
+	unsigned long last_change;              /* last time, when the state was changed */
 };
 
 #endif /* _HAPROXY_COUNTERS_T_H */

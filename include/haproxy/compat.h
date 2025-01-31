@@ -24,6 +24,7 @@
 
 #include <limits.h>
 #include <unistd.h>
+#include <fcntl.h>
 /* This is needed on Linux for Netfilter includes */
 #include <sys/param.h>
 #include <sys/types.h>
@@ -94,11 +95,19 @@ typedef struct { } empty_t;
 #endif
 
 #ifndef MIN
-#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#define MIN(a, b) ({				\
+	typeof(a) _a = (a);			\
+	typeof(a) _b = (b);			\
+	((_a < _b) ? _a : _b);			\
+})
 #endif
 
 #ifndef MAX
-#define MAX(a, b) (((a) > (b)) ? (a) : (b))
+#define MAX(a, b) ({				\
+	typeof(a) _a = (a);			\
+	typeof(a) _b = (b);			\
+	((_a > _b) ? _a : _b);			\
+})
 #endif
 
 /* this is for libc5 for example */
@@ -232,7 +241,11 @@ typedef struct { } empty_t;
  * than ours.
  */
 #ifdef USE_BACKTRACE
-#if defined(__aarch64__)
+#if defined(__linux__) && !defined(__GNU_LIBRARY__)
+/* On Linux, backtrace() is only available in glibc. Others will need the
+ * in-house implementation.
+ */
+#elif defined(__aarch64__)
 /* on aarch64 at least from gcc-4.7.4 to 7.4.1 we only get a single entry, which
  * is pointless. Ours works though it misses the faulty function itself,
  * probably due to an alternate stack for the signal handler which does not
@@ -245,6 +258,12 @@ typedef struct { } empty_t;
 #else
 #define HA_HAVE_WORKING_BACKTRACE
 #endif
+#endif
+
+/* dl_iterate_phdr() is available in GLIBC 2.2.4 and up. Let's round up to 2.3.x */
+#if defined(USE_DL) && defined(__GNU_LIBRARY__) && (__GLIBC__ > 2 || __GLIBC__ == 2 && __GLIBC_MINOR__ >= 3)
+#define HA_HAVE_DL_ITERATE_PHDR
+#define HA_HAVE_DUMP_LIBS
 #endif
 
 /* malloc_trim() can be very convenient to reclaim unused memory especially
@@ -274,15 +293,44 @@ typedef struct { } empty_t;
 #endif
 
 /* macOS has a call similar to malloc_usable_size */
-#if defined(USE_MEMORY_PROFILING) && defined(__APPLE__)
+#if defined(__APPLE__)
 #include <malloc/malloc.h>
 #define malloc_usable_size malloc_size
+#define HA_HAVE_MALLOC_ZONE
+#define TCP_KEEPIDLE TCP_KEEPALIVE
+#define TCP_INFO TCP_CONNECTION_INFO
+#define tcp_info tcp_connection_info
 #endif
 
 /* Max number of file descriptors we send in one sendmsg(). Linux seems to be
- * able to send 253 fds per sendmsg(), not sure about the other OSes.
+ * able to send 253 fds per sendmsg(), however musl is limited to 252, not sure
+ * about the other OSes.
  */
-#define MAX_SEND_FD 253
+#define MAX_SEND_FD 252
+
+/* Some bsd kernels (ie: FreeBSD) offer the FAST clock source as equivalent
+ * to Linux COARSE clock source. Aliasing COARSE to FAST on such systems when
+ * COARSE is not already defined.
+ */
+#if !defined(CLOCK_MONOTONIC_COARSE) && defined(CLOCK_MONOTONIC_FAST)
+#define CLOCK_MONOTONIC_COARSE CLOCK_MONOTONIC_FAST
+#endif
+
+/* On Solaris, `queue` is a reserved name, so we redefine it here for now.
+ */
+#if defined(sun)
+#define queue _queue
+#endif
+
+/* Define a flag indicating if MPTCP is available */
+#ifdef __linux__
+#define HA_HAVE_MPTCP 1
+#endif
+
+/* only Linux defines IPPROTO_MPTCP */
+#ifndef IPPROTO_MPTCP
+#define IPPROTO_MPTCP 262
+#endif
 
 #endif /* _HAPROXY_COMPAT_H */
 

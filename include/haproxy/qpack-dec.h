@@ -1,7 +1,7 @@
 /*
  * QPACK decompressor
  *
- * Copyright 2021 HAProxy Technologies, Frédéric Lécaille <flecaille@haproxy.com>
+ * Copyright 2021 HAProxy Technologies, Frederic Lecaille <flecaille@haproxy.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -21,20 +21,22 @@
 #ifndef _HAPROXY_QPACK_DEC_H
 #define _HAPROXY_QPACK_DEC_H
 
-#include <haproxy/mux_quic-t.h>
+#include <inttypes.h>
 
-struct h3_uqs;
+struct buffer;
 struct http_hdr;
 
 /* Internal QPACK processing errors.
  *Nothing to see with the RFC.
  */
 enum {
-	QPACK_ERR_NONE = 0,
-	QPACK_ERR_RIC,
-	QPACK_ERR_DB,
-	QPACK_ERR_TRUNCATED,
-	QPACK_ERR_HUFFMAN,
+	QPACK_RET_NONE = 0,  /* no error */
+	QPACK_RET_DECOMP,    /* corresponds to RFC 9204 decompression error */
+	QPACK_RET_RIC,       /* cannot decode Required Insert Count prefix field */
+	QPACK_RET_DB,        /* cannot decode Delta Base prefix field */
+	QPACK_RET_TRUNCATED, /* truncated stream */
+	QPACK_RET_HUFFMAN,   /* huffman decoding error */
+	QPACK_RET_TOO_LARGE, /* decoded request/response is too large */
 };
 
 struct qpack_dec {
@@ -45,8 +47,10 @@ struct qpack_dec {
 };
 
 int qpack_decode_fs(const unsigned char *buf, uint64_t len, struct buffer *tmp,
-                    struct http_hdr *list);
-int qpack_decode_enc(struct h3_uqs *h3_uqs, void *ctx);
-int qpack_decode_dec(struct h3_uqs *h3_uqs, void *ctx);
+                    struct http_hdr *list, int list_size);
+int qpack_decode_enc(struct buffer *buf, int fin, void *ctx);
+int qpack_decode_dec(struct buffer *buf, int fin, void *ctx);
+
+int qpack_err_decode(const int value);
 
 #endif /* _HAPROXY_QPACK_DEC_H */

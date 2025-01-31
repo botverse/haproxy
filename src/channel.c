@@ -119,7 +119,7 @@ int ci_putchr(struct channel *chn, char c)
 	*ci_tail(chn) = c;
 
 	b_add(&chn->buf, 1);
-	chn->flags |= CF_READ_PARTIAL;
+	chn->flags |= CF_READ_EVENT;
 
 	if (chn->to_forward >= 1) {
 		if (chn->to_forward != CHN_INFINITE_FORWARD)
@@ -176,7 +176,91 @@ int ci_putblk(struct channel *chn, const char *blk, int len)
 	return len;
 }
 
-/* Gets one text word out of a channel's buffer from a stream interface.
+/* Locates the longest part of the channel's output buffer that is composed
+ * exclusively of characters not in the <delim> set, and delimited by one of
+ * these characters, and returns the initial part and the first of such
+ * delimiters. A single escape character in <escape> may be specified so that
+ * when not 0 and found, the character that follows it is never taken as a
+ * delimiter. Note that <delim> cannot contain the zero byte, hence this
+ * function is not usable with byte zero as a delimiter.
+ *
+ * Return values :
+ *   >0 : number of bytes read. Includes the sep if present before len or end.
+ *   =0 : no sep before end found. <str> is left undefined.
+ *   <0 : no more bytes readable because output is shut.
+ * The channel status is not changed. The caller must call co_skip() to
+ * update it. One of the delimiters is waited for as long as neither the buffer
+ * nor the output are full. If either of them is full, the string may be
+ * returned as is, without the delimiter.
+ */
+int co_getdelim(const struct channel *chn, char *str, int len, const char *delim, char escape)
+{
+	uchar delim_map[256 / 8];
+	int found, escaped;
+	uint pos, bit;
+	int ret, max;
+	uchar b;
+	char *p;
+
+	ret = 0;
+	max = len;
+
+	/* closed or empty + imminent close = -1; empty = 0 */
+	if (unlikely((chn_cons(chn)->flags & SC_FL_SHUT_DONE) || !co_data(chn))) {
+		if (chn_cons(chn)->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED))
+			ret = -1;
+		goto out;
+	}
+
+	p = co_head(chn);
+
+	if (max > co_data(chn)) {
+		max = co_data(chn);
+		str[max-1] = 0;
+	}
+
+	/* create the byte map */
+	memset(delim_map, 0, sizeof(delim_map));
+	while ((b = *delim)) {
+		pos = b >> 3;
+		bit = b &  7;
+		delim_map[pos] |= 1 << bit;
+		delim++;
+	}
+
+	found = escaped = 0;
+	while (max) {
+		*str++ = b = *p;
+		ret++;
+		max--;
+
+		if (escape && (escaped || *p == escape)) {
+			escaped = !escaped;
+			goto skip;
+		}
+
+		pos = b >> 3;
+		bit = b &  7;
+		if (delim_map[pos] & (1 << bit)) {
+			found = 1;
+			break;
+		}
+	skip:
+		p = b_next(&chn->buf, p);
+	}
+
+	if (ret > 0 && ret < len &&
+	    (ret < co_data(chn) || channel_may_recv(chn)) &&
+	    !found &&
+	    !(chn_cons(chn)->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED)))
+		ret = 0;
+ out:
+	if (max)
+		*str = 0;
+	return ret;
+}
+
+/* Gets one text word out of a channel's buffer from a stream connector.
  * Return values :
  *   >0 : number of bytes read. Includes the sep if present before len or end.
  *   =0 : no sep before end found. <str> is left undefined.
@@ -195,8 +279,8 @@ int co_getword(const struct channel *chn, char *str, int len, char sep)
 	max = len;
 
 	/* closed or empty + imminent close = -1; empty = 0 */
-	if (unlikely((chn->flags & CF_SHUTW) || channel_is_empty(chn))) {
-		if (chn->flags & (CF_SHUTW|CF_SHUTW_NOW))
+	if (unlikely((chn_cons(chn)->flags & SC_FL_SHUT_DONE) || !co_data(chn))) {
+		if (chn_cons(chn)->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED))
 			ret = -1;
 		goto out;
 	}
@@ -219,7 +303,7 @@ int co_getword(const struct channel *chn, char *str, int len, char sep)
 	if (ret > 0 && ret < len &&
 	    (ret < co_data(chn) || channel_may_recv(chn)) &&
 	    *(str-1) != sep &&
-	    !(chn->flags & (CF_SHUTW|CF_SHUTW_NOW)))
+	    !(chn_cons(chn)->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED)))
 		ret = 0;
  out:
 	if (max)
@@ -227,7 +311,7 @@ int co_getword(const struct channel *chn, char *str, int len, char sep)
 	return ret;
 }
 
-/* Gets one text line out of a channel's buffer from a stream interface.
+/* Gets one text line out of a channel's buffer from a stream connector.
  * Return values :
  *   >0 : number of bytes read. Includes the \n if present before len or end.
  *   =0 : no '\n' before end found. <str> is left undefined.
@@ -240,37 +324,47 @@ int co_getword(const struct channel *chn, char *str, int len, char sep)
 int co_getline(const struct channel *chn, char *str, int len)
 {
 	int ret, max;
-	char *p;
+	size_t ofs;
 
 	ret = 0;
 	max = len;
 
 	/* closed or empty + imminent close = -1; empty = 0 */
-	if (unlikely((chn->flags & CF_SHUTW) || channel_is_empty(chn))) {
-		if (chn->flags & (CF_SHUTW|CF_SHUTW_NOW))
+	if (unlikely((chn_cons(chn)->flags & SC_FL_SHUT_DONE) || !co_data(chn))) {
+		if (chn_cons(chn)->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED))
 			ret = -1;
 		goto out;
 	}
-
-	p = co_head(chn);
 
 	if (max > co_data(chn)) {
 		max = co_data(chn);
 		str[max-1] = 0;
 	}
-	while (max) {
-		*str++ = *p;
-		ret++;
-		max--;
 
-		if (*p == '\n')
+	ofs = 0;
+
+	while (max) {
+		size_t contig = b_contig_data(&chn->buf, ofs);
+		size_t len = MIN(max, contig);
+		const char *beg = b_peek(&chn->buf, ofs);
+		const char *lf = memchr(beg, '\n', len);
+
+		if (lf) /* take the LF with it before stopping */
+			len = lf + 1 - beg;
+
+		memcpy(str, beg, len);
+		ret += len;
+		str += len;
+		ofs += len;
+		max -= len;
+
+		if (lf)
 			break;
-		p = b_next(&chn->buf, p);
 	}
 	if (ret > 0 && ret < len &&
 	    (ret < co_data(chn) || channel_may_recv(chn)) &&
 	    *(str-1) != '\n' &&
-	    !(chn->flags & (CF_SHUTW|CF_SHUTW_NOW)))
+	    !(chn_cons(chn)->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED)))
 		ret = 0;
  out:
 	if (max)
@@ -288,11 +382,11 @@ int co_getline(const struct channel *chn, char *str, int len)
  */
 int co_getchar(const struct channel *chn, char *c)
 {
-	if (chn->flags & CF_SHUTW)
+	if (chn_cons(chn)->flags & SC_FL_SHUT_DONE)
 		return -1;
 
 	if (unlikely(co_data(chn) == 0)) {
-		if (chn->flags & (CF_SHUTW|CF_SHUTW_NOW))
+		if (chn_cons(chn)->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED))
 			return -1;
 		return 0;
 	}
@@ -311,11 +405,11 @@ int co_getchar(const struct channel *chn, char *c)
  */
 int co_getblk(const struct channel *chn, char *blk, int len, int offset)
 {
-	if (chn->flags & CF_SHUTW)
+	if (chn_cons(chn)->flags & SC_FL_SHUT_DONE)
 		return -1;
 
-	if (len + offset > co_data(chn)) {
-		if (chn->flags & (CF_SHUTW|CF_SHUTW_NOW))
+	if (len + offset > co_data(chn) || co_data(chn) == 0) {
+		if (chn_cons(chn)->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED))
 			return -1;
 		return 0;
 	}
@@ -334,7 +428,7 @@ int co_getblk(const struct channel *chn, char *blk, int len, int offset)
 int co_getblk_nc(const struct channel *chn, const char **blk1, size_t *len1, const char **blk2, size_t *len2)
 {
 	if (unlikely(co_data(chn) == 0)) {
-		if (chn->flags & (CF_SHUTW|CF_SHUTW_NOW))
+		if (chn_cons(chn)->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED))
 			return -1;
 		return 0;
 	}
@@ -342,7 +436,7 @@ int co_getblk_nc(const struct channel *chn, const char **blk1, size_t *len1, con
 	return b_getblk_nc(&chn->buf, blk1, len1, blk2, len2, 0, co_data(chn));
 }
 
-/* Gets one text line out of a channel's output buffer from a stream interface.
+/* Gets one text line out of a channel's output buffer from a stream connector.
  * Return values :
  *   >0 : number of blocks returned (1 or 2). blk1 is always filled before blk2.
  *   =0 : not enough data available.
@@ -376,7 +470,7 @@ int co_getline_nc(const struct channel *chn,
 		}
 	}
 
-	if (chn->flags & (CF_SHUTW|CF_SHUTW_NOW)) {
+	if (chn_cons(chn)->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED)) {
 		/* If we have found no LF and the buffer is shut, then
 		 * the resulting string is made of the concatenation of
 		 * the pending blocks (1 or 2).
@@ -400,7 +494,7 @@ int ci_getblk_nc(const struct channel *chn,
                  char **blk2, size_t *len2)
 {
 	if (unlikely(ci_data(chn) == 0)) {
-		if (chn->flags & CF_SHUTR)
+		if (chn_prod(chn)->flags & (SC_FL_EOS|SC_FL_ABRT_DONE))
 			return -1;
 		return 0;
 	}
@@ -418,7 +512,7 @@ int ci_getblk_nc(const struct channel *chn,
 	return 1;
 }
 
-/* Gets one text line out of a channel's input buffer from a stream interface.
+/* Gets one text line out of a channel's input buffer from a stream connector.
  * Return values :
  *   >0 : number of blocks returned (1 or 2). blk1 is always filled before blk2.
  *   =0 : not enough data available.
@@ -452,7 +546,7 @@ int ci_getline_nc(const struct channel *chn,
 		}
 	}
 
-	if (chn->flags & CF_SHUTW) {
+	if (chn_cons(chn)->flags & SC_FL_SHUT_DONE) {
 		/* If we have found no LF and the buffer is shut, then
 		 * the resulting string is made of the concatenation of
 		 * the pending blocks (1 or 2).
@@ -463,6 +557,36 @@ int ci_getline_nc(const struct channel *chn,
 	/* No LF yet and not shut yet */
 	return 0;
 }
+
+/* Inserts <str> at position <pos> relative to channel <c>'s  * input head. The
+ * <len> argument informs about the length of string <str> so that we don't have
+ * to measure it. <str> must be a valid pointer.
+ *
+ * The number of bytes added is returned on success. 0 is returned on failure.
+ */
+int ci_insert(struct channel *c, int pos, const char *str, int len)
+{
+	struct buffer *b = &c->buf;
+	char *dst = c_ptr(c, pos);
+
+	if (__b_tail(b) + len >= b_wrap(b))
+		return 0;  /* no space left */
+
+	if (b_data(b) &&
+	    b_tail(b) + len > b_head(b) &&
+	    b_head(b) >= b_tail(b))
+		return 0;  /* no space left before wrapping data */
+
+	/* first, protect the end of the buffer */
+	memmove(dst + len, dst, b_tail(b) - dst);
+
+	/* now, copy str over dst */
+	memcpy(dst, str, len);
+
+	b_add(b, len);
+	return len;
+}
+
 
 /* Inserts <str> followed by "\r\n" at position <pos> relative to channel <c>'s
  * input head. The <len> argument informs about the length of string <str> so

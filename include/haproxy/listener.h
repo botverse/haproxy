@@ -31,6 +31,8 @@
 struct proxy;
 struct task;
 
+int li_init_per_thr(struct listener *li);
+
 /* adjust the listener's state and its proxy's listener counters if needed */
 void listener_set_state(struct listener *l, enum li_state st);
 
@@ -40,18 +42,40 @@ void listener_set_state(struct listener *l, enum li_state st);
  * closes upon SHUT_WR and refuses to rebind. So a common validation path
  * involves SHUT_WR && listen && SHUT_RD. In case of success, the FD's polling
  * is disabled. It normally returns non-zero, unless an error is reported.
+ * It will need to operate under the proxy's lock and the listener's lock.
+ * suspend() may totally stop a listener if it doesn't support the PAUSED
+ * state, in which case state will be set to ASSIGNED.
+ * The caller is responsible for indicating in lpx, lli whether the respective
+ * locks are already held (non-zero) or not (zero) so that the function pick
+ * the missing ones, in this order.
  */
-int pause_listener(struct listener *l);
+int suspend_listener(struct listener *l, int lpx, int lli);
 
 /* This function tries to resume a temporarily disabled listener.
  * The resulting state will either be LI_READY or LI_FULL. 0 is returned
  * in case of failure to resume (eg: dead socket).
+ * It will need to operate under the proxy's lock and the listener's lock.
+ * The caller is responsible for indicating in lpx, lli whether the respective
+ * locks are already held (non-zero) or not (zero) so that the function pick
+ * the missing ones, in this order.
  */
-int resume_listener(struct listener *l);
+int resume_listener(struct listener *l, int lpx, int lli);
+
+/* Same as resume_listener(), but will only work to resume from
+ * LI_FULL or LI_LIMITED states because we try to relax listeners that
+ * were temporarily restricted and not to resume inactive listeners that
+ * may have been paused or completely stopped in the meantime.
+ * Returns positive value for success and 0 for failure.
+ * It will need to operate under the proxy's lock and the listener's lock.
+ * The caller is responsible for indicating in lpx, lli whether the respective
+ * locks are already held (non-zero) or not (zero) so that the function pick
+ * the missing ones, in this order.
+ */
+int relax_listener(struct listener *l, int lpx, int lli);
 
 /*
  * This function completely stops a listener. It will need to operate under the
- * proxy's lock, the protocol's lock, and the listener's lock. The caller is
+ * proxy's lock, the protocol's and the listener's lock. The caller is
  * responsible for indicating in lpx, lpr, lli whether the respective locks are
  * already held (non-zero) or not (zero) so that the function picks the missing
  * ones, in this order.
@@ -70,7 +94,7 @@ void enable_listener(struct listener *listener);
 void dequeue_all_listeners(void);
 
 /* Dequeues all listeners waiting for a resource in proxy <px>'s queue */
-void dequeue_proxy_listeners(struct proxy *px);
+void dequeue_proxy_listeners(struct proxy *px, int lpx);
 
 /* This function closes the listening socket for the specified listener,
  * provided that it's already in a listening state. The listener enters the
@@ -98,6 +122,8 @@ void unbind_listener(struct listener *listener);
  */
 int create_listeners(struct bind_conf *bc, const struct sockaddr_storage *ss,
                      int portl, int porth, int fd, struct protocol *proto, char **err);
+struct shard_info *shard_info_attach(struct receiver *rx, struct shard_info *si);
+void shard_info_detach(struct receiver *rx);
 struct listener *clone_listener(struct listener *src);
 
 /* Delete a listener from its protocol's list of listeners. The listener's
@@ -158,6 +184,21 @@ int default_suspend_listener(struct listener *l);
  */
 int default_resume_listener(struct listener *l);
 
+/* Applies the thread mask, shards etc to the bind_conf. It normally returns 0
+ * otherwie the number of errors. Upon error it may set error codes (ERR_*) in
+ * err_code. It is supposed to be called only once very late in the boot process
+ * after the bind_conf's thread_set is fixed. The function may emit warnings and
+ * alerts. Extra listeners may be created on the fly.
+ */
+int bind_complete_thread_setup(struct bind_conf *bind_conf, int *err_code);
+
+/* Generate and insert unique GUID for each listeners of <bind_conf> instance
+ * if GUID prefix is defined.
+ *
+ * Returns 0 on success else non-zero.
+ */
+int bind_generate_guid(struct bind_conf *bind_conf);
+
 /*
  * Registers the bind keyword list <kwl> as a list of valid keywords for next
  * parsing sessions.
@@ -170,6 +211,8 @@ struct bind_kw *bind_find_kw(const char *kw);
 /* Dumps all registered "bind" keywords to the <out> string pointer. */
 void bind_dump_kws(char **out);
 const char *bind_find_best_kw(const char *word);
+int bind_parse_args_list(struct bind_conf *bind_conf, char **args, int cur_arg,
+                         const char *section, const char *file, int linenum);
 
 void bind_recount_thread_bits(struct bind_conf *conf);
 unsigned int bind_map_thread_id(const struct bind_conf *conf, unsigned int r);
@@ -183,6 +226,22 @@ extern struct accept_queue_ring accept_queue_rings[MAX_THREADS] __attribute__((a
 
 extern const char* li_status_st[LI_STATE_COUNT];
 enum li_status get_li_status(struct listener *l);
+
+/* number of times an accepted connection resulted in maxconn being reached */
+extern ullong maxconn_reached;
+
+static inline uint accept_queue_ring_len(const struct accept_queue_ring *ring)
+{
+	uint idx, head, tail, len;
+
+	idx  = _HA_ATOMIC_LOAD(&ring->idx);  /* (head << 16) + tail */
+	head = idx >> 16;
+	tail = idx & 0xffff;
+	len  = tail + ACCEPT_QUEUE_SIZE - head;
+	if (len >= ACCEPT_QUEUE_SIZE)
+		len -= ACCEPT_QUEUE_SIZE;
+	return len;
+}
 
 #endif /* _HAPROXY_LISTENER_H */
 

@@ -10,7 +10,6 @@
  *
  */
 
-#include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
 #include <sys/types.h>
@@ -22,7 +21,7 @@
 
 #include <haproxy/acl.h>
 #include <haproxy/api.h>
-#include <haproxy/applet-t.h>
+#include <haproxy/applet.h>
 #include <haproxy/capture-t.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/cli.h>
@@ -30,8 +29,12 @@
 #include <haproxy/fd.h>
 #include <haproxy/filters.h>
 #include <haproxy/global.h>
+#include <haproxy/guid.h>
 #include <haproxy/http_ana.h>
 #include <haproxy/http_htx.h>
+#include <haproxy/http_ext.h>
+#include <haproxy/http_rules.h>
+#include <haproxy/mailers.h>
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
 #include <haproxy/obj_type-t.h>
@@ -40,16 +43,18 @@
 #include <haproxy/protocol.h>
 #include <haproxy/proto_tcp.h>
 #include <haproxy/proxy.h>
+#include <haproxy/sc_strm.h>
+#include <haproxy/quic_tp.h>
 #include <haproxy/server-t.h>
 #include <haproxy/signal.h>
 #include <haproxy/stats-t.h>
+#include <haproxy/stconn.h>
 #include <haproxy/stream.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/task.h>
 #include <haproxy/tcpcheck.h>
 #include <haproxy/time.h>
 #include <haproxy/tools.h>
-#include <haproxy/xprt_quic.h>
+#include <haproxy/uri_auth.h>
 
 
 int listeners;	/* # of proxy listeners, set by cfgparse */
@@ -57,7 +62,20 @@ struct proxy *proxies_list  = NULL;	/* list of all existing proxies */
 struct eb_root used_proxy_id = EB_ROOT;	/* list of proxy IDs in use */
 struct eb_root proxy_by_name = EB_ROOT; /* tree of proxies sorted by name */
 struct eb_root defproxy_by_name = EB_ROOT; /* tree of default proxies sorted by name (dups possible) */
+struct proxy *orphaned_default_proxies = NULL; /* deleted ones with refcount != 0 */
 unsigned int error_snapshot_id = 0;     /* global ID assigned to each error then incremented */
+
+/* CLI context used during "show servers {state|conn}" */
+struct show_srv_ctx {
+	struct proxy *px;       /* current proxy to dump or NULL */
+	struct server *sv;      /* current server to dump or NULL */
+	uint only_pxid;         /* dump only this proxy ID when explicit */
+	int show_conn;          /* non-zero = "conn" otherwise "state" */
+	enum {
+		SHOW_SRV_HEAD = 0,
+		SHOW_SRV_LIST,
+	} state;
+};
 
 /* proxy->options */
 const struct cfg_opt cfg_opts[] =
@@ -70,6 +88,7 @@ const struct cfg_opt cfg_opts[] =
 	{ "dontlognull",  PR_O_NULLNOLOG,  PR_CAP_FE, 0, 0 },
 	{ "http-buffer-request", PR_O_WREQ_BODY,  PR_CAP_FE | PR_CAP_BE, 0, PR_MODE_HTTP },
 	{ "http-ignore-probes", PR_O_IGNORE_PRB, PR_CAP_FE, 0, PR_MODE_HTTP },
+	{ "idle-close-on-response", PR_O_IDLE_CLOSE_RESP, PR_CAP_FE, 0, PR_MODE_HTTP },
 	{ "prefer-last-server", PR_O_PREF_LAST,  PR_CAP_BE, 0, PR_MODE_HTTP },
 	{ "logasap",      PR_O_LOGASAP,    PR_CAP_FE, 0, 0 },
 	{ "nolinger",     PR_O_TCP_NOLING, PR_CAP_FE | PR_CAP_BE, 0, 0 },
@@ -96,8 +115,8 @@ const struct cfg_opt cfg_opts2[] =
         { "splice-response", 0, 0, 0, 0 },
         { "splice-auto",     0, 0, 0, 0 },
 #endif
-	{ "accept-invalid-http-request",  PR_O2_REQBUG_OK, PR_CAP_FE, 0, PR_MODE_HTTP },
-	{ "accept-invalid-http-response", PR_O2_RSPBUG_OK, PR_CAP_BE, 0, PR_MODE_HTTP },
+	{ "accept-unsafe-violations-in-http-request",  PR_O2_REQBUG_OK, PR_CAP_FE, 0, PR_MODE_HTTP },
+	{ "accept-unsafe-violations-in-http-response", PR_O2_RSPBUG_OK, PR_CAP_BE, 0, PR_MODE_HTTP },
 	{ "dontlog-normal",               PR_O2_NOLOGNORM, PR_CAP_FE, 0, 0 },
 	{ "log-separate-errors",          PR_O2_LOGERRORS, PR_CAP_FE, 0, 0 },
 	{ "log-health-checks",            PR_O2_LOGHCHKS,  PR_CAP_BE, 0, 0 },
@@ -109,13 +128,48 @@ const struct cfg_opt cfg_opts2[] =
 	{ "http-pretend-keepalive",       PR_O2_FAKE_KA,   PR_CAP_BE, 0, PR_MODE_HTTP },
 	{ "http-no-delay",                PR_O2_NODELAY,   PR_CAP_FE|PR_CAP_BE, 0, PR_MODE_HTTP },
 
-	{"h1-case-adjust-bogus-client",   PR_O2_H1_ADJ_BUGCLI, PR_CAP_FE, 0, PR_MODE_HTTP },
-	{"h1-case-adjust-bogus-server",   PR_O2_H1_ADJ_BUGSRV, PR_CAP_BE, 0, PR_MODE_HTTP },
+	{"h1-case-adjust-bogus-client",   PR_O2_H1_ADJ_BUGCLI, PR_CAP_FE, 0, 0 },
+	{"h1-case-adjust-bogus-server",   PR_O2_H1_ADJ_BUGSRV, PR_CAP_BE, 0, 0 },
 	{"disable-h2-upgrade",            PR_O2_NO_H2_UPGRADE, PR_CAP_FE, 0, PR_MODE_HTTP },
 	{ NULL, 0, 0, 0 }
 };
 
-static void free_stick_rules(struct list *rules)
+/* Helper function to resolve a single sticking rule after config parsing.
+ * Returns 1 for success and 0 for failure
+ */
+int resolve_stick_rule(struct proxy *curproxy, struct sticking_rule *mrule)
+{
+	struct stktable *target;
+
+	if (mrule->table.name)
+		target = stktable_find_by_name(mrule->table.name);
+	else
+		target = curproxy->table;
+
+	if (!target) {
+		ha_alert("Proxy '%s': unable to find stick-table '%s'.\n",
+		         curproxy->id, mrule->table.name ? mrule->table.name : curproxy->id);
+		return 0;
+	}
+	else if (!stktable_compatible_sample(mrule->expr, target->type)) {
+		ha_alert("Proxy '%s': type of fetch not usable with type of stick-table '%s'.\n",
+		         curproxy->id, mrule->table.name ? mrule->table.name : curproxy->id);
+		return 0;
+	}
+
+	/* success */
+	ha_free(&mrule->table.name);
+	mrule->table.t = target;
+	stktable_alloc_data_type(target, STKTABLE_DT_SERVER_ID, NULL, NULL);
+	stktable_alloc_data_type(target, STKTABLE_DT_SERVER_KEY, NULL, NULL);
+	if (!in_proxies_list(target->proxies_list, curproxy)) {
+		curproxy->next_stkt_ref = target->proxies_list;
+		target->proxies_list = curproxy;
+	}
+	return 1;
+}
+
+void free_stick_rules(struct list *rules)
 {
 	struct sticking_rule *rule, *ruleb;
 
@@ -127,6 +181,101 @@ static void free_stick_rules(struct list *rules)
 	}
 }
 
+void free_server_rules(struct list *srules)
+{
+	struct server_rule *srule, *sruleb;
+
+	list_for_each_entry_safe(srule, sruleb, srules, list) {
+		LIST_DELETE(&srule->list);
+		free_acl_cond(srule->cond);
+		lf_expr_deinit(&srule->expr);
+		free(srule->file);
+		free(srule);
+	}
+}
+
+/* Frees proxy members that are common to all proxy types (either regular or
+ * default ones) for a proxy that's about to be destroyed.
+ * This is a subset of the complete proxy or default proxy deinit code.
+ */
+static inline void proxy_free_common(struct proxy *px)
+{
+	struct acl *acl, *aclb;
+	struct logger *log, *logb;
+	struct lf_expr *lf, *lfb;
+	struct eb32_node *node;
+
+	ha_free(&px->id);
+	drop_file_name(&px->conf.file);
+	ha_free(&px->check_command);
+	ha_free(&px->check_path);
+	ha_free(&px->cookie_name);
+	ha_free(&px->rdp_cookie_name);
+	ha_free(&px->dyncookie_key);
+	ha_free(&px->cookie_domain);
+	ha_free(&px->cookie_attrs);
+	ha_free(&px->lbprm.arg_str);
+	ha_free(&px->capture_name);
+	istfree(&px->monitor_uri);
+	ha_free(&px->conn_src.iface_name);
+#if defined(CONFIG_HAP_TRANSPARENT)
+	ha_free(&px->conn_src.bind_hdr_name);
+#endif
+	istfree(&px->server_id_hdr_name);
+	istfree(&px->header_unique_id);
+
+	http_ext_clean(px);
+
+	list_for_each_entry_safe(acl, aclb, &px->acl, list) {
+		LIST_DELETE(&acl->list);
+		prune_acl(acl);
+		free(acl);
+	}
+
+	free_act_rules(&px->tcp_req.inspect_rules);
+	free_act_rules(&px->tcp_rep.inspect_rules);
+	free_act_rules(&px->tcp_req.l4_rules);
+	free_act_rules(&px->tcp_req.l5_rules);
+	free_act_rules(&px->http_req_rules);
+	free_act_rules(&px->http_res_rules);
+	free_act_rules(&px->http_after_res_rules);
+#ifdef USE_QUIC
+	free_act_rules(&px->quic_init_rules);
+#endif
+
+	lf_expr_deinit(&px->logformat);
+	lf_expr_deinit(&px->logformat_sd);
+	lf_expr_deinit(&px->logformat_error);
+	lf_expr_deinit(&px->format_unique_id);
+
+	list_for_each_entry_safe(log, logb, &px->loggers, list) {
+		LIST_DEL_INIT(&log->list);
+		free_logger(log);
+	}
+
+	/* ensure that remaining lf_expr that were not postchecked (ie: disabled
+	 * proxy) don't keep a reference on the proxy which is about to be freed.
+	 */
+	list_for_each_entry_safe(lf, lfb, &px->conf.lf_checks, list)
+		LIST_DEL_INIT(&lf->list);
+
+	chunk_destroy(&px->log_tag);
+
+	node = eb32_first(&px->conf.log_steps);
+	while (node) {
+		struct eb32_node *prev_node = node;
+
+		/* log steps directly use the node key as id, they are not encapsulated */
+		node = eb32_next(node);
+		eb32_delete(prev_node);
+		free(prev_node);
+	}
+
+	free_email_alert(px);
+	stats_uri_auth_drop(px->uri_auth);
+	px->uri_auth = NULL;
+}
+
 void free_proxy(struct proxy *p)
 {
 	struct server *s;
@@ -134,153 +283,57 @@ void free_proxy(struct proxy *p)
 	struct listener *l,*l_next;
 	struct bind_conf *bind_conf, *bind_back;
 	struct acl_cond *cond, *condb;
-	struct acl *acl, *aclb;
-	struct server_rule *srule, *sruleb;
 	struct switching_rule *rule, *ruleb;
 	struct redirect_rule *rdr, *rdrb;
-	struct logsrv *log, *logb;
-	struct logformat_node *lf, *lfb;
 	struct proxy_deinit_fct *pxdf;
 	struct server_deinit_fct *srvdf;
 
 	if (!p)
 		return;
 
-	proxy_unref_defaults(p);
-	free(p->conf.file);
-	free(p->id);
-	free(p->cookie_name);
-	free(p->cookie_domain);
-	free(p->cookie_attrs);
-	free(p->lbprm.arg_str);
+	proxy_free_common(p);
+
+	/* regular proxy specific cleanup */
+	release_sample_expr(p->lbprm.expr);
 	free(p->server_state_file_name);
-	free(p->capture_name);
-	free(p->monitor_uri);
-	free(p->rdp_cookie_name);
 	free(p->invalid_rep);
 	free(p->invalid_req);
-#if defined(CONFIG_HAP_TRANSPARENT)
-	free(p->conn_src.bind_hdr_name);
-#endif
-	if (p->conf.logformat_string != default_http_log_format &&
-	    p->conf.logformat_string != default_tcp_log_format &&
-	    p->conf.logformat_string != clf_http_log_format &&
-	    p->conf.logformat_string != default_https_log_format)
-		free(p->conf.logformat_string);
-
-	free(p->conf.lfs_file);
-	free(p->conf.uniqueid_format_string);
-	istfree(&p->header_unique_id);
-	free(p->conf.uif_file);
 	if ((p->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_MAP)
 		free(p->lbprm.map.srv);
 
-	if (p->conf.logformat_sd_string != default_rfc5424_sd_log_format)
-		free(p->conf.logformat_sd_string);
-	free(p->conf.lfsd_file);
-
-	free(p->conf.error_logformat_string);
-	free(p->conf.elfs_file);
-
 	list_for_each_entry_safe(cond, condb, &p->mon_fail_cond, list) {
 		LIST_DELETE(&cond->list);
-		prune_acl_cond(cond);
-		free(cond);
+		free_acl_cond(cond);
 	}
+
+	guid_remove(&p->guid);
 
 	EXTRA_COUNTERS_FREE(p->extra_counters_fe);
 	EXTRA_COUNTERS_FREE(p->extra_counters_be);
 
-	list_for_each_entry_safe(acl, aclb, &p->acl, list) {
-		LIST_DELETE(&acl->list);
-		prune_acl(acl);
-		free(acl);
-	}
-
-	list_for_each_entry_safe(srule, sruleb, &p->server_rules, list) {
-		LIST_DELETE(&srule->list);
-		prune_acl_cond(srule->cond);
-		list_for_each_entry_safe(lf, lfb, &srule->expr, list) {
-			LIST_DELETE(&lf->list);
-			release_sample_expr(lf->expr);
-			free(lf->arg);
-			free(lf);
-		}
-		free(srule->file);
-		free(srule->cond);
-		free(srule);
-	}
+	free_server_rules(&p->server_rules);
 
 	list_for_each_entry_safe(rule, ruleb, &p->switching_rules, list) {
 		LIST_DELETE(&rule->list);
-		if (rule->cond) {
-			prune_acl_cond(rule->cond);
-			free(rule->cond);
-		}
+		free_acl_cond(rule->cond);
+		if (rule->dynamic)
+			lf_expr_deinit(&rule->be.expr);
 		free(rule->file);
 		free(rule);
 	}
 
 	list_for_each_entry_safe(rdr, rdrb, &p->redirect_rules, list) {
 		LIST_DELETE(&rdr->list);
-		if (rdr->cond) {
-			prune_acl_cond(rdr->cond);
-			free(rdr->cond);
-		}
-		free(rdr->rdr_str);
-		list_for_each_entry_safe(lf, lfb, &rdr->rdr_fmt, list) {
-			LIST_DELETE(&lf->list);
-			free(lf);
-		}
-		free(rdr);
+		http_free_redirect_rule(rdr);
 	}
-
-	list_for_each_entry_safe(log, logb, &p->logsrvs, list) {
-		LIST_DELETE(&log->list);
-		free(log);
-	}
-
-	list_for_each_entry_safe(lf, lfb, &p->logformat, list) {
-		LIST_DELETE(&lf->list);
-		release_sample_expr(lf->expr);
-		free(lf->arg);
-		free(lf);
-	}
-
-	list_for_each_entry_safe(lf, lfb, &p->logformat_sd, list) {
-		LIST_DELETE(&lf->list);
-		release_sample_expr(lf->expr);
-		free(lf->arg);
-		free(lf);
-	}
-
-	list_for_each_entry_safe(lf, lfb, &p->format_unique_id, list) {
-		LIST_DELETE(&lf->list);
-		release_sample_expr(lf->expr);
-		free(lf->arg);
-		free(lf);
-	}
-
-	list_for_each_entry_safe(lf, lfb, &p->logformat_error, list) {
-		LIST_DELETE(&lf->list);
-		release_sample_expr(lf->expr);
-		free(lf->arg);
-		free(lf);
-	}
-
-	free_act_rules(&p->tcp_req.inspect_rules);
-	free_act_rules(&p->tcp_rep.inspect_rules);
-	free_act_rules(&p->tcp_req.l4_rules);
-	free_act_rules(&p->tcp_req.l5_rules);
-	free_act_rules(&p->http_req_rules);
-	free_act_rules(&p->http_res_rules);
-	free_act_rules(&p->http_after_res_rules);
 
 	free_stick_rules(&p->storersp_rules);
 	free_stick_rules(&p->sticking_rules);
 
 	h = p->req_cap;
 	while (h) {
+		if (p->defpx && h == p->defpx->req_cap)
+			break;
 		h_next = h->next;
 		free(h->name);
 		pool_destroy(h->pool);
@@ -290,6 +343,8 @@ void free_proxy(struct proxy *p)
 
 	h = p->rsp_cap;
 	while (h) {
+		if (p->defpx && h == p->defpx->rsp_cap)
+			break;
 		h_next = h->next;
 		free(h->name);
 		pool_destroy(h->pool);
@@ -304,11 +359,19 @@ void free_proxy(struct proxy *p)
 		s = srv_drop(s);
 	}/* end while(s) */
 
+	/* also free default-server parameters since some of them might have
+	 * been dynamically allocated (e.g.: config hints, cookies, ssl..)
+	 */
+	srv_free_params(&p->defsrv);
+
 	list_for_each_entry_safe(l, l_next, &p->conf.listeners, by_fe) {
+		guid_remove(&l->guid);
 		LIST_DELETE(&l->by_fe);
 		LIST_DELETE(&l->by_bind);
 		free(l->name);
+		free(l->per_thr);
 		free(l->counters);
+		task_destroy(l->rx.rhttp.task);
 
 		EXTRA_COUNTERS_FREE(l->extra_counters);
 		free(l);
@@ -320,7 +383,13 @@ void free_proxy(struct proxy *p)
 			bind_conf->xprt->destroy_bind_conf(bind_conf);
 		free(bind_conf->file);
 		free(bind_conf->arg);
+		free(bind_conf->settings.interface);
 		LIST_DELETE(&bind_conf->by_fe);
+		free(bind_conf->guid_prefix);
+		free(bind_conf->rhttp_srvname);
+#ifdef USE_QUIC
+		free(bind_conf->quic_cc_algo);
+#endif
 		free(bind_conf);
 	}
 
@@ -330,17 +399,20 @@ void free_proxy(struct proxy *p)
 		pxdf->fct(p);
 
 	free(p->desc);
-	free(p->fwdfor_hdr_name);
 
 	task_destroy(p->task);
 
 	pool_destroy(p->req_cap_pool);
 	pool_destroy(p->rsp_cap_pool);
-	if (p->table)
-		pool_destroy(p->table->pool);
+
+	stktable_deinit(p->table);
+	ha_free(&p->table);
+	ha_free(&p->per_tgrp);
 
 	HA_RWLOCK_DESTROY(&p->lbprm.lock);
 	HA_RWLOCK_DESTROY(&p->lock);
+
+	proxy_unref_defaults(p);
 	ha_free(&p);
 }
 
@@ -377,6 +449,12 @@ const char *proxy_mode_str(int mode) {
 		return "http";
 	else if (mode == PR_MODE_CLI)
 		return "cli";
+	else if (mode == PR_MODE_SYSLOG)
+		return "syslog";
+	else if (mode == PR_MODE_PEERS)
+		return "peers";
+	else if (mode == PR_MODE_SPOP)
+		return "spop";
 	else
 		return "unknown";
 }
@@ -430,42 +508,6 @@ const char *proxy_find_best_option(const char *word, const char **extra)
 	return best_ptr;
 }
 
-/*
- * This function scans the list of backends and servers to retrieve the first
- * backend and the first server with the given names, and sets them in both
- * parameters. It returns zero if either is not found, or non-zero and sets
- * the ones it did not found to NULL. If a NULL pointer is passed for the
- * backend, only the pointer to the server will be updated.
- */
-int get_backend_server(const char *bk_name, const char *sv_name,
-		       struct proxy **bk, struct server **sv)
-{
-	struct proxy *p;
-	struct server *s;
-	int sid;
-
-	*sv = NULL;
-
-	sid = -1;
-	if (*sv_name == '#')
-		sid = atoi(sv_name + 1);
-
-	p = proxy_be_by_name(bk_name);
-	if (bk)
-		*bk = p;
-	if (!p)
-		return 0;
-
-	for (s = p->srv; s; s = s->next)
-		if ((sid >= 0 && s->puid == sid) ||
-		    (sid < 0 && strcmp(s->id, sv_name) == 0))
-			break;
-	*sv = s;
-	if (!s)
-		return 0;
-	return 1;
-}
-
 /* This function parses a "timeout" statement in a proxy section. It returns
  * -1 if there is any error, 1 for a warning, otherwise zero. If it does not
  * return zero, it will write an error or warning message into a preallocated
@@ -501,6 +543,10 @@ static int proxy_parse_timeout(char **args, int section, struct proxy *proxy,
 		tv = &proxy->timeout.tarpit;
 		td = &defpx->timeout.tarpit;
 		cap = PR_CAP_FE | PR_CAP_BE;
+	} else if (strcmp(args[0], "client-hs") == 0) {
+		tv = &proxy->timeout.client_hs;
+		td = &defpx->timeout.client_hs;
+		cap = PR_CAP_FE;
 	} else if (strcmp(args[0], "http-keep-alive") == 0) {
 		tv = &proxy->timeout.httpka;
 		td = &defpx->timeout.httpka;
@@ -551,7 +597,7 @@ static int proxy_parse_timeout(char **args, int section, struct proxy *proxy,
 	} else {
 		memprintf(err,
 		          "'timeout' supports 'client', 'server', 'connect', 'check', "
-		          "'queue', 'http-keep-alive', 'http-request', 'tunnel', 'tarpit', "
+		          "'queue', 'handshake', 'http-keep-alive', 'http-request', 'tunnel', 'tarpit', "
 			  "'client-fin' and 'server-fin' (got '%s')",
 		          args[0]);
 		return -1;
@@ -576,6 +622,12 @@ static int proxy_parse_timeout(char **args, int section, struct proxy *proxy,
 	else if (res) {
 		memprintf(err, "unexpected character '%c' in 'timeout %s'", *res, name);
 		return -1;
+	}
+
+	if (warn_if_lower(args[1], 100)) {
+		memprintf(err, "'timeout %s %u' in %s '%s' is suspiciously small for a value in milliseconds. Please use an explicit unit ('%ums') if that was the intent.",
+		          name, timeout, proxy_type_str(proxy), proxy->id, timeout);
+		retval = 1;
 	}
 
 	if (!(proxy->cap & cap)) {
@@ -826,8 +878,12 @@ proxy_parse_retry_on(char **args, int section, struct proxy *curpx,
 			curpx->retry_type |= PR_RE_404;
 		else if (strcmp(args[i], "408") == 0)
 			curpx->retry_type |= PR_RE_408;
+		else if (strcmp(args[i], "421") == 0)
+			curpx->retry_type |= PR_RE_421;
 		else if (strcmp(args[i], "425") == 0)
 			curpx->retry_type |= PR_RE_425;
+		else if (strcmp(args[i], "429") == 0)
+			curpx->retry_type |= PR_RE_429;
 		else if (strcmp(args[i], "500") == 0)
 			curpx->retry_type |= PR_RE_500;
 		else if (strcmp(args[i], "501") == 0)
@@ -1021,6 +1077,33 @@ static int proxy_parse_tcpka_intvl(char **args, int section, struct proxy *proxy
 	return retval;
 }
 #endif
+
+static int proxy_parse_guid(char **args, int section_type, struct proxy *curpx,
+                            const struct proxy *defpx, const char *file, int line,
+                            char **err)
+{
+	const char *guid;
+	char *guid_err = NULL;
+
+	if (curpx->cap & PR_CAP_DEF) {
+		ha_alert("parsing [%s:%d] : '%s' not allowed in 'defaults' section.\n", file, line, args[0]);
+		return -1;
+	}
+
+	if (!*args[1]) {
+		memprintf(err, "'%s' : expects an argument", args[0]);
+		return -1;
+	}
+
+	guid = args[1];
+	if (guid_insert(&curpx->obj_type, guid, &guid_err)) {
+		memprintf(err, "'%s': %s", args[0], guid_err);
+		ha_free(&guid_err);
+		return -1;
+	}
+
+	return 0;
+}
 
 /* This function inserts proxy <px> into the tree of known proxies (regular
  * ones or defaults depending on px->cap & PR_CAP_DEF). The proxy's name is
@@ -1268,35 +1351,49 @@ int proxy_cfg_ensure_no_http(struct proxy *curproxy)
 		ha_warning("cookie will be ignored for %s '%s' (needs 'mode http').\n",
 			   proxy_type_str(curproxy), curproxy->id);
 	}
-	if (curproxy->monitor_uri != NULL) {
-		ha_warning("monitor-uri will be ignored for %s '%s' (needs 'mode http').\n",
-			   proxy_type_str(curproxy), curproxy->id);
-	}
 	if (curproxy->lbprm.algo & BE_LB_NEED_HTTP) {
 		curproxy->lbprm.algo &= ~BE_LB_ALGO;
 		curproxy->lbprm.algo |= BE_LB_ALGO_RR;
 		ha_warning("Layer 7 hash not possible for %s '%s' (needs 'mode http'). Falling back to round robin.\n",
 			   proxy_type_str(curproxy), curproxy->id);
 	}
-	if (curproxy->to_log & (LW_REQ | LW_RESP)) {
-		curproxy->to_log &= ~(LW_REQ | LW_RESP);
-		ha_warning("parsing [%s:%d] : HTTP log/header format not usable with %s '%s' (needs 'mode http').\n",
-			   curproxy->conf.lfs_file, curproxy->conf.lfs_line,
-			   proxy_type_str(curproxy), curproxy->id);
-	}
-	if (curproxy->conf.logformat_string == default_http_log_format ||
-	    curproxy->conf.logformat_string == clf_http_log_format) {
+	if (curproxy->logformat.str == default_http_log_format) {
 		/* Note: we don't change the directive's file:line number */
-		curproxy->conf.logformat_string = default_tcp_log_format;
+		curproxy->logformat.str = default_tcp_log_format;
 		ha_warning("parsing [%s:%d] : 'option httplog' not usable with %s '%s' (needs 'mode http'). Falling back to 'option tcplog'.\n",
-			   curproxy->conf.lfs_file, curproxy->conf.lfs_line,
+			   curproxy->logformat.conf.file, curproxy->logformat.conf.line,
 			   proxy_type_str(curproxy), curproxy->id);
 	}
-	else if (curproxy->conf.logformat_string == default_https_log_format) {
+	else if (curproxy->logformat.str == clf_http_log_format) {
 		/* Note: we don't change the directive's file:line number */
-		curproxy->conf.logformat_string = default_tcp_log_format;
+		curproxy->logformat.str = clf_tcp_log_format;
+		ha_warning("parsing [%s:%d] : 'option httplog clf' not usable with %s '%s' (needs 'mode http'). Falling back to 'option tcplog clf'.\n",
+			   curproxy->logformat.conf.file, curproxy->logformat.conf.line,
+			   proxy_type_str(curproxy), curproxy->id);
+	}
+	else if (curproxy->logformat.str == default_https_log_format) {
+		/* Note: we don't change the directive's file:line number */
+		curproxy->logformat.str = default_tcp_log_format;
 		ha_warning("parsing [%s:%d] : 'option httpslog' not usable with %s '%s' (needs 'mode http'). Falling back to 'option tcplog'.\n",
-			   curproxy->conf.lfs_file, curproxy->conf.lfs_line,
+			   curproxy->logformat.conf.file, curproxy->logformat.conf.line,
+			   proxy_type_str(curproxy), curproxy->id);
+	}
+
+	return 0;
+}
+
+/* This function checks that the designated proxy has no log directives
+ * enabled. It will output a warning if there are, and will fix some of them.
+ * It returns the number of fatal errors encountered. This should be called
+ * at the end of the configuration parsing if the proxy is not in log mode.
+ * The <file> argument is used to construct the error message.
+ */
+int proxy_cfg_ensure_no_log(struct proxy *curproxy)
+{
+	if (curproxy->lbprm.algo & BE_LB_NEED_LOG) {
+		curproxy->lbprm.algo &= ~BE_LB_ALGO;
+		curproxy->lbprm.algo |= BE_LB_ALGO_RR;
+		ha_warning("Unusable balance algorithm for %s '%s' (needs 'mode log'). Falling back to round robin.\n",
 			   proxy_type_str(curproxy), curproxy->id);
 	}
 
@@ -1311,7 +1408,6 @@ void init_new_proxy(struct proxy *p)
 {
 	memset(p, 0, sizeof(struct proxy));
 	p->obj_type = OBJ_TYPE_PROXY;
-	queue_init(&p->queue, p, NULL);
 	LIST_INIT(&p->acl);
 	LIST_INIT(&p->http_req_rules);
 	LIST_INIT(&p->http_res_rules);
@@ -1327,16 +1423,16 @@ void init_new_proxy(struct proxy *p)
 	LIST_INIT(&p->tcp_rep.inspect_rules);
 	LIST_INIT(&p->tcp_req.l4_rules);
 	LIST_INIT(&p->tcp_req.l5_rules);
+#ifdef USE_QUIC
+	LIST_INIT(&p->quic_init_rules);
+#endif
 	MT_LIST_INIT(&p->listener_queue);
-	LIST_INIT(&p->logsrvs);
-	LIST_INIT(&p->logformat);
-	LIST_INIT(&p->logformat_sd);
-	LIST_INIT(&p->format_unique_id);
-	LIST_INIT(&p->logformat_error);
+	LIST_INIT(&p->loggers);
 	LIST_INIT(&p->conf.bind);
 	LIST_INIT(&p->conf.listeners);
 	LIST_INIT(&p->conf.errors);
 	LIST_INIT(&p->conf.args.list);
+	LIST_INIT(&p->conf.lf_checks);
 	LIST_INIT(&p->filter_configs);
 	LIST_INIT(&p->tcpcheck_rules.preset_vars);
 
@@ -1344,6 +1440,7 @@ void init_new_proxy(struct proxy *p)
 	p->conf.used_listener_id = EB_ROOT;
 	p->conf.used_server_id   = EB_ROOT;
 	p->used_server_addr      = EB_ROOT_UNIQUE;
+	p->conf.log_steps        = EB_ROOT_UNIQUE;
 
 	/* Timeouts are defined as -1 */
 	proxy_reset_timeouts(p);
@@ -1355,10 +1452,27 @@ void init_new_proxy(struct proxy *p)
 	/* Default to only allow L4 retries */
 	p->retry_type = PR_RE_CONN_FAILED;
 
+	guid_init(&p->guid);
+
 	p->extra_counters_fe = NULL;
 	p->extra_counters_be = NULL;
 
 	HA_RWLOCK_INIT(&p->lock);
+
+	/* initialize the default settings */
+	proxy_preset_defaults(p);
+}
+
+/* Initialize per-thread proxy fields */
+int proxy_init_per_thr(struct proxy *px)
+{
+	int i;
+
+	px->per_tgrp = calloc(global.nbtgroups, sizeof(*px->per_tgrp));
+	for (i = 0; i < global.nbtgroups; i++)
+		queue_init(&px->per_tgrp[i].queue, px, NULL);
+
+	return 0;
 }
 
 /* Preset default settings onto proxy <defproxy>. */
@@ -1376,106 +1490,55 @@ void proxy_preset_defaults(struct proxy *defproxy)
 		defproxy->options2 |= PR_O2_INDEPSTR;
 	defproxy->max_out_conns = MAX_SRV_LIST;
 
-	defproxy->defsrv.check.inter = DEF_CHKINTR;
-	defproxy->defsrv.check.fastinter = 0;
-	defproxy->defsrv.check.downinter = 0;
-	defproxy->defsrv.agent.inter = DEF_CHKINTR;
-	defproxy->defsrv.agent.fastinter = 0;
-	defproxy->defsrv.agent.downinter = 0;
-	defproxy->defsrv.check.rise = DEF_RISETIME;
-	defproxy->defsrv.check.fall = DEF_FALLTIME;
-	defproxy->defsrv.agent.rise = DEF_AGENT_RISETIME;
-	defproxy->defsrv.agent.fall = DEF_AGENT_FALLTIME;
-	defproxy->defsrv.check.port = 0;
-	defproxy->defsrv.agent.port = 0;
-	defproxy->defsrv.maxqueue = 0;
-	defproxy->defsrv.minconn = 0;
-	defproxy->defsrv.maxconn = 0;
-	defproxy->defsrv.max_reuse = -1;
-	defproxy->defsrv.max_idle_conns = -1;
-	defproxy->defsrv.pool_purge_delay = 5000;
-	defproxy->defsrv.slowstart = 0;
-	defproxy->defsrv.onerror = DEF_HANA_ONERR;
-	defproxy->defsrv.consecutive_errors_limit = DEF_HANA_ERRLIMIT;
-	defproxy->defsrv.uweight = defproxy->defsrv.iweight = 1;
+	srv_settings_init(&defproxy->defsrv);
+
+	lf_expr_init(&defproxy->logformat);
+	lf_expr_init(&defproxy->logformat_sd);
+	lf_expr_init(&defproxy->format_unique_id);
+	lf_expr_init(&defproxy->logformat_error);
 
 	defproxy->email_alert.level = LOG_ALERT;
 	defproxy->load_server_state_from_file = PR_SRV_STATE_FILE_UNSPEC;
-#if defined(USE_QUIC)
-	quic_transport_params_init(&defproxy->defsrv.quic_params, 0);
-#endif
 
 	if (defproxy->cap & PR_CAP_INT)
 		defproxy->timeout.connect = 5000;
 }
 
 /* Frees all dynamic settings allocated on a default proxy that's about to be
- * destroyed. This is a subset of the complete proxy deinit code, but these
- * should probably be merged ultimately. Note that most of the fields are not
- * even reset, so extreme care is required here, and calling
- * proxy_preset_defaults() afterwards would be safer.
+ * destroyed. Note that most of the fields are not even reset, so extreme care
+ * is required here, and calling proxy_preset_defaults() afterwards would be
+ * safer.
  */
 void proxy_free_defaults(struct proxy *defproxy)
 {
-	struct acl *acl, *aclb;
+	struct cap_hdr *h,*h_next;
 
-	ha_free(&defproxy->id);
-	ha_free(&defproxy->conf.file);
-	ha_free(&defproxy->check_command);
-	ha_free(&defproxy->check_path);
-	ha_free(&defproxy->cookie_name);
-	ha_free(&defproxy->rdp_cookie_name);
-	ha_free(&defproxy->dyncookie_key);
-	ha_free(&defproxy->cookie_domain);
-	ha_free(&defproxy->cookie_attrs);
-	ha_free(&defproxy->lbprm.arg_str);
-	ha_free(&defproxy->capture_name);
-	ha_free(&defproxy->monitor_uri);
+	proxy_free_common(defproxy);
+
+	/* default proxy specific cleanup */
+	ha_free((char **)&defproxy->defsrv.conf.file);
 	ha_free(&defproxy->defbe.name);
-	ha_free(&defproxy->conn_src.iface_name);
-	ha_free(&defproxy->fwdfor_hdr_name); defproxy->fwdfor_hdr_len = 0;
-	ha_free(&defproxy->orgto_hdr_name); defproxy->orgto_hdr_len = 0;
-	ha_free(&defproxy->server_id_hdr_name); defproxy->server_id_hdr_len = 0;
 
-	list_for_each_entry_safe(acl, aclb, &defproxy->acl, list) {
-		LIST_DELETE(&acl->list);
-		prune_acl(acl);
-		free(acl);
+	h = defproxy->req_cap;
+	while (h) {
+		h_next = h->next;
+		free(h->name);
+		pool_destroy(h->pool);
+		free(h);
+		h = h_next;
 	}
 
-	free_act_rules(&defproxy->tcp_req.inspect_rules);
-	free_act_rules(&defproxy->tcp_rep.inspect_rules);
-	free_act_rules(&defproxy->tcp_req.l4_rules);
-	free_act_rules(&defproxy->tcp_req.l5_rules);
-	free_act_rules(&defproxy->http_req_rules);
-	free_act_rules(&defproxy->http_res_rules);
-	free_act_rules(&defproxy->http_after_res_rules);
-
-	if (defproxy->conf.logformat_string != default_http_log_format &&
-	    defproxy->conf.logformat_string != default_tcp_log_format &&
-	    defproxy->conf.logformat_string != clf_http_log_format &&
-	    defproxy->conf.logformat_string != default_https_log_format) {
-		ha_free(&defproxy->conf.logformat_string);
+	h = defproxy->rsp_cap;
+	while (h) {
+		h_next = h->next;
+		free(h->name);
+		pool_destroy(h->pool);
+		free(h);
+		h = h_next;
 	}
 
-	if (defproxy->conf.logformat_sd_string != default_rfc5424_sd_log_format)
-		ha_free(&defproxy->conf.logformat_sd_string);
-
-	ha_free(&defproxy->conf.uniqueid_format_string);
-	ha_free(&defproxy->conf.error_logformat_string);
-	ha_free(&defproxy->conf.lfs_file);
-	ha_free(&defproxy->conf.lfsd_file);
-	ha_free(&defproxy->conf.uif_file);
-	ha_free(&defproxy->conf.elfs_file);
-	chunk_destroy(&defproxy->log_tag);
-
-	free_email_alert(defproxy);
 	proxy_release_conf_errors(defproxy);
 	deinit_proxy_tcpcheck(defproxy);
-
-	/* FIXME: we cannot free uri_auth because it might already be used by
-	 * another proxy (legacy code for stats URI ...). Refcount anyone ?
-	 */
 }
 
 /* delete a defproxy from the tree if still in it, frees its content and its
@@ -1500,15 +1563,43 @@ void proxy_destroy_defaults(struct proxy *px)
 void proxy_destroy_all_unref_defaults()
 {
 	struct ebpt_node *n;
+	struct proxy *px, *nx;
 
 	n = ebpt_first(&defproxy_by_name);
 	while (n) {
-		struct proxy *px = container_of(n, struct proxy, conf.by_name);
+		px = container_of(n, struct proxy, conf.by_name);
 		BUG_ON(!(px->cap & PR_CAP_DEF));
 		n = ebpt_next(n);
 		if (!px->conf.refcount)
 			proxy_destroy_defaults(px);
 	}
+
+	px = orphaned_default_proxies;
+	while (px) {
+		BUG_ON(!(px->cap & PR_CAP_DEF));
+		nx = px->next;
+		if (!px->conf.refcount)
+			proxy_destroy_defaults(px);
+		px = nx;
+	}
+}
+
+/* Try to destroy a defaults section, or just unreference it if still
+ * refcounted. In this case it's added to the orphaned_default_proxies list
+ * so that it can later be found.
+ */
+void proxy_unref_or_destroy_defaults(struct proxy *px)
+{
+	if (!px || !(px->cap & PR_CAP_DEF))
+		return;
+
+	ebpt_delete(&px->conf.by_name);
+	if (px->conf.refcount) {
+		/* still referenced just append it to the orphaned list */
+		px->next = orphaned_default_proxies;
+		orphaned_default_proxies = px;
+	} else
+		proxy_destroy_defaults(px);
 }
 
 /* Add a reference on the default proxy <defpx> for the proxy <px> Nothing is
@@ -1544,6 +1635,7 @@ void proxy_unref_defaults(struct proxy *px)
  */
 struct proxy *alloc_new_proxy(const char *name, unsigned int cap, char **errmsg)
 {
+	uint last_change;
 	struct proxy *curproxy;
 
 	if ((curproxy = calloc(1, sizeof(*curproxy))) == NULL) {
@@ -1552,7 +1644,13 @@ struct proxy *alloc_new_proxy(const char *name, unsigned int cap, char **errmsg)
 	}
 
 	init_new_proxy(curproxy);
-	curproxy->last_change = now.tv_sec;
+
+	last_change = ns_to_sec(now_ns);
+	if (cap & PR_CAP_FE)
+		curproxy->fe_counters.last_change = last_change;
+	if (cap & PR_CAP_BE)
+		curproxy->be_counters.last_change = last_change;
+
 	curproxy->id = strdup(name);
 	curproxy->cap = cap;
 
@@ -1578,37 +1676,27 @@ struct proxy *alloc_new_proxy(const char *name, unsigned int cap, char **errmsg)
 static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defproxy,
                               char **errmsg)
 {
-	struct logsrv *tmplogsrv;
+	struct logger *tmplogger;
 	char *tmpmsg = NULL;
+	struct eb32_node *node;
 
 	/* set default values from the specified default proxy */
-	memcpy(&curproxy->defsrv, &defproxy->defsrv, sizeof(curproxy->defsrv));
+	srv_settings_cpy(&curproxy->defsrv, &defproxy->defsrv, 0);
 
 	curproxy->flags = (defproxy->flags & PR_FL_DISABLED); /* Only inherit from disabled flag */
 	curproxy->options = defproxy->options;
 	curproxy->options2 = defproxy->options2;
 	curproxy->no_options = defproxy->no_options;
 	curproxy->no_options2 = defproxy->no_options2;
-	curproxy->except_xff_net = defproxy->except_xff_net;
-	curproxy->except_xot_net = defproxy->except_xot_net;
 	curproxy->retry_type = defproxy->retry_type;
 	curproxy->tcp_req.inspect_delay = defproxy->tcp_req.inspect_delay;
 	curproxy->tcp_rep.inspect_delay = defproxy->tcp_rep.inspect_delay;
 
-	if (defproxy->fwdfor_hdr_len) {
-		curproxy->fwdfor_hdr_len  = defproxy->fwdfor_hdr_len;
-		curproxy->fwdfor_hdr_name = strdup(defproxy->fwdfor_hdr_name);
-	}
+	http_ext_clean(curproxy);
+	http_ext_dup(defproxy, curproxy);
 
-	if (defproxy->orgto_hdr_len) {
-		curproxy->orgto_hdr_len  = defproxy->orgto_hdr_len;
-		curproxy->orgto_hdr_name = strdup(defproxy->orgto_hdr_name);
-	}
-
-	if (defproxy->server_id_hdr_len) {
-		curproxy->server_id_hdr_len  = defproxy->server_id_hdr_len;
-		curproxy->server_id_hdr_name = strdup(defproxy->server_id_hdr_name);
-	}
+	if (isttest(defproxy->server_id_hdr_name))
+		curproxy->server_id_hdr_name = istdup(defproxy->server_id_hdr_name);
 
 	/* initialize error relocations */
 	if (!proxy_dup_default_conf_errors(curproxy, defproxy, &tmpmsg)) {
@@ -1649,6 +1737,7 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 		}
 
 		curproxy->ck_opts = defproxy->ck_opts;
+
 		if (defproxy->cookie_name)
 			curproxy->cookie_name = strdup(defproxy->cookie_name);
 		curproxy->cookie_len = defproxy->cookie_len;
@@ -1697,53 +1786,29 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 			curproxy->capture_name = strdup(defproxy->capture_name);
 		curproxy->capture_namelen = defproxy->capture_namelen;
 		curproxy->capture_len = defproxy->capture_len;
+
+		curproxy->nb_req_cap = defproxy->nb_req_cap;
+		curproxy->req_cap = defproxy->req_cap;
+
+		curproxy->nb_rsp_cap = defproxy->nb_rsp_cap;
+		curproxy->rsp_cap = defproxy->rsp_cap;
 	}
 
 	if (curproxy->cap & PR_CAP_FE) {
 		curproxy->timeout.client = defproxy->timeout.client;
+		curproxy->timeout.client_hs = defproxy->timeout.client_hs;
 		curproxy->timeout.clientfin = defproxy->timeout.clientfin;
 		curproxy->timeout.tarpit = defproxy->timeout.tarpit;
 		curproxy->timeout.httpreq = defproxy->timeout.httpreq;
 		curproxy->timeout.httpka = defproxy->timeout.httpka;
-		if (defproxy->monitor_uri)
-			curproxy->monitor_uri = strdup(defproxy->monitor_uri);
-		curproxy->monitor_uri_len = defproxy->monitor_uri_len;
+		if (isttest(defproxy->monitor_uri))
+			curproxy->monitor_uri = istdup(defproxy->monitor_uri);
 		if (defproxy->defbe.name)
 			curproxy->defbe.name = strdup(defproxy->defbe.name);
 
-		/* get either a pointer to the logformat string or a copy of it */
-		curproxy->conf.logformat_string = defproxy->conf.logformat_string;
-		if (curproxy->conf.logformat_string &&
-		    curproxy->conf.logformat_string != default_http_log_format &&
-		    curproxy->conf.logformat_string != default_tcp_log_format &&
-		    curproxy->conf.logformat_string != clf_http_log_format &&
-		    curproxy->conf.logformat_string != default_https_log_format)
-			curproxy->conf.logformat_string = strdup(curproxy->conf.logformat_string);
-
-		if (defproxy->conf.lfs_file) {
-			curproxy->conf.lfs_file = strdup(defproxy->conf.lfs_file);
-			curproxy->conf.lfs_line = defproxy->conf.lfs_line;
-		}
-
-		/* get either a pointer to the logformat string for RFC5424 structured-data or a copy of it */
-		curproxy->conf.logformat_sd_string = defproxy->conf.logformat_sd_string;
-		if (curproxy->conf.logformat_sd_string &&
-		    curproxy->conf.logformat_sd_string != default_rfc5424_sd_log_format)
-			curproxy->conf.logformat_sd_string = strdup(curproxy->conf.logformat_sd_string);
-
-		if (defproxy->conf.lfsd_file) {
-			curproxy->conf.lfsd_file = strdup(defproxy->conf.lfsd_file);
-			curproxy->conf.lfsd_line = defproxy->conf.lfsd_line;
-		}
-
-		curproxy->conf.error_logformat_string = defproxy->conf.error_logformat_string;
-		if (curproxy->conf.error_logformat_string)
-			curproxy->conf.error_logformat_string = strdup(curproxy->conf.error_logformat_string);
-
-		if (defproxy->conf.elfs_file) {
-			curproxy->conf.elfs_file = strdup(defproxy->conf.elfs_file);
-			curproxy->conf.elfs_line = defproxy->conf.elfs_line;
-		}
+		lf_expr_dup(&defproxy->logformat, &curproxy->logformat);
+		lf_expr_dup(&defproxy->logformat_sd, &curproxy->logformat_sd);
+		lf_expr_dup(&defproxy->logformat_error, &curproxy->logformat_error);
 	}
 
 	if (curproxy->cap & PR_CAP_BE) {
@@ -1760,32 +1825,26 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 	}
 
 	curproxy->mode = defproxy->mode;
-	curproxy->uri_auth = defproxy->uri_auth; /* for stats */
 
-	/* copy default logsrvs to curproxy */
-	list_for_each_entry(tmplogsrv, &defproxy->logsrvs, list) {
-		struct logsrv *node = malloc(sizeof(*node));
+	/* for stats */
+	stats_uri_auth_drop(curproxy->uri_auth);
+	stats_uri_auth_take(defproxy->uri_auth);
+	curproxy->uri_auth = defproxy->uri_auth;
+
+	/* copy default loggers to curproxy */
+	list_for_each_entry(tmplogger, &defproxy->loggers, list) {
+		struct logger *node = dup_logger(tmplogger);
 
 		if (!node) {
 			memprintf(errmsg, "proxy '%s': out of memory", curproxy->id);
 			return 1;
 		}
-		memcpy(node, tmplogsrv, sizeof(struct logsrv));
-		node->ref = tmplogsrv->ref;
-		LIST_INIT(&node->list);
-		LIST_APPEND(&curproxy->logsrvs, &node->list);
+		LIST_APPEND(&curproxy->loggers, &node->list);
 	}
 
-	curproxy->conf.uniqueid_format_string = defproxy->conf.uniqueid_format_string;
-	if (curproxy->conf.uniqueid_format_string)
-		curproxy->conf.uniqueid_format_string = strdup(curproxy->conf.uniqueid_format_string);
+	lf_expr_dup(&defproxy->format_unique_id, &curproxy->format_unique_id);
 
 	chunk_dup(&curproxy->log_tag, &defproxy->log_tag);
-
-	if (defproxy->conf.uif_file) {
-		curproxy->conf.uif_file = strdup(defproxy->conf.uif_file);
-		curproxy->conf.uif_line = defproxy->conf.uif_line;
-	}
 
 	/* copy default header unique id */
 	if (isttest(defproxy->header_unique_id)) {
@@ -1805,8 +1864,11 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 			memprintf(errmsg, "proxy '%s': out of memory for default compression options", curproxy->id);
 			return 1;
 		}
-		curproxy->comp->algos = defproxy->comp->algos;
-		curproxy->comp->types = defproxy->comp->types;
+		curproxy->comp->algos_res = defproxy->comp->algos_res;
+		curproxy->comp->algo_req = defproxy->comp->algo_req;
+		curproxy->comp->types_res = defproxy->comp->types_res;
+		curproxy->comp->types_req = defproxy->comp->types_req;
+		curproxy->comp->flags = defproxy->comp->flags;
 	}
 
 	if (defproxy->check_path)
@@ -1814,6 +1876,7 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 	if (defproxy->check_command)
 		curproxy->check_command = strdup(defproxy->check_command);
 
+	BUG_ON(curproxy->email_alert.flags & PR_EMAIL_ALERT_RESOLVED);
 	if (defproxy->email_alert.mailers.name)
 		curproxy->email_alert.mailers.name = strdup(defproxy->email_alert.mailers.name);
 	if (defproxy->email_alert.from)
@@ -1823,7 +1886,26 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 	if (defproxy->email_alert.myhostname)
 		curproxy->email_alert.myhostname = strdup(defproxy->email_alert.myhostname);
 	curproxy->email_alert.level = defproxy->email_alert.level;
-	curproxy->email_alert.set = defproxy->email_alert.set;
+	curproxy->email_alert.flags = defproxy->email_alert.flags;
+
+	/* defproxy is const pointer, so we need to typecast log_steps to
+	 * drop the const in order to use EB tree API, please note however
+	 * that the operations performed below should theorically be read-only
+	 */
+	node = eb32_first((struct eb_root *)&defproxy->conf.log_steps);
+	while (node) {
+		struct eb32_node *new_node;
+
+		new_node = malloc(sizeof(*new_node));
+		if (!new_node) {
+			memprintf(errmsg, "proxy '%s': out of memory for log_steps option", curproxy->id);
+			return 1;
+		}
+
+		new_node->key = node->key;
+		eb32_insert(&curproxy->conf.log_steps, new_node);
+		node = eb32_next(node);
+	}
 
 	return 0;
 }
@@ -1837,7 +1919,7 @@ struct proxy *parse_new_proxy(const char *name, unsigned int cap,
                               const struct proxy *defproxy)
 {
 	struct proxy *curproxy = NULL;
-	char *errmsg;
+	char *errmsg = NULL;
 
 	if (!(curproxy = alloc_new_proxy(name, cap, &errmsg))) {
 		ha_alert("parsing [%s:%d] : %s\n", file, linenum, errmsg);
@@ -1854,14 +1936,31 @@ struct proxy *parse_new_proxy(const char *name, unsigned int cap,
 			return NULL;
 		}
 	}
-	else {
-		proxy_preset_defaults(curproxy);
-	}
 
-	curproxy->conf.args.file = curproxy->conf.file = strdup(file);
+	curproxy->conf.args.file = curproxy->conf.file = copy_file_name(file);
 	curproxy->conf.args.line = curproxy->conf.line = linenum;
 
 	return curproxy;
+}
+
+/* to be called under the proxy lock after pausing some listeners. This will
+ * automatically update the p->flags flag
+ */
+void proxy_cond_pause(struct proxy *p)
+{
+	if (p->li_ready)
+		return;
+	p->flags |= PR_FL_PAUSED;
+}
+
+/* to be called under the proxy lock after resuming some listeners. This will
+ * automatically update the p->flags flag
+ */
+void proxy_cond_resume(struct proxy *p)
+{
+	if (!p->li_ready)
+		return;
+	p->flags &= ~PR_FL_PAUSED;
 }
 
 /* to be called under the proxy lock after stopping some listeners. This will
@@ -1885,13 +1984,13 @@ void proxy_cond_disable(struct proxy *p)
 	 * peers, etc) we must not report them at all as they're not really on
 	 * the data plane but on the control plane.
 	 */
-	if (p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP || p->mode == PR_MODE_SYSLOG)
+	if ((p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP || p->mode == PR_MODE_SYSLOG || p->mode == PR_MODE_SPOP) && !(p->cap & PR_CAP_INT))
 		ha_warning("Proxy %s stopped (cumulated conns: FE: %lld, BE: %lld).\n",
-			   p->id, p->fe_counters.cum_conn, p->be_counters.cum_conn);
+			   p->id, p->fe_counters.cum_conn, p->be_counters.cum_sess);
 
-	if (p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP)
+	if ((p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP || p->mode == PR_MODE_SPOP) && !(p->cap & PR_CAP_INT))
 		send_log(p, LOG_WARNING, "Proxy %s stopped (cumulated conns: FE: %lld, BE: %lld).\n",
-			 p->id, p->fe_counters.cum_conn, p->be_counters.cum_conn);
+			 p->id, p->fe_counters.cum_conn, p->be_counters.cum_sess);
 
 	if (p->table && p->table->size && p->table->sync_task)
 		task_wakeup(p->table->sync_task, TASK_WOKEN_MSG);
@@ -1916,20 +2015,6 @@ struct task *manage_proxy(struct task *t, void *context, unsigned int state)
 	 * global resource here.
 	 */
 
-	/* first, let's check if we need to stop the proxy */
-	if (unlikely(stopping && !(p->flags & (PR_FL_DISABLED|PR_FL_STOPPED)))) {
-		int t;
-		t = tick_remain(now_ms, p->stop_time);
-		if (t == 0) {
-			stop_proxy(p);
-			/* try to free more memory */
-			pool_gc(NULL);
-		}
-		else {
-			next = tick_first(next, p->stop_time);
-		}
-	}
-
 	/* If the proxy holds a stick table, we need to purge all unused
 	 * entries. These are all the ones in the table with ref_cnt == 0
 	 * and all the ones in the pool used to allocate new entries. Any
@@ -1945,11 +2030,40 @@ struct task *manage_proxy(struct task *t, void *context, unsigned int state)
 			 * to push to a new process and
 			 * we are free to flush the table.
 			 */
-			stktable_trash_oldest(p->table, p->table->current);
-			pool_gc(NULL);
+			int budget;
+			int cleaned_up;
+
+			/* We purposely enforce a budget limitation since we don't want
+			 * to spend too much time purging old entries
+			 *
+			 * This is known to cause the watchdog to occasionnaly trigger if
+			 * the table is huge and all entries become available for purge
+			 * at the same time
+			 *
+			 * Moreover, we must also anticipate the pool_gc() call which
+			 * will also be much slower if there is too much work at once
+			 */
+			budget = MIN(p->table->current, (1 << 15)); /* max: 32K */
+			cleaned_up = stktable_trash_oldest(p->table, budget);
+			if (cleaned_up) {
+				/* immediately release freed memory since we are stopping */
+				pool_gc(NULL);
+				if (cleaned_up > (budget / 2)) {
+					/* most of the budget was used to purge entries,
+					 * it is very likely that there are still trashable
+					 * entries in the table, reschedule a new cleanup
+					 * attempt ASAP
+					 */
+					t->expire = TICK_ETERNITY;
+					task_wakeup(t, TASK_WOKEN_RES);
+					return t;
+				}
+			}
 		}
 		if (p->table->current) {
-			/* some entries still remain, let's recheck in one second */
+			/* some entries still remain but are not yet available
+			 * for cleanup, let's recheck in one second
+			 */
 			next = tick_first(next, tick_add(now_ms, 1000));
 		}
 	}
@@ -1963,7 +2077,7 @@ struct task *manage_proxy(struct task *t, void *context, unsigned int state)
 		goto out;
 
 	if (p->fe_sps_lim &&
-	    (wait = next_event_delay(&p->fe_sess_per_sec, p->fe_sps_lim, 0))) {
+	    (wait = next_event_delay(&p->fe_counters.sess_per_sec, p->fe_sps_lim, 0))) {
 		/* we're blocking because a limit was reached on the number of
 		 * requests/s on the frontend. We want to re-check ASAP, which
 		 * means in 1 ms before estimated expiration date, because the
@@ -1974,7 +2088,7 @@ struct task *manage_proxy(struct task *t, void *context, unsigned int state)
 	}
 
 	/* The proxy is not limited so we can re-enable any waiting listener */
-	dequeue_proxy_listeners(p);
+	dequeue_proxy_listeners(p, 0);
  out:
 	t->expire = next;
 	task_queue(t);
@@ -2038,6 +2152,46 @@ static int proxy_parse_hard_stop_after(char **args, int section_type, struct pro
 	return 0;
 }
 
+static int proxy_parse_close_spread_time(char **args, int section_type, struct proxy *curpx,
+					 const struct proxy *defpx, const char *file, int line,
+					 char **err)
+{
+	const char *res;
+
+	if (!*args[1]) {
+		memprintf(err, "'%s' expects <time> as argument.\n", args[0]);
+		return -1;
+	}
+
+	/* If close-spread-time is set to "infinite", disable the active connection
+	 * closing during soft-stop.
+	 */
+	if (strcmp(args[1], "infinite") == 0) {
+		global.tune.options |= GTUNE_DISABLE_ACTIVE_CLOSE;
+		global.close_spread_time = TICK_ETERNITY;
+		return 0;
+	}
+
+	res = parse_time_err(args[1], &global.close_spread_time, TIME_UNIT_MS);
+	if (res == PARSE_TIME_OVER) {
+		memprintf(err, "timer overflow in argument '%s' to '%s' (maximum value is 2147483647 ms or ~24.8 days)",
+			  args[1], args[0]);
+		return -1;
+	}
+	else if (res == PARSE_TIME_UNDER) {
+		memprintf(err, "timer underflow in argument '%s' to '%s' (minimum non-null value is 1 ms)",
+			  args[1], args[0]);
+		return -1;
+	}
+	else if (res) {
+		memprintf(err, "unexpected character '%c' in argument to <%s>.\n", *res, args[0]);
+		return -1;
+	}
+	global.tune.options &= ~GTUNE_DISABLE_ACTIVE_CLOSE;
+
+	return 0;
+}
+
 struct task *hard_stop(struct task *t, void *context, unsigned int state)
 {
 	struct proxy *p;
@@ -2049,7 +2203,7 @@ struct task *hard_stop(struct task *t, void *context, unsigned int state)
 		send_log(NULL, LOG_WARNING, "Some tasks resisted to hard-stop, exiting now.\n");
 		killed = 2;
 		for (thr = 0; thr < global.nbthread; thr++)
-			if (((all_threads_mask & ~tid_bit) >> thr) & 1)
+			if (_HA_ATOMIC_LOAD(&ha_thread_info[thr].tg->threads_enabled) & ha_thread_info[thr].ltid_bit)
 				wake_thread(thr);
 		t->expire = TICK_ETERNITY;
 		return t;
@@ -2086,10 +2240,15 @@ struct task *hard_stop(struct task *t, void *context, unsigned int state)
 /* perform the soft-stop right now (i.e. unbind listeners) */
 static void do_soft_stop_now()
 {
+	struct proxy *p;
 	struct task *task;
 
 	/* disable busy polling to avoid cpu eating for the new process */
 	global.tune.options &= ~GTUNE_BUSY_POLLING;
+
+	if (tick_isset(global.close_spread_time)) {
+		global.close_spread_end = tick_add(now_ms, global.close_spread_time);
+	}
 
 	/* schedule a hard-stop after a delay if needed */
 	if (tick_isset(global.hard_stop_after)) {
@@ -2103,8 +2262,22 @@ static void do_soft_stop_now()
 		}
 	}
 
+	/* we isolate so that we have a chance of stopping listeners in other groups */
+	thread_isolate();
+
 	/* stop all stoppable listeners */
 	protocol_stop_now();
+
+	thread_release();
+
+	/* Loop on proxies to stop backends */
+	p = proxies_list;
+	while (p) {
+		HA_RWLOCK_WRLOCK(PROXY_LOCK, &p->lock);
+		proxy_cond_disable(p);
+		HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &p->lock);
+		p = p->next;
+	}
 
 	/* signal zero is used to broadcast the "stopping" event */
 	signal_handler(0);
@@ -2152,22 +2325,29 @@ void soft_stop(void)
 /* Temporarily disables listening on all of the proxy's listeners. Upon
  * success, the proxy enters the PR_PAUSED state. The function returns 0
  * if it fails, or non-zero on success.
+ * The function takes the proxy's lock so it's safe to
+ * call from multiple places.
  */
 int pause_proxy(struct proxy *p)
 {
 	struct listener *l;
 
+	HA_RWLOCK_WRLOCK(PROXY_LOCK, &p->lock);
+
 	if (!(p->cap & PR_CAP_FE) || (p->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) || !p->li_ready)
-		return 1;
+		goto end;
 
 	list_for_each_entry(l, &p->conf.listeners, by_fe)
-		pause_listener(l);
+		suspend_listener(l, 1, 0);
 
 	if (p->li_ready) {
 		ha_warning("%s %s failed to enter pause mode.\n", proxy_cap_str(p->cap), p->id);
 		send_log(p, LOG_WARNING, "%s %s failed to enter pause mode.\n", proxy_cap_str(p->cap), p->id);
+		HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &p->lock);
 		return 0;
 	}
+end:
+	HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &p->lock);
 	return 1;
 }
 
@@ -2176,7 +2356,8 @@ int pause_proxy(struct proxy *p)
  * to be called when going down in order to release the ports so that another
  * process may bind to them. It must also be called on disabled proxies at the
  * end of start-up. If all listeners are closed, the proxy is set to the
- * PR_STOPPED state. The function takes the proxy's lock so it's safe to
+ * PR_STOPPED state.
+ * The function takes the proxy's lock so it's safe to
  * call from multiple places.
  */
 void stop_proxy(struct proxy *p)
@@ -2200,18 +2381,22 @@ void stop_proxy(struct proxy *p)
  * listeners and tries to enable them all. If any of them fails, the proxy is
  * put back to the paused state. It returns 1 upon success, or zero if an error
  * is encountered.
+ * The function takes the proxy's lock so it's safe to
+ * call from multiple places.
  */
 int resume_proxy(struct proxy *p)
 {
 	struct listener *l;
 	int fail;
 
+	HA_RWLOCK_WRLOCK(PROXY_LOCK, &p->lock);
+
 	if ((p->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) || !p->li_paused)
-		return 1;
+		goto end;
 
 	fail = 0;
 	list_for_each_entry(l, &p->conf.listeners, by_fe) {
-		if (!resume_listener(l)) {
+		if (!resume_listener(l, 1, 0)) {
 			int port;
 
 			port = get_host_port(&l->rx.addr);
@@ -2235,9 +2420,13 @@ int resume_proxy(struct proxy *p)
 	}
 
 	if (fail) {
+		HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &p->lock);
+		/* pause_proxy will take PROXY_LOCK */
 		pause_proxy(p);
 		return 0;
 	}
+end:
+	HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &p->lock);
 	return 1;
 }
 
@@ -2263,12 +2452,9 @@ int stream_set_backend(struct stream *s, struct proxy *be)
 	proxy_inc_be_ctr(be);
 
 	/* assign new parameters to the stream from the new backend */
-	s->si[1].flags &= ~SI_FL_INDEP_STR;
+	s->scb->flags &= ~SC_FL_INDEP_STR;
 	if (be->options2 & PR_O2_INDEPSTR)
-		s->si[1].flags |= SI_FL_INDEP_STR;
-
-	if (tick_isset(be->timeout.serverfin))
-		s->si[1].hcto = be->timeout.serverfin;
+		s->scb->flags |= SC_FL_INDEP_STR;
 
 	/* We want to enable the backend-specific analysers except those which
 	 * were already run as part of the frontend/listener. Note that it would
@@ -2288,7 +2474,7 @@ int stream_set_backend(struct stream *s, struct proxy *be)
 		 */
 		req_ana &= ~(AN_REQ_WAIT_HTTP|AN_REQ_HTTP_PROCESS_FE);
 	}
-	s->req.analysers |= req_ana & ~(strm_li(s) ? strm_li(s)->analysers : 0);
+	s->req.analysers |= req_ana & ~(strm_li(s) ? strm_li(s)->bind_conf->analysers : 0);
 
 	if (!IS_HTX_STRM(s) && be->mode == PR_MODE_HTTP) {
 		/* If we chain a TCP frontend to an HTX backend, we must upgrade
@@ -2314,8 +2500,8 @@ int stream_set_backend(struct stream *s, struct proxy *be)
 
 	s->flags |= SF_BE_ASSIGNED;
 	if (be->options2 & PR_O2_NODELAY) {
-		s->req.flags |= CF_NEVER_WAIT;
-		s->res.flags |= CF_NEVER_WAIT;
+		s->scf->flags |= SC_FL_SND_NEVERWAIT;
+		s->scb->flags |= SC_FL_SND_NEVERWAIT;
 	}
 
 	return 1;
@@ -2410,8 +2596,8 @@ void proxy_capture_error(struct proxy *proxy, int is_back,
 	} else {
 		es = HA_ATOMIC_XCHG(&proxy->invalid_req, es);
 	}
-	free(es);
 	HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &proxy->lock);
+	ha_free(&es);
 }
 
 /* Configure all proxies which lack a maxconn setting to use the global one by
@@ -2493,6 +2679,7 @@ void proxy_adjust_all_maxconn()
 static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "grace", proxy_parse_grace },
 	{ CFG_GLOBAL, "hard-stop-after", proxy_parse_hard_stop_after },
+	{ CFG_GLOBAL, "close-spread-time", proxy_parse_close_spread_time },
 	{ CFG_LISTEN, "timeout", proxy_parse_timeout },
 	{ CFG_LISTEN, "clitimeout", proxy_parse_timeout }, /* This keyword actually fails to parse, this line remains for better error messages. */
 	{ CFG_LISTEN, "contimeout", proxy_parse_timeout }, /* This keyword actually fails to parse, this line remains for better error messages. */
@@ -2513,6 +2700,7 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_LISTEN, "clitcpka-intvl", proxy_parse_tcpka_intvl },
 	{ CFG_LISTEN, "srvtcpka-intvl", proxy_parse_tcpka_intvl },
 #endif
+	{ CFG_LISTEN, "guid", proxy_parse_guid },
 	{ 0, NULL, NULL },
 }};
 
@@ -2563,14 +2751,15 @@ struct proxy *cli_find_backend(struct appctx *appctx, const char *arg)
 
 /* parse a "show servers [state|conn]" CLI line, returns 0 if it wants to start
  * the dump or 1 if it stops immediately. If an argument is specified, it will
- * set the proxy pointer into cli.p0 and its ID into cli.i0. It sets cli.o0 to
- * 0 for "state", or 1 for "conn".
+ * reserve a show_srv_ctx context and set the proxy pointer into ->px, its ID
+ * into ->only_pxid, and ->show_conn to 0 for "state", or 1 for "conn".
  */
 static int cli_parse_show_servers(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_srv_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	struct proxy *px;
 
-	appctx->ctx.cli.o0 = *args[2] == 'c'; // "conn" vs "state"
+	ctx->show_conn = *args[2] == 'c'; // "conn" vs "state"
 
 	/* check if a backend name has been provided */
 	if (*args[3]) {
@@ -2580,8 +2769,8 @@ static int cli_parse_show_servers(char **args, char *payload, struct appctx *app
 		if (!px)
 			return cli_err(appctx, "Can't find backend.\n");
 
-		appctx->ctx.cli.p0 = px;
-		appctx->ctx.cli.i0 = px->uuid;
+		ctx->px = px;
+		ctx->only_pxid = px->uuid;
 	}
 	return 0;
 }
@@ -2603,15 +2792,16 @@ static void dump_server_addr(const struct sockaddr_storage *addr, char *addr_str
 
 /* dumps server state information for all the servers found in backend cli.p0.
  * These information are all the parameters which may change during HAProxy runtime.
- * By default, we only export to the last known server state file format.
- * These information can be used at next startup to recover same level of server state.
- * It uses the proxy pointer from cli.p0, the proxy's id from cli.i0 and the server's
- * pointer from cli.p1.
+ * By default, we only export to the last known server state file format. These
+ * information can be used at next startup to recover same level of server
+ * state. It takes its context from show_srv_ctx, with the proxy pointer from
+ * ->px, the proxy's id ->only_pxid, the server's pointer from ->sv, and the
+ * choice of what to dump from ->show_conn.
  */
-static int dump_servers_state(struct stream_interface *si)
+static int dump_servers_state(struct appctx *appctx)
 {
-	struct appctx *appctx = __objt_appctx(si->end);
-	struct proxy *px = appctx->ctx.cli.p0;
+	struct show_srv_ctx *ctx = appctx->svcctx;
+	struct proxy *px = ctx->px;
 	struct server *srv;
 	char srv_addr[INET6_ADDRSTRLEN + 1];
 	char srv_agent_addr[INET6_ADDRSTRLEN + 1];
@@ -2620,17 +2810,17 @@ static int dump_servers_state(struct stream_interface *si)
 	int bk_f_forced_id, srv_f_forced_id;
 	char *srvrecord;
 
-	if (!appctx->ctx.cli.p1)
-		appctx->ctx.cli.p1 = px->srv;
+	if (!ctx->sv)
+		ctx->sv = px->srv;
 
-	for (; appctx->ctx.cli.p1 != NULL; appctx->ctx.cli.p1 = srv->next) {
-		srv = appctx->ctx.cli.p1;
+	for (; ctx->sv != NULL; ctx->sv = srv->next) {
+		srv = ctx->sv;
 
 		dump_server_addr(&srv->addr, srv_addr);
 		dump_server_addr(&srv->check.addr, srv_check_addr);
 		dump_server_addr(&srv->agent.addr, srv_agent_addr);
 
-		srv_time_since_last_change = now.tv_sec - srv->last_change;
+		srv_time_since_last_change = ns_to_sec(now_ns) - srv->counters.last_change;
 		bk_f_forced_id = px->options & PR_O_FORCED_ID ? 1 : 0;
 		srv_f_forced_id = srv->flags & SRV_F_FORCED_ID ? 1 : 0;
 
@@ -2638,7 +2828,7 @@ static int dump_servers_state(struct stream_interface *si)
 		if (srv->srvrq && srv->srvrq->name)
 			srvrecord = srv->srvrq->name;
 
-		if (appctx->ctx.cli.o0 == 0) {
+		if (ctx->show_conn == 0) {
 			/* show servers state */
 			chunk_printf(&trash,
 			             "%d %s "
@@ -2649,11 +2839,15 @@ static int dump_servers_state(struct stream_interface *si)
 				     "%s %d %d "
 				     "%s %s %d"
 			             "\n",
-			             px->uuid, px->id,
-			             srv->puid, srv->id, srv_addr,
-			             srv->cur_state, srv->cur_admin, srv->uweight, srv->iweight, (long int)srv_time_since_last_change,
-			             srv->check.status, srv->check.result, srv->check.health, srv->check.state, srv->agent.state,
-			             bk_f_forced_id, srv_f_forced_id, srv->hostname ? srv->hostname : "-", srv->svc_port,
+			             px->uuid, HA_ANON_CLI(px->id),
+			             srv->puid, HA_ANON_CLI(srv->id),
+				     hash_ipanon(appctx->cli_anon_key, srv_addr, 0),
+			             srv->cur_state, srv->cur_admin, srv->uweight, srv->iweight,
+				     (long int)srv_time_since_last_change,
+			             srv->check.status, srv->check.result, srv->check.health,
+				     srv->check.state & 0x0F, srv->agent.state & 0x1F,
+			             bk_f_forced_id, srv_f_forced_id,
+				     srv->hostname ? HA_ANON_CLI(srv->hostname) : "-", srv->svc_port,
 			             srvrecord ? srvrecord : "-", srv->use_ssl, srv->check.port,
 				     srv_check_addr, srv_agent_addr, srv->agent.port);
 		} else {
@@ -2662,8 +2856,9 @@ static int dump_servers_state(struct stream_interface *si)
 
 			chunk_printf(&trash,
 			             "%s/%s %d/%d %s %u - %u %u %u %u %u %u %d %u",
-			             px->id, srv->id, px->uuid, srv->puid, srv_addr,srv->svc_port,
-			             srv->pool_purge_delay,
+			             HA_ANON_CLI(px->id), HA_ANON_CLI(srv->id),
+			             px->uuid, srv->puid, hash_ipanon(appctx->cli_anon_key, srv_addr, 0),
+			             srv->svc_port, srv->pool_purge_delay,
 			             srv->curr_used_conns, srv->max_used_conns, srv->est_need_conns,
 			             srv->curr_idle_nb, srv->curr_safe_nb, (int)srv->max_idle_conns, srv->curr_idle_conns);
 
@@ -2673,8 +2868,7 @@ static int dump_servers_state(struct stream_interface *si)
 			chunk_appendf(&trash, "\n");
 		}
 
-		if (ci_putchk(si_ic(si), &trash) == -1) {
-			si_rx_room_blk(si);
+		if (applet_putchk(appctx, &trash) == -1) {
 			return 0;
 		}
 	}
@@ -2682,47 +2876,40 @@ static int dump_servers_state(struct stream_interface *si)
 }
 
 /* Parses backend list or simply use backend name provided by the user to return
- * states of servers to stdout. It dumps proxy <cli.p0> and stops if <cli.i0> is
- * non-null.
+ * states of servers to stdout. It takes its context from show_srv_ctx and dumps
+ * proxy ->px and stops if ->only_pxid is non-null.
  */
 static int cli_io_handler_servers_state(struct appctx *appctx)
 {
-	struct stream_interface *si = appctx->owner;
+	struct show_srv_ctx *ctx = appctx->svcctx;
 	struct proxy *curproxy;
 
-	chunk_reset(&trash);
-
-	if (appctx->st2 == STAT_ST_INIT) {
-		if (!appctx->ctx.cli.p0)
-			appctx->ctx.cli.p0 = proxies_list;
-		appctx->st2 = STAT_ST_HEAD;
-	}
-
-	if (appctx->st2 == STAT_ST_HEAD) {
-		if (appctx->ctx.cli.o0 == 0)
+	if (ctx->state == SHOW_SRV_HEAD) {
+		if (ctx->show_conn == 0)
 			chunk_printf(&trash, "%d\n# %s\n", SRV_STATE_FILE_VERSION, SRV_STATE_FILE_FIELD_NAMES);
 		else
 			chunk_printf(&trash,
 			             "# bkname/svname bkid/svid addr port - purge_delay used_cur used_max need_est unsafe_nb safe_nb idle_lim idle_cur idle_per_thr[%d]\n",
 			             global.nbthread);
 
-		if (ci_putchk(si_ic(si), &trash) == -1) {
-			si_rx_room_blk(si);
+		if (applet_putchk(appctx, &trash) == -1)
 			return 0;
-		}
-		appctx->st2 = STAT_ST_INFO;
+
+		ctx->state = SHOW_SRV_LIST;
+
+		if (!ctx->px)
+			ctx->px = proxies_list;
 	}
 
-	/* STAT_ST_INFO */
-	for (; appctx->ctx.cli.p0 != NULL; appctx->ctx.cli.p0 = curproxy->next) {
-		curproxy = appctx->ctx.cli.p0;
+	for (; ctx->px != NULL; ctx->px = curproxy->next) {
+		curproxy = ctx->px;
 		/* servers are only in backends */
 		if ((curproxy->cap & PR_CAP_BE) && !(curproxy->cap & PR_CAP_INT)) {
-			if (!dump_servers_state(si))
+			if (!dump_servers_state(appctx))
 				return 0;
 		}
 		/* only the selected proxy is dumped */
-		if (appctx->ctx.cli.i0)
+		if (ctx->only_pxid)
 			break;
 	}
 
@@ -2730,36 +2917,32 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
 }
 
 /* Parses backend list and simply report backend names. It keeps the proxy
- * pointer in cli.p0.
+ * pointer in svcctx since there's nothing else to store there.
  */
 static int cli_io_handler_show_backend(struct appctx *appctx)
 {
-	struct stream_interface *si = appctx->owner;
 	struct proxy *curproxy;
 
 	chunk_reset(&trash);
 
-	if (!appctx->ctx.cli.p0) {
+	if (!appctx->svcctx) {
 		chunk_printf(&trash, "# name\n");
-		if (ci_putchk(si_ic(si), &trash) == -1) {
-			si_rx_room_blk(si);
+		if (applet_putchk(appctx, &trash) == -1)
 			return 0;
-		}
-		appctx->ctx.cli.p0 = proxies_list;
+
+		appctx->svcctx = proxies_list;
 	}
 
-	for (; appctx->ctx.cli.p0 != NULL; appctx->ctx.cli.p0 = curproxy->next) {
-		curproxy = appctx->ctx.cli.p0;
+	for (; appctx->svcctx != NULL; appctx->svcctx = curproxy->next) {
+		curproxy = appctx->svcctx;
 
-		/* looking for backends only */
-		if (!(curproxy->cap & PR_CAP_BE))
+		/* looking for non-internal backends only */
+		if ((curproxy->cap & (PR_CAP_BE|PR_CAP_INT)) != PR_CAP_BE)
 			continue;
 
 		chunk_appendf(&trash, "%s\n", curproxy->id);
-		if (ci_putchk(si_ic(si), &trash) == -1) {
-			si_rx_room_blk(si);
+		if (applet_putchk(appctx, &trash) == -1)
 			return 0;
-		}
 	}
 
 	return 1;
@@ -2780,6 +2963,9 @@ static int cli_parse_enable_dyncookie_backend(char **args, char *payload, struct
 	px = cli_find_backend(appctx, args[3]);
 	if (!px)
 		return 1;
+
+	if (px->mode != PR_MODE_TCP && px->mode != PR_MODE_HTTP)
+		return cli_err(appctx, "Not available.\n");
 
 	/* Note: this lock is to make sure this doesn't change while another
 	 * thread is in srv_set_dyncookie().
@@ -2812,6 +2998,9 @@ static int cli_parse_disable_dyncookie_backend(char **args, char *payload, struc
 	px = cli_find_backend(appctx, args[3]);
 	if (!px)
 		return 1;
+
+	if (px->mode != PR_MODE_TCP && px->mode != PR_MODE_HTTP)
+		return cli_err(appctx, "Not available.\n");
 
 	/* Note: this lock is to make sure this doesn't change while another
 	 * thread is in srv_set_dyncookie().
@@ -2846,6 +3035,9 @@ static int cli_parse_set_dyncookie_key_backend(char **args, char *payload, struc
 	px = cli_find_backend(appctx, args[3]);
 	if (!px)
 		return 1;
+
+	if (px->mode != PR_MODE_TCP && px->mode != PR_MODE_HTTP)
+		return cli_err(appctx, "Not available.\n");
 
 	if (!*args[4])
 		return cli_err(appctx, "String value expected.\n");
@@ -2903,11 +3095,11 @@ static int cli_parse_set_maxconn_frontend(char **args, char *payload, struct app
 	px->maxconn = v;
 	list_for_each_entry(l, &px->conf.listeners, by_fe) {
 		if (l->state == LI_FULL)
-			resume_listener(l);
+			relax_listener(l, 1, 0);
 	}
 
 	if (px->maxconn > px->feconn)
-		dequeue_proxy_listeners(px);
+		dequeue_proxy_listeners(px, 1);
 
 	HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &px->lock);
 
@@ -2958,9 +3150,8 @@ static int cli_parse_disable_frontend(char **args, char *payload, struct appctx 
 	if (!px->li_ready)
 		return cli_msg(appctx, LOG_NOTICE, "All sockets are already disabled.\n");
 
-	HA_RWLOCK_WRLOCK(PROXY_LOCK, &px->lock);
+	/* pause_proxy will take PROXY_LOCK */
 	ret = pause_proxy(px);
-	HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &px->lock);
 
 	if (!ret)
 		return cli_err(appctx, "Failed to pause frontend, check logs for precise cause.\n");
@@ -2990,20 +3181,31 @@ static int cli_parse_enable_frontend(char **args, char *payload, struct appctx *
 	if (px->li_ready == px->li_all)
 		return cli_msg(appctx, LOG_NOTICE, "All sockets are already enabled.\n");
 
-	HA_RWLOCK_WRLOCK(PROXY_LOCK, &px->lock);
+	/* resume_proxy will take PROXY_LOCK */
 	ret = resume_proxy(px);
-	HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &px->lock);
 
 	if (!ret)
 		return cli_err(appctx, "Failed to resume frontend, check logs for precise cause (port conflict?).\n");
 	return 1;
 }
 
+/* appctx context used during "show errors" */
+struct show_errors_ctx {
+	struct proxy *px;	/* current proxy being dumped, NULL = not started yet. */
+	unsigned int flag;	/* bit0: buffer being dumped, 0 = req, 1 = resp ; bit1=skip req ; bit2=skip resp. */
+	unsigned int ev_id;	/* event ID of error being dumped */
+	int iid;		/* if >= 0, ID of the proxy to filter on */
+	int ptr;		/* <0: headers, >=0 : text pointer to restart from */
+	int bol;		/* pointer to beginning of current line */
+};
+
 /* "show errors" handler for the CLI. Returns 0 if wants to continue, 1 to stop
  * now.
  */
 static int cli_parse_show_errors(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_errors_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
 	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
 		return 1;
 
@@ -3012,40 +3214,37 @@ static int cli_parse_show_errors(char **args, char *payload, struct appctx *appc
 
 		px = proxy_find_by_name(args[2], 0, 0);
 		if (px)
-			appctx->ctx.errors.iid = px->uuid;
+			ctx->iid = px->uuid;
 		else
-			appctx->ctx.errors.iid = atoi(args[2]);
+			ctx->iid = atoi(args[2]);
 
-		if (!appctx->ctx.errors.iid)
+		if (!ctx->iid)
 			return cli_err(appctx, "No such proxy.\n");
 	}
 	else
-		appctx->ctx.errors.iid	= -1; // dump all proxies
+		ctx->iid	= -1; // dump all proxies
 
-	appctx->ctx.errors.flag = 0;
+	ctx->flag = 0;
 	if (strcmp(args[3], "request") == 0)
-		appctx->ctx.errors.flag |= 4; // ignore response
+		ctx->flag |= 4; // ignore response
 	else if (strcmp(args[3], "response") == 0)
-		appctx->ctx.errors.flag |= 2; // ignore request
-	appctx->ctx.errors.px = NULL;
+		ctx->flag |= 2; // ignore request
+	ctx->px = NULL;
 	return 0;
 }
 
-/* This function dumps all captured errors onto the stream interface's
+/* This function dumps all captured errors onto the stream connector's
  * read buffer. It returns 0 if the output buffer is full and it needs
  * to be called again, otherwise non-zero.
  */
 static int cli_io_handler_show_errors(struct appctx *appctx)
 {
-	struct stream_interface *si = appctx->owner;
+	struct show_errors_ctx *ctx = appctx->svcctx;
 	extern const char *monthname[12];
-
-	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
-		return 1;
 
 	chunk_reset(&trash);
 
-	if (!appctx->ctx.errors.px) {
+	if (!ctx->px) {
 		/* the function had not been called yet, let's prepare the
 		 * buffer for a response.
 		 */
@@ -3057,42 +3256,42 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 			     tm.tm_hour, tm.tm_min, tm.tm_sec, (int)(date.tv_usec/1000),
 			     error_snapshot_id);
 
-		if (ci_putchk(si_ic(si), &trash) == -1)
+		if (applet_putchk(appctx, &trash) == -1)
 			goto cant_send;
 
-		appctx->ctx.errors.px = proxies_list;
-		appctx->ctx.errors.bol = 0;
-		appctx->ctx.errors.ptr = -1;
+		ctx->px = proxies_list;
+		ctx->bol = 0;
+		ctx->ptr = -1;
 	}
 
 	/* we have two inner loops here, one for the proxy, the other one for
 	 * the buffer.
 	 */
-	while (appctx->ctx.errors.px) {
+	while (ctx->px) {
 		struct error_snapshot *es;
 
-		HA_RWLOCK_RDLOCK(PROXY_LOCK, &appctx->ctx.errors.px->lock);
+		HA_RWLOCK_RDLOCK(PROXY_LOCK, &ctx->px->lock);
 
-		if ((appctx->ctx.errors.flag & 1) == 0) {
-			es = appctx->ctx.errors.px->invalid_req;
-			if (appctx->ctx.errors.flag & 2) // skip req
+		if ((ctx->flag & 1) == 0) {
+			es = ctx->px->invalid_req;
+			if (ctx->flag & 2) // skip req
 				goto next;
 		}
 		else {
-			es = appctx->ctx.errors.px->invalid_rep;
-			if (appctx->ctx.errors.flag & 4) // skip resp
+			es = ctx->px->invalid_rep;
+			if (ctx->flag & 4) // skip resp
 				goto next;
 		}
 
 		if (!es)
 			goto next;
 
-		if (appctx->ctx.errors.iid >= 0 &&
-		    appctx->ctx.errors.px->uuid != appctx->ctx.errors.iid &&
-		    (!es->oe || es->oe->uuid != appctx->ctx.errors.iid))
+		if (ctx->iid >= 0 &&
+		    ctx->px->uuid != ctx->iid &&
+		    (!es->oe || es->oe->uuid != ctx->iid))
 			goto next;
 
-		if (appctx->ctx.errors.ptr < 0) {
+		if (ctx->ptr < 0) {
 			/* just print headers now */
 
 			char pn[INET6_ADDRSTRLEN];
@@ -3113,12 +3312,12 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 				port = 0;
 			}
 
-			switch (appctx->ctx.errors.flag & 1) {
+			switch (ctx->flag & 1) {
 			case 0:
 				chunk_appendf(&trash,
 					     " frontend %s (#%d): invalid request\n"
 					     "  backend %s (#%d)",
-					     appctx->ctx.errors.px->id, appctx->ctx.errors.px->uuid,
+					     ctx->px->id, ctx->px->uuid,
 					     (es->oe && es->oe->cap & PR_CAP_BE) ? es->oe->id : "<NONE>",
 					     (es->oe && es->oe->cap & PR_CAP_BE) ? es->oe->uuid : -1);
 				break;
@@ -3126,7 +3325,7 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 				chunk_appendf(&trash,
 					     " backend %s (#%d): invalid response\n"
 					     "  frontend %s (#%d)",
-					     appctx->ctx.errors.px->id, appctx->ctx.errors.px->uuid,
+					     ctx->px->id, ctx->px->uuid,
 					     es->oe ? es->oe->id : "<NONE>" , es->oe ? es->oe->uuid : -1);
 				break;
 			}
@@ -3147,55 +3346,56 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 
 			chunk_appendf(&trash, "  \n");
 
-			if (ci_putchk(si_ic(si), &trash) == -1)
+			if (applet_putchk(appctx, &trash) == -1)
 				goto cant_send_unlock;
 
-			appctx->ctx.errors.ptr = 0;
-			appctx->ctx.errors.ev_id = es->ev_id;
+			ctx->ptr = 0;
+			ctx->ev_id = es->ev_id;
 		}
 
-		if (appctx->ctx.errors.ev_id != es->ev_id) {
+		if (ctx->ev_id != es->ev_id) {
 			/* the snapshot changed while we were dumping it */
 			chunk_appendf(&trash,
 				     "  WARNING! update detected on this snapshot, dump interrupted. Please re-check!\n");
-			if (ci_putchk(si_ic(si), &trash) == -1)
+			if (applet_putchk(appctx, &trash) == -1)
 				goto cant_send_unlock;
 
 			goto next;
 		}
 
 		/* OK, ptr >= 0, so we have to dump the current line */
-		while (appctx->ctx.errors.ptr < es->buf_len && appctx->ctx.errors.ptr < global.tune.bufsize) {
+		while (ctx->ptr < es->buf_len && ctx->ptr < global.tune.bufsize) {
 			int newptr;
 			int newline;
 
-			newline = appctx->ctx.errors.bol;
-			newptr = dump_text_line(&trash, es->buf, global.tune.bufsize, es->buf_len, &newline, appctx->ctx.errors.ptr);
-			if (newptr == appctx->ctx.errors.ptr)
+			newline = ctx->bol;
+			newptr = dump_text_line(&trash, es->buf, global.tune.bufsize, es->buf_len, &newline, ctx->ptr);
+			if (newptr == ctx->ptr) {
+				applet_fl_set(appctx, APPCTX_FL_OUTBLK_FULL);
+				goto cant_send_unlock;
+			}
+
+			if (applet_putchk(appctx, &trash) == -1)
 				goto cant_send_unlock;
 
-			if (ci_putchk(si_ic(si), &trash) == -1)
-				goto cant_send_unlock;
-
-			appctx->ctx.errors.ptr = newptr;
-			appctx->ctx.errors.bol = newline;
+			ctx->ptr = newptr;
+			ctx->bol = newline;
 		};
 	next:
-		HA_RWLOCK_RDUNLOCK(PROXY_LOCK, &appctx->ctx.errors.px->lock);
-		appctx->ctx.errors.bol = 0;
-		appctx->ctx.errors.ptr = -1;
-		appctx->ctx.errors.flag ^= 1;
-		if (!(appctx->ctx.errors.flag & 1))
-			appctx->ctx.errors.px = appctx->ctx.errors.px->next;
+		HA_RWLOCK_RDUNLOCK(PROXY_LOCK, &ctx->px->lock);
+		ctx->bol = 0;
+		ctx->ptr = -1;
+		ctx->flag ^= 1;
+		if (!(ctx->flag & 1))
+			ctx->px = ctx->px->next;
 	}
 
 	/* dump complete */
 	return 1;
 
  cant_send_unlock:
-	HA_RWLOCK_RDUNLOCK(PROXY_LOCK, &appctx->ctx.errors.px->lock);
+	HA_RWLOCK_RDUNLOCK(PROXY_LOCK, &ctx->px->lock);
  cant_send:
-	si_rx_room_blk(si);
 	return 0;
 }
 

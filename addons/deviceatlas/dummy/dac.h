@@ -26,9 +26,8 @@ typedef int _Bool;
 #endif
 #endif
 
-#define MOBI_DA_MAJOR 2
-#define MOBI_DA_MINOR 1
-#define MOBI_DA_DUMMY_LIBRARY 1
+#define DATLAS_DA_MAJOR 3
+#define DATLAS_DA_DUMMY_LIBRARY 1
 
 
 /**
@@ -134,6 +133,7 @@ typedef void (*da_errorfunc_t)(da_severity_t severity, da_status_t status, const
 
 /* Manifest constants. */
 enum {
+    DA_CACHE_MAX = 50000,
     /*
      * used as the initial guess for the compiled size of an atlas.
      * If atlas sizes grow more beyond this, it can be expanded to avoid multiple scans of the data.
@@ -142,9 +142,8 @@ enum {
 };
 
 struct da_config {
-    unsigned int ua_props;
-    unsigned int lang_props;
-    unsigned int __reserved[14]; /* enough reserved keywords for future use */
+    unsigned int cache_size;
+    unsigned int __reserved[15]; /* enough reserved keywords for future use */
 };
 
 /**
@@ -223,6 +222,17 @@ da_status_t da_atlas_compile(void *ctx, da_read_fn readfn, da_setpos_fn setposfn
  */
 da_status_t da_atlas_open(da_atlas_t *atlas, da_property_decl_t *extra_props, const void *ptr, size_t pos);
 
+/**
+ * @brief read from a mapped data which then replace da_atlas_compile call
+ *
+ * @param dumppath, anonymous if NULL
+ * @param map for anonymous, it is the responsibility of the caller to unmap it, ignored otherwise
+ * @param maplen for anonymous, it is the size of the mapped data, ignored otherwise
+ * @param ptr Pointer dynamically allocated if the mapping happened normally
+ * @param len size of the atlas image
+ * @return status of mapping
+ */
+da_status_t da_atlas_read_mapped(const char *path, void *m, void **p, size_t *l);
 /**
  * @brief Release any resources associated with the atlas structure atlas, which was previously generated from
  * da_read_atlas or da_compile_atlas.
@@ -440,21 +450,22 @@ const char *da_typename(da_type_t type);
  * @param atlas
  * @return version
  */
-char *da_getdataversion(da_atlas_t *atlas);
+char *da_getdataversion(const da_atlas_t *atlas);
 
 /**
  * @brief returns the date creation's timestamp from the JSON in memory
  * @param atlas
  * @return version
  */
-time_t da_getdatacreation(da_atlas_t *atlas);
+time_t da_getdatacreation(const da_atlas_t *atlas);
+char *da_getdatacreationiso8601(const da_atlas_t *atlas);
 
 /**
  * @brief returns the revision's number from the JSON in memory
  * @param atlas
  * @return version
  */
-int da_getdatarevision(da_atlas_t *atlas);
+int da_getdatarevision(const da_atlas_t *atlas);
 
 /**
  * @brief returns the name of a global property

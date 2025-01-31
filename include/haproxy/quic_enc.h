@@ -2,7 +2,7 @@
  * include/haproxy/quic_enc.h
  * This file contains QUIC varint encoding function prototypes
  *
- * Copyright 2021 HAProxy Technologies, Frédéric Lécaille <flecaille@haproxy.com>
+ * Copyright 2021 HAProxy Technologies, Frederic Lecaille <flecaille@haproxy.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -26,7 +26,7 @@
 #error "Must define USE_OPENSSL"
 #endif
 
-#include <stdint.h>
+#include <inttypes.h>
 
 #include <haproxy/buf.h>
 #include <haproxy/chunk.h>
@@ -86,6 +86,23 @@ static inline size_t quic_int_getsize(uint64_t val)
 	default:
 		return 0;
 	}
+}
+
+/* Returns the maximum value of a QUIC variable-length integer with <sz> as size */
+static inline uint64_t quic_max_int(size_t sz)
+{
+	switch (sz) {
+	case 1:
+		return QUIC_VARINT_1_BYTE_MAX;
+	case 2:
+		return QUIC_VARINT_2_BYTE_MAX;
+	case 4:
+		return QUIC_VARINT_4_BYTE_MAX;
+	case 8:
+		return QUIC_VARINT_8_BYTE_MAX;
+	}
+
+	return -1;
 }
 
 /* Decode a QUIC variable-length integer from <buf> buffer into <val>.
@@ -181,41 +198,77 @@ static inline int quic_enc_int(unsigned char **buf, const unsigned char *end, ui
 	return 1;
 }
 
-/* Encode a QUIC variable-length integer <val> into <b> buffer.
- * Returns 1 if succeeded (there was enough room in buf), 0 if not.
+/* Encode a QUIC variable-length integer <val> into <b> buffer. <width> can be
+ * set to specify the desired output width. By default use 0 for the minimal
+ * integer size. Other valid values are 1, 2, 4 or 8.
+ *
+ * Returns 1 on success else 0.
  */
-static inline int b_quic_enc_int(struct buffer *b, uint64_t val)
+static inline int b_quic_enc_int(struct buffer *b, uint64_t val, int width)
 {
-	unsigned int shift;
-	unsigned char size_bits, *tail, *pos, *wrap;
-	size_t save_len, len;
-	size_t data = b_data(b);
-	size_t size = b_size(b);
+	char *pos;
+	int save_width, len;
 
-	if (data == size)
-		return 0;
+	/* width can only by 0, 1, 2, 4 or 8 */
+	BUG_ON(width && (width > 8 || atleast2(width)));
 
-	save_len = len = quic_int_getsize(val);
+	len = quic_int_getsize(val);
 	if (!len)
 		return 0;
 
-	shift = (len - 1) * 8;
-	/* set the bits of byte#0 which gives the length of the encoded integer */
-	size_bits = quic_log2(len) << QUIC_VARINT_BYTE_0_SHIFT;
-	pos = tail = (unsigned char *)b_tail(b);
-	wrap = (unsigned char *)b_wrap(b);
-	while (len--) {
-		*pos++ = val >> shift;
-		shift -= 8;
-		if (pos == wrap)
-			pos -= size;
-		if (++data == size && len)
-			return 0;
+	/* Check that buffer room is sufficient and width big enough if set. */
+	if (b_room(b) < len || (width && width < len))
+		return 0;
+
+	if (!width)
+		width = len;
+	save_width = width;
+
+	pos = b_tail(b);
+	while (width--) {
+		/* Encode the shifted integer or 0 if width bigger than integer length. */
+		*pos++ = width >= len ? 0 : val >> (width * 8);
+
+		if (pos == b_wrap(b))
+			pos = b_orig(b);
 	}
-	*tail |= size_bits;
-	b_add(b, save_len);
+
+	/* set the bits of byte#0 which gives the length of the encoded integer */
+	*b_tail(b) |= quic_log2(save_width) << QUIC_VARINT_BYTE_0_SHIFT;
+	b_add(b, save_width);
 
 	return 1;
+}
+
+static inline size_t quic_incint_size_diff(uint64_t val)
+{
+	switch (val) {
+	case QUIC_VARINT_1_BYTE_MAX:
+		return 1;
+	case QUIC_VARINT_2_BYTE_MAX:
+		return 2;
+	case QUIC_VARINT_4_BYTE_MAX:
+		return 4;
+	default:
+		return 0;
+	}
+}
+
+/* Return the difference between the encoded length of <val> and the encoded
+ * length of <val-1>.
+ */
+static inline size_t quic_decint_size_diff(uint64_t val)
+{
+	switch (val) {
+	case QUIC_VARINT_1_BYTE_MAX + 1:
+		return 1;
+	case QUIC_VARINT_2_BYTE_MAX + 1:
+		return 2;
+	case QUIC_VARINT_4_BYTE_MAX + 1:
+		return 4;
+	default:
+		return 0;
+	}
 }
 
 #endif /* USE_QUIC */

@@ -1,7 +1,7 @@
 /*
  * AF_INET/AF_INET6 QUIC protocol layer.
  *
- * Copyright 2020 Frédéric Lécaille <flecaille@haproxy.com>
+ * Copyright 2020 Frederic Lecaille <flecaille@haproxy.com>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -12,7 +12,6 @@
 
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +23,8 @@
 
 #include <netinet/udp.h>
 #include <netinet/in.h>
+
+#include <import/ebtree-t.h>
 
 #include <haproxy/api.h>
 #include <haproxy/arg.h>
@@ -41,34 +42,51 @@
 #include <haproxy/proto_quic.h>
 #include <haproxy/proto_udp.h>
 #include <haproxy/proxy-t.h>
-#include <haproxy/sock.h>
+#include <haproxy/quic_conn.h>
 #include <haproxy/quic_sock.h>
+#include <haproxy/sock.h>
 #include <haproxy/sock_inet.h>
+#include <haproxy/task.h>
 #include <haproxy/tools.h>
-#include <haproxy/xprt_quic-t.h>
 
+/* per-thread quic datagram handlers */
+struct quic_dghdlr *quic_dghdlrs;
 
-static void quic_add_listener(struct protocol *proto, struct listener *listener);
+/* Size of the internal buffer of QUIC RX buffer at the fd level */
+#define QUIC_RX_BUFSZ  (1UL << 18)
+
+DECLARE_STATIC_POOL(pool_head_quic_rxbuf, "quic_rxbuf", QUIC_RX_BUFSZ);
+
 static int quic_bind_listener(struct listener *listener, char *errmsg, int errlen);
 static int quic_connect_server(struct connection *conn, int flags);
 static void quic_enable_listener(struct listener *listener);
 static void quic_disable_listener(struct listener *listener);
+static int quic_bind_tid_prep(struct connection *conn, int new_tid);
+static void quic_bind_tid_commit(struct connection *conn);
+static void quic_bind_tid_reset(struct connection *conn);
+static int quic_get_info(struct connection *conn, long long int *info, int info_num);
 
 /* Note: must not be declared <const> as its list will be overwritten */
 struct protocol proto_quic4 = {
 	.name           = "quic4",
 
 	/* connection layer */
-	.ctrl_type      = SOCK_STREAM,
+	.xprt_type      = PROTO_TYPE_STREAM,
 	.listen         = quic_bind_listener,
 	.enable         = quic_enable_listener,
 	.disable        = quic_disable_listener,
-	.add            = quic_add_listener,
+	.add            = default_add_listener,
 	.unbind         = default_unbind_listener,
 	.suspend        = default_suspend_listener,
 	.resume         = default_resume_listener,
 	.accept_conn    = quic_sock_accept_conn,
+	.get_src        = quic_sock_get_src,
+	.get_dst        = quic_sock_get_dst,
 	.connect        = quic_connect_server,
+	.get_info       = quic_get_info,
+	.bind_tid_prep   = quic_bind_tid_prep,
+	.bind_tid_commit = quic_bind_tid_commit,
+	.bind_tid_reset  = quic_bind_tid_reset,
 
 	/* binding layer */
 	.rx_suspend     = udp_suspend_receiver,
@@ -85,9 +103,10 @@ struct protocol proto_quic4 = {
 	.rx_disable     = sock_disable,
 	.rx_unbind      = sock_unbind,
 	.rx_listening   = quic_sock_accepting_conn,
-	.default_iocb   = quic_sock_fd_iocb,
-	.receivers      = LIST_HEAD_INIT(proto_quic4.receivers),
-	.nb_receivers   = 0,
+	.default_iocb   = quic_lstnr_sock_fd_iocb,
+#ifdef SO_REUSEPORT
+	.flags          = PROTO_F_REUSEPORT_SUPPORTED,
+#endif
 };
 
 INITCALL1(STG_REGISTER, protocol_register, &proto_quic4);
@@ -97,16 +116,22 @@ struct protocol proto_quic6 = {
 	.name            = "quic6",
 
 	/* connection layer */
-	.ctrl_type      = SOCK_STREAM,
+	.xprt_type      = PROTO_TYPE_STREAM,
 	.listen         = quic_bind_listener,
 	.enable         = quic_enable_listener,
 	.disable        = quic_disable_listener,
-	.add            = quic_add_listener,
+	.add            = default_add_listener,
 	.unbind         = default_unbind_listener,
 	.suspend        = default_suspend_listener,
 	.resume         = default_resume_listener,
 	.accept_conn    = quic_sock_accept_conn,
+	.get_src        = quic_sock_get_src,
+	.get_dst        = quic_sock_get_dst,
 	.connect        = quic_connect_server,
+	.get_info       = quic_get_info,
+	.bind_tid_prep   = quic_bind_tid_prep,
+	.bind_tid_commit = quic_bind_tid_commit,
+	.bind_tid_reset  = quic_bind_tid_reset,
 
 	/* binding layer */
 	.rx_suspend     = udp_suspend_receiver,
@@ -123,9 +148,10 @@ struct protocol proto_quic6 = {
 	.rx_disable     = sock_disable,
 	.rx_unbind      = sock_unbind,
 	.rx_listening   = quic_sock_accepting_conn,
-	.default_iocb   = quic_sock_fd_iocb,
-	.receivers      = LIST_HEAD_INIT(proto_quic6.receivers),
-	.nb_receivers   = 0,
+	.default_iocb   = quic_lstnr_sock_fd_iocb,
+#ifdef SO_REUSEPORT
+	.flags          = PROTO_F_REUSEPORT_SUPPORTED,
+#endif
 };
 
 INITCALL1(STG_REGISTER, protocol_register, &proto_quic6);
@@ -251,21 +277,23 @@ int quic_bind_socket(int fd, int flags, struct sockaddr_storage *local, struct s
 
 int quic_connect_server(struct connection *conn, int flags)
 {
-	int fd;
+	int fd, stream_err;
 	struct server *srv;
 	struct proxy *be;
 	struct conn_src *src;
 	struct sockaddr_storage *addr;
 
+	BUG_ON(!conn->dst);
+
 	conn->flags |= CO_FL_WAIT_L4_CONN; /* connection in progress */
 
 	switch (obj_type(conn->target)) {
 	case OBJ_TYPE_PROXY:
-		be = objt_proxy(conn->target);
+		be = __objt_proxy(conn->target);
 		srv = NULL;
 		break;
 	case OBJ_TYPE_SERVER:
-		srv = objt_server(conn->target);
+		srv = __objt_server(conn->target);
 		be = srv->proxy;
 		break;
 	default:
@@ -273,72 +301,12 @@ int quic_connect_server(struct connection *conn, int flags)
 		return SF_ERR_INTERNAL;
 	}
 
-	if (!conn->dst) {
-		conn->flags |= CO_FL_ERROR;
-		return SF_ERR_INTERNAL;
-	}
+	/* perform common checks on obtained socket FD, return appropriate Stream Error Flag in case of failure */
+	fd = conn->handle.fd = sock_create_server_socket(conn, be, &stream_err);
+	if (fd == -1)
+		return stream_err;
 
-	fd = conn->handle.fd = sock_create_server_socket(conn);
-
-	if (fd == -1) {
-		qfprintf(stderr, "Cannot get a server socket.\n");
-
-		if (errno == ENFILE) {
-			conn->err_code = CO_ER_SYS_FDLIM;
-			send_log(be, LOG_EMERG,
-				 "Proxy %s reached system FD limit (maxsock=%d). Please check system tunables.\n",
-				 be->id, global.maxsock);
-		}
-		else if (errno == EMFILE) {
-			conn->err_code = CO_ER_PROC_FDLIM;
-			send_log(be, LOG_EMERG,
-				 "Proxy %s reached process FD limit (maxsock=%d). Please check 'ulimit-n' and restart.\n",
-				 be->id, global.maxsock);
-		}
-		else if (errno == ENOBUFS || errno == ENOMEM) {
-			conn->err_code = CO_ER_SYS_MEMLIM;
-			send_log(be, LOG_EMERG,
-				 "Proxy %s reached system memory limit (maxsock=%d). Please check system tunables.\n",
-				 be->id, global.maxsock);
-		}
-		else if (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT) {
-			conn->err_code = CO_ER_NOPROTO;
-		}
-		else
-			conn->err_code = CO_ER_SOCK_ERR;
-
-		/* this is a resource error */
-		conn->flags |= CO_FL_ERROR;
-		return SF_ERR_RESOURCE;
-	}
-
-	if (fd >= global.maxsock) {
-		/* do not log anything there, it's a normal condition when this option
-		 * is used to serialize connections to a server !
-		 */
-		ha_alert("socket(): not enough free sockets. Raise -n argument. Giving up.\n");
-		close(fd);
-		conn->err_code = CO_ER_CONF_FDLIM;
-		conn->flags |= CO_FL_ERROR;
-		return SF_ERR_PRXCOND; /* it is a configuration limit */
-	}
-
-	if ((fcntl(fd, F_SETFL, O_NONBLOCK)==-1)) {
-		qfprintf(stderr,"Cannot set client socket to non blocking mode.\n");
-		close(fd);
-		conn->err_code = CO_ER_SOCK_ERR;
-		conn->flags |= CO_FL_ERROR;
-		return SF_ERR_INTERNAL;
-	}
-
-	if (master == 1 && (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1)) {
-		ha_alert("Cannot set CLOEXEC on client socket.\n");
-		close(fd);
-		conn->err_code = CO_ER_SOCK_ERR;
-		conn->flags |= CO_FL_ERROR;
-		return SF_ERR_INTERNAL;
-	}
-
+	/* FD is ok, perform protocol specific settings */
 	/* allow specific binding :
 	 * - server-specific at first
 	 * - proxy-specific next
@@ -357,7 +325,7 @@ int quic_connect_server(struct connection *conn, int flags)
 			switch (src->opts & CO_SRC_TPROXY_MASK) {
 			case CO_SRC_TPROXY_CLI:
 				conn_set_private(conn);
-				/* fall through */
+				__fallthrough;
 			case CO_SRC_TPROXY_ADDR:
 				flags = 3;
 				break;
@@ -456,9 +424,9 @@ int quic_connect_server(struct connection *conn, int flags)
 			/* should normally not happen but if so, indicates that it's OK */
 			conn->flags &= ~CO_FL_WAIT_L4_CONN;
 		}
-		else if (errno == EAGAIN || errno == EADDRINUSE || errno == EADDRNOTAVAIL) {
+		else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EADDRINUSE || errno == EADDRNOTAVAIL) {
 			char *msg;
-			if (errno == EAGAIN || errno == EADDRNOTAVAIL) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EADDRNOTAVAIL) {
 				msg = "no free ports";
 				conn->err_code = CO_ER_FREE_PORTS;
 			}
@@ -498,8 +466,6 @@ int quic_connect_server(struct connection *conn, int flags)
 		conn->flags &= ~CO_FL_WAIT_L4_CONN;
 	}
 
-	conn->flags |= CO_FL_ADDR_TO_SET;
-
 	conn_ctrl_init(conn);       /* registers the FD */
 	HA_ATOMIC_OR(&fdtab[fd].state, FD_LINGER_RISK);  /* close hard if needed */
 
@@ -512,91 +478,41 @@ int quic_connect_server(struct connection *conn, int flags)
 	return SF_ERR_NONE;  /* connection is OK */
 }
 
-/* Add listener <listener> to protocol <proto>. Technically speaking we just
- * initialize a few entries which should be doable during quic_bind_listener().
- * The end of the initialization goes on with the default function.
- */
-static void quic_add_listener(struct protocol *proto, struct listener *listener)
-{
-	MT_LIST_INIT(&listener->rx.pkts);
-	listener->rx.odcids = EB_ROOT_UNIQUE;
-	listener->rx.cids = EB_ROOT_UNIQUE;
-	HA_RWLOCK_INIT(&listener->rx.cids_lock);
-	default_add_listener(proto, listener);
-}
-
-/* Allocate the TX ring buffers for <l> listener.
- * Return 1 if succeeded, 0 if not.
- */
-static int quic_alloc_tx_rings_listener(struct listener *l)
-{
-	struct qring *qr;
-	int i;
-
-	l->rx.tx_qrings = calloc(global.nbthread, sizeof *l->rx.tx_qrings);
-	if (!l->rx.tx_qrings)
-		return 0;
-
-	MT_LIST_INIT(&l->rx.tx_qring_list);
-	for (i = 0; i < global.nbthread; i++) {
-		unsigned char *buf;
-		struct qring *qr = &l->rx.tx_qrings[i];
-
-		buf = pool_alloc(pool_head_quic_tx_ring);
-		if (!buf)
-			goto err;
-
-		qr->cbuf = cbuf_new(buf, QUIC_TX_RING_BUFSZ);
-		if (!qr->cbuf) {
-			pool_free(pool_head_quic_tx_ring, buf);
-			goto err;
-		}
-
-		MT_LIST_APPEND(&l->rx.tx_qring_list, &qr->mt_list);
-	}
-
-	return 1;
-
- err:
-	while ((qr = MT_LIST_POP(&l->rx.tx_qring_list, typeof(qr), mt_list))) {
-		pool_free(pool_head_quic_tx_ring, qr->cbuf->buf);
-		cbuf_free(qr->cbuf);
-	}
-	free(l->rx.tx_qrings);
-	return 0;
-}
-
 /* Allocate the RX buffers for <l> listener.
  * Return 1 if succeeded, 0 if not.
  */
 static int quic_alloc_rxbufs_listener(struct listener *l)
 {
 	int i;
-	struct rxbuf *rxbuf;
-
-	l->rx.rxbufs = calloc(global.nbthread, sizeof *l->rx.rxbufs);
-	if (!l->rx.rxbufs)
-		return 0;
+	struct quic_receiver_buf *tmp;
 
 	MT_LIST_INIT(&l->rx.rxbuf_list);
-	for (i = 0; i < global.nbthread; i++) {
+	for (i = 0; i < my_popcountl(l->rx.bind_thread); i++) {
+		struct quic_receiver_buf *rxbuf;
 		char *buf;
 
-		rxbuf = &l->rx.rxbufs[i];
-		buf = pool_alloc(pool_head_quic_rxbuf);
-		if (!buf)
+		rxbuf = calloc(1, sizeof(*rxbuf));
+		if (!rxbuf)
 			goto err;
 
+		buf = pool_alloc(pool_head_quic_rxbuf);
+		if (!buf) {
+			free(rxbuf);
+			goto err;
+		}
+
 		rxbuf->buf = b_make(buf, QUIC_RX_BUFSZ, 0, 0);
-		MT_LIST_APPEND(&l->rx.rxbuf_list, &rxbuf->mt_list);
+		LIST_INIT(&rxbuf->dgram_list);
+		MT_LIST_APPEND(&l->rx.rxbuf_list, &rxbuf->rxbuf_el);
 	}
 
 	return 1;
 
  err:
-	while ((rxbuf = MT_LIST_POP(&l->rx.rxbuf_list, typeof(rxbuf), mt_list)))
-		pool_free(pool_head_quic_rxbuf, rxbuf->buf.area);
-	free(l->rx.rxbufs);
+	while ((tmp = MT_LIST_POP(&l->rx.rxbuf_list, typeof(tmp), rxbuf_el))) {
+		pool_free(pool_head_quic_rxbuf, tmp->buf.area);
+		free(tmp);
+	}
 	return 0;
 }
 
@@ -615,7 +531,8 @@ static int quic_alloc_rxbufs_listener(struct listener *l)
  */
 static int quic_bind_listener(struct listener *listener, char *errmsg, int errlen)
 {
-	int err = ERR_NONE;
+	const struct sockaddr_storage addr = listener->rx.addr;
+	int fd, err = ERR_NONE;
 	char *msg = NULL;
 
 	/* ensure we never return garbage */
@@ -630,12 +547,41 @@ static int quic_bind_listener(struct listener *listener, char *errmsg, int errle
 		goto udp_return;
 	}
 
-	if (!quic_alloc_tx_rings_listener(listener) ||
-	    !quic_alloc_rxbufs_listener(listener)) {
+	/* Duplicate quic_mode setting from bind_conf. Useful to overwrite it
+	 * at runtime per receiver instance.
+	 */
+	listener->rx.quic_mode = listener->bind_conf->quic_mode;
+
+	/* Set IP_PKTINFO to retrieve destination address on recv. */
+	fd = listener->rx.fd;
+	switch (addr.ss_family) {
+	case AF_INET:
+#if defined(IP_PKTINFO)
+		setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &one, sizeof(one));
+#elif defined(IP_RECVDSTADDR)
+		setsockopt(fd, IPPROTO_IP, IP_RECVDSTADDR, &one, sizeof(one));
+#endif /* IP_PKTINFO || IP_RECVDSTADDR */
+		break;
+	case AF_INET6:
+#ifdef IPV6_RECVPKTINFO
+		setsockopt(fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &one, sizeof(one));
+#endif
+		break;
+	default:
+		break;
+	}
+
+	if (!quic_alloc_rxbufs_listener(listener)) {
 		msg = "could not initialize tx/rx rings";
 		err |= ERR_WARN;
 		goto udp_return;
 	}
+
+	if (global.tune.frontend_rcvbuf)
+		setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &global.tune.frontend_rcvbuf, sizeof(global.tune.frontend_rcvbuf));
+
+	if (global.tune.frontend_sndbuf)
+		setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &global.tune.frontend_sndbuf, sizeof(global.tune.frontend_sndbuf));
 
 	listener_set_state(listener, LI_LISTEN);
 
@@ -674,6 +620,239 @@ static void quic_disable_listener(struct listener *l)
 	if (fd_updt)
 		fd_stop_recv(l->rx.fd);
 }
+
+static int quic_get_info(struct connection *conn, long long int *info, int info_num)
+{
+	struct quic_conn *qc = conn->handle.qc;
+
+	switch (info_num) {
+	case 0:  *info = qc->path->loss.srtt * 1000;      break;
+	case 1:  *info = qc->path->loss.rtt_var * 1000;   break;
+	case 4:  *info = qc->path->loss.nb_lost_pkt;      break;
+	case 7:  *info = qc->path->loss.nb_reordered_pkt; break;
+	default: return 0;
+	}
+
+	return 1;
+}
+
+/* change the connection's thread to <new_tid>. For frontend connections, the
+ * target is a listener, and the caller is responsible for guaranteeing that
+ * the listener assigned to the connection is bound to the requested thread.
+ */
+static int quic_bind_tid_prep(struct connection *conn, int new_tid)
+{
+	struct quic_conn *qc = conn->handle.qc;
+	return qc_bind_tid_prep(qc, new_tid);
+}
+
+static void quic_bind_tid_commit(struct connection *conn)
+{
+	struct quic_conn *qc = conn->handle.qc;
+	qc_bind_tid_commit(qc, objt_listener(conn->target));
+}
+
+static void quic_bind_tid_reset(struct connection *conn)
+{
+	struct quic_conn *qc = conn->handle.qc;
+	qc_bind_tid_reset(qc);
+}
+
+static int quic_alloc_dghdlrs(void)
+{
+	int i;
+
+	quic_dghdlrs = calloc(global.nbthread, sizeof(*quic_dghdlrs));
+	if (!quic_dghdlrs) {
+		ha_alert("Failed to allocate the quic datagram handlers.\n");
+		return 0;
+	}
+
+	for (i = 0; i < global.nbthread; i++) {
+		struct quic_dghdlr *dghdlr = &quic_dghdlrs[i];
+
+		dghdlr->task = tasklet_new();
+		if (!dghdlr->task) {
+			ha_alert("Failed to allocate the quic datagram handler on thread %d.\n", i);
+			return 0;
+		}
+
+		tasklet_set_tid(dghdlr->task, i);
+		dghdlr->task->context = dghdlr;
+		dghdlr->task->process = quic_lstnr_dghdlr;
+
+		MT_LIST_INIT(&dghdlr->dgrams);
+	}
+
+	return 1;
+}
+REGISTER_POST_CHECK(quic_alloc_dghdlrs);
+
+static int quic_deallocate_dghdlrs(void)
+{
+	int i;
+
+	if (quic_dghdlrs) {
+		for (i = 0; i < global.nbthread; ++i)
+			tasklet_free(quic_dghdlrs[i].task);
+		free(quic_dghdlrs);
+	}
+
+	return 1;
+}
+REGISTER_POST_DEINIT(quic_deallocate_dghdlrs);
+
+/* Checks that connection socket-owner mode is supported.
+ * Returns 1 if it is, 0 if not. A negative error code is used for an unknown
+ * error which leaves support status as unknown.
+ */
+static int quic_test_conn_socket_owner(void)
+{
+	int fdtest[2] = { -1, -1 };
+	struct sockaddr_in lo_addr;
+	socklen_t addrlen __maybe_unused = sizeof(lo_addr);
+	int i, ret = 1;
+
+	lo_addr.sin_family = AF_INET;
+	lo_addr.sin_addr.s_addr = ntohl(INADDR_LOOPBACK);
+	lo_addr.sin_port = 0;
+
+	if ((fdtest[0] = socket(AF_INET, SOCK_DGRAM, 0)) < 0 ||
+	    (fdtest[1] = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+		ret = -1;
+		goto end;
+	}
+
+	/* Connection socket-owner mode relies on several system features :
+	 * - IP_PKTINFO or equivalent, to retrieve peer address for connect()
+	 * - support for multiple UDP sockets bound on the same source address
+	 */
+
+#if defined(IP_PKTINFO) || defined(IP_RECVDSTADDR)
+	/* Bind first UDP socket on a random source port for loopback address. */
+	if (setsockopt(fdtest[0], SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) ||
+	    bind(fdtest[0], (struct sockaddr *)&lo_addr, sizeof(lo_addr))) {
+		ret = 0;
+		goto end;
+	}
+
+	/* Retrieve bound port to reuse it for the second UDP socket. */
+	if (getsockname(fdtest[0], (struct sockaddr *)&lo_addr, &addrlen)) {
+		ret = -1;
+		goto end;
+	}
+
+	/* Bind second UDP socket on the same port as the first socket. */
+	if (setsockopt(fdtest[1], SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) ||
+	    bind(fdtest[1], (struct sockaddr *)&lo_addr, sizeof(lo_addr))) {
+		ret = 0;
+		goto end;
+	}
+#else
+	ret = 0;
+	goto end;
+#endif
+
+ end:
+	for (i = 0; i <= 1; ++i) {
+		if (fdtest[i] >= 0)
+			close(fdtest[i]);
+	}
+
+	return ret;
+}
+
+/* Returns 1 if GSO is supported, 0 if not, or a negative error code if unknown. */
+static int quic_test_gso(void)
+{
+	int fdtest = -1;
+	int ret = 1;
+
+	if ((fdtest = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+		ret = -1;
+		goto end;
+	}
+
+#ifdef UDP_SEGMENT
+	if (setsockopt(fdtest, SOL_UDP, UDP_SEGMENT, &zero, sizeof(zero))) {
+		ret = 0;
+		goto end;
+	}
+#else
+	ret = 0;
+	goto end;
+#endif
+
+ end:
+	if (fdtest >= 0)
+		close(fdtest);
+	return ret;
+}
+
+/* Check for platform support of every advanced UDP network API features used
+ * by the QUIC stack. For every unsupported feature, switch to a fallback
+ * mechanism. A message is notified in this case when running in diagnostic
+ * mode.
+ *
+ * Returns ERR_NONE if every checks performed, wether or not some features are
+ * not available. ERR_FATAL is reported if checks cannot be executed.
+ */
+static int quic_test_socketopts(void)
+{
+	int ret;
+
+	/* Check for connection socket-owner mode support. */
+	if (global.tune.options & GTUNE_QUIC_SOCK_PER_CONN) {
+		ret = quic_test_conn_socket_owner();
+		if (ret < 0) {
+			goto err;
+		}
+		else if (!ret) {
+			ha_diag_warning("Your platform does not seem to support UDP source address retrieval through IP_PKTINFO or an alternative flag. "
+			                "QUIC connections will use listener socket.\n");
+			global.tune.options &= ~GTUNE_QUIC_SOCK_PER_CONN;
+		}
+	}
+
+	/* Check for UDP GSO support. */
+	if (!(global.tune.options & GTUNE_QUIC_NO_UDP_GSO)) {
+		ret = quic_test_gso();
+		if (ret < 0) {
+			goto err;
+		}
+		else if (!ret) {
+			ha_diag_warning("Your platform does not support UDP GSO. "
+			                "This will be automatically disabled for QUIC transfer.\n");
+			global.tune.options |= GTUNE_QUIC_NO_UDP_GSO;
+		}
+	}
+
+	return ERR_NONE;
+
+ err:
+	ha_alert("Fatal error on %s(): %s.\n", __func__, strerror(errno));
+	return ERR_FATAL;
+}
+REGISTER_POST_CHECK(quic_test_socketopts);
+
+static void quic_register_build_options(void)
+{
+	char *ptr = NULL;
+	int ret;
+
+	ret = quic_test_conn_socket_owner();
+	memprintf(&ptr, "QUIC: connection socket-owner mode support : ");
+	memprintf(&ptr, "%s%s\n", ptr, ret > 0 ? "yes" :
+	                               !ret ? "no" : "unknown");
+
+	ret = quic_test_gso();
+	memprintf(&ptr, "%sQUIC: GSO emission support : ", ptr);
+	memprintf(&ptr, "%s%s", ptr, ret > 0 ? "yes" :
+	                             !ret ? "no" : "unknown");
+
+	hap_register_build_opts(ptr, 1);
+}
+INITCALL0(STG_REGISTER, quic_register_build_options);
 
 /*
  * Local variables:

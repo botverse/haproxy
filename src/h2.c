@@ -49,95 +49,6 @@ struct h2_frame_definition h2_frame_definition[H2_FT_ENTRIES] =	{
 	 [H2_FT_CONTINUATION ] = { .dir = 3, .min_id = 1, .max_id = H2_MAX_STREAM_ID, .min_len = 0, .max_len = H2_MAX_FRAME_LEN, },
 };
 
-/* Looks into <ist> for forbidden characters for header values (0x00, 0x0A,
- * 0x0D), starting at pointer <start> which must be within <ist>. Returns
- * non-zero if such a character is found, 0 otherwise. When run on unlikely
- * header match, it's recommended to first check for the presence of control
- * chars using ist_find_ctl().
- */
-static int has_forbidden_char(const struct ist ist, const char *start)
-{
-	do {
-		if ((uint8_t)*start <= 0x0d &&
-		    (1U << (uint8_t)*start) & ((1<<13) | (1<<10) | (1<<0)))
-			return 1;
-		start++;
-	} while (start < istend(ist));
-	return 0;
-}
-
-/* Parse the Content-Length header field of an HTTP/2 request. The function
- * checks all possible occurrences of a comma-delimited value, and verifies
- * if any of them doesn't match a previous value. It returns <0 if a value
- * differs, 0 if the whole header can be dropped (i.e. already known), or >0
- * if the value can be indexed (first one). In the last case, the value might
- * be adjusted and the caller must only add the updated value.
- */
-int h2_parse_cont_len_header(unsigned int *msgf, struct ist *value, unsigned long long *body_len)
-{
-	char *e, *n;
-	unsigned long long cl;
-	int not_first = !!(*msgf & H2_MSGF_BODY_CL);
-	struct ist word;
-
-	word.ptr = value->ptr - 1; // -1 for next loop's pre-increment
-	e = value->ptr + value->len;
-
-	while (++word.ptr < e) {
-		/* skip leading delimiter and blanks */
-		if (unlikely(HTTP_IS_LWS(*word.ptr)))
-			continue;
-
-		/* digits only now */
-		for (cl = 0, n = word.ptr; n < e; n++) {
-			unsigned int c = *n - '0';
-			if (unlikely(c > 9)) {
-				/* non-digit */
-				if (unlikely(n == word.ptr)) // spaces only
-					goto fail;
-				break;
-			}
-			if (unlikely(cl > ULLONG_MAX / 10ULL))
-				goto fail; /* multiply overflow */
-			cl = cl * 10ULL;
-			if (unlikely(cl + c < cl))
-				goto fail; /* addition overflow */
-			cl = cl + c;
-		}
-
-		/* keep a copy of the exact cleaned value */
-		word.len = n - word.ptr;
-
-		/* skip trailing LWS till next comma or EOL */
-		for (; n < e; n++) {
-			if (!HTTP_IS_LWS(*n)) {
-				if (unlikely(*n != ','))
-					goto fail;
-				break;
-			}
-		}
-
-		/* if duplicate, must be equal */
-		if (*msgf & H2_MSGF_BODY_CL && cl != *body_len)
-			goto fail;
-
-		/* OK, store this result as the one to be indexed */
-		*msgf |= H2_MSGF_BODY_CL;
-		*body_len = cl;
-		*value = word;
-		word.ptr = n;
-	}
-	/* here we've reached the end with a single value or a series of
-	 * identical values, all matching previous series if any. The last
-	 * parsed value was sent back into <value>. We just have to decide
-	 * if this occurrence has to be indexed (it's the first one) or
-	 * silently skipped (it's not the first one)
-	 */
-	return !not_first;
- fail:
-	return -1;
-}
-
 /* Prepare the request line into <htx> from pseudo headers stored in <phdr[]>.
  * <fields> indicates what was found so far. This should be called once at the
  * detection of the first general header field or at the end of the request if
@@ -177,6 +88,7 @@ static struct htx_sl *h2_prepare_htx_reqline(uint32_t fields, struct ist *phdr, 
 	struct ist uri, meth_sl;
 	unsigned int flags = HTX_SL_F_NONE;
 	struct htx_sl *sl;
+	enum http_meth_t meth;
 	size_t i;
 
 	if ((fields & H2_PHDR_FND_METH) && isteq(phdr[H2_PHDR_IDX_METH], ist("CONNECT"))) {
@@ -353,13 +265,17 @@ static struct htx_sl *h2_prepare_htx_reqline(uint32_t fields, struct ist *phdr, 
 	flags |= HTX_SL_F_VER_11;    // V2 in fact
 	flags |= HTX_SL_F_XFER_LEN;  // xfer len always known with H2
 
+
+	meth = find_http_meth(meth_sl.ptr, meth_sl.len);
+	if (meth == HTTP_METH_HEAD) {
+		*msgf |= H2_MSGF_BODYLESS_RSP;
+		flags |= HTX_SL_F_BODYLESS_RESP;
+	}
+
 	sl = htx_add_stline(htx, HTX_BLK_REQ_SL, flags, meth_sl, uri, ist("HTTP/2.0"));
 	if (!sl)
 		goto fail;
-
-	sl->info.req.meth = find_http_meth(meth_sl.ptr, meth_sl.len);
-	if (sl->info.req.meth == HTTP_METH_HEAD)
-		*msgf |= H2_MSGF_BODYLESS_RSP;
+	sl->info.req.meth = meth;
 	return sl;
  fail:
 	return NULL;
@@ -385,8 +301,12 @@ static struct htx_sl *h2_prepare_htx_reqline(uint32_t fields, struct ist *phdr, 
  *
  * The Cookie header will be reassembled at the end, and for this, the <list>
  * will be used to create a linked list, so its contents may be destroyed.
+ *
+ * When <relaxed> is non-nul, some non-dangerous checks will be ignored. This
+ * is in order to satisfy "option accept-unsafe-violations-in-http-request" for
+ * interoperability purposes.
  */
-int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *msgf, unsigned long long *body_len)
+int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *msgf, unsigned long long *body_len, int relaxed)
 {
 	struct ist phdr_val[H2_PHDR_NUM_ENTRIES];
 	uint32_t fields; /* bit mask of H2_PHDR_FND_* */
@@ -402,7 +322,7 @@ int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *ms
 	lck = ck = -1; // no cookie for now
 	fields = 0;
 	for (idx = 0; list[idx].n.len != 0; idx++) {
-		if (!list[idx].n.ptr) {
+		if (!isttest(list[idx].n)) {
 			/* this is an indexed pseudo-header */
 			phdr = list[idx].n.len;
 		}
@@ -422,11 +342,18 @@ int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *ms
 		}
 
 		/* RFC7540#10.3: intermediaries forwarding to HTTP/1 must take care of
-		 * rejecting NUL, CR and LF characters.
+		 * rejecting NUL, CR and LF characters. For :path we reject all CTL
+		 * chars, spaces, and '#'.
 		 */
-		ctl = ist_find_ctl(list[idx].v);
-		if (unlikely(ctl) && has_forbidden_char(list[idx].v, ctl))
-			goto fail;
+		if (phdr == H2_PHDR_IDX_PATH && !relaxed) {
+			ctl = ist_find_range(list[idx].v, 0, '#');
+			if (unlikely(ctl) && http_path_has_forbidden_char(list[idx].v, ctl))
+				goto fail;
+		} else {
+			ctl = ist_find_ctl(list[idx].v);
+			if (unlikely(ctl) && http_header_has_forbidden_char(list[idx].v, ctl))
+				goto fail;
+		}
 
 		if (phdr > 0 && phdr < H2_PHDR_NUM_ENTRIES) {
 			/* insert a pseudo header by its index (in phdr) and value (in value) */
@@ -479,10 +406,12 @@ int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *ms
 		}
 
 		if (isteq(list[idx].n, ist("content-length"))) {
-			ret = h2_parse_cont_len_header(msgf, &list[idx].v, body_len);
+			ret = http_parse_cont_len_header(&list[idx].v, body_len,
+			                                 *msgf & H2_MSGF_BODY_CL);
 			if (ret < 0)
 				goto fail;
 
+			*msgf |= H2_MSGF_BODY_CL;
 			sl_flags |= HTX_SL_F_CLEN;
 			if (ret == 0)
 				continue; // skip this duplicate
@@ -501,14 +430,7 @@ int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *ms
 
 		/* cookie requires special processing at the end */
 		if (isteq(list[idx].n, ist("cookie"))) {
-			list[idx].n.len = -1;
-
-			if (ck < 0)
-				ck = idx;
-			else
-				list[lck].n.len = idx;
-
-			lck = idx;
+			http_cookie_register(list, idx, &ck, &lck);
 			continue;
 		}
 
@@ -534,10 +456,17 @@ int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *ms
 	    (*msgf & H2_MSGF_BODY_TUNNEL)) {
 		/* Request without body or tunnel requested */
 		sl_flags |= HTX_SL_F_BODYLESS;
-		htx->flags |= HTX_FL_EOM;
+		if (*msgf & H2_MSGF_BODY_TUNNEL)
+		    htx->flags |= HTX_FL_EOM;
 	}
 
 	if (*msgf & H2_MSGF_EXT_CONNECT) {
+		/* Consider "h2c" / "h2" as invalid protocol value for Extended CONNECT. */
+		if (isteqi(phdr_val[H2_PHDR_IDX_PROT], ist("h2c")) ||
+		    isteqi(phdr_val[H2_PHDR_IDX_PROT], ist("h2"))) {
+			goto fail;
+		}
+
 		if (!htx_add_header(htx, ist("upgrade"), phdr_val[H2_PHDR_IDX_PROT]))
 			goto fail;
 		if (!htx_add_header(htx, ist("connection"), ist("upgrade")))
@@ -561,38 +490,13 @@ int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *ms
 	 * visited headers.
 	 */
 	if (ck >= 0) {
-		uint32_t fs; // free space
-		uint32_t bs; // block size
-		uint32_t vl; // value len
-		uint32_t tl; // total length
-		struct htx_blk *blk;
-
-		blk = htx_add_header(htx, ist("cookie"), list[ck].v);
-		if (!blk)
+		if (http_cookie_merge(htx, list, ck))
 			goto fail;
-
-		tl = list[ck].v.len;
-		fs = htx_free_data_space(htx);
-		bs = htx_get_blksz(blk);
-
-		/* for each extra cookie, we'll extend the cookie's value and
-		 * insert "; " before the new value.
-		 */
-		fs += tl; // first one is already counted
-		while ((ck = list[ck].n.len) >= 0) {
-			vl = list[ck].v.len;
-			tl += vl + 2;
-			if (tl > fs)
-				goto fail;
-
-			htx_change_blk_value_len(htx, blk, tl);
-			*(char *)(htx_get_blk_ptr(htx, blk) + bs + 0) = ';';
-			*(char *)(htx_get_blk_ptr(htx, blk) + bs + 1) = ' ';
-			memcpy(htx_get_blk_ptr(htx, blk) + bs + 2, list[ck].v.ptr, vl);
-			bs += vl + 2;
-		}
-
 	}
+
+	/* Check the number of blocks agains "tune.http.maxhdr" value before adding EOH block */
+	if (htx_nbblks(htx) > global.tune.max_http_hdr)
+		goto fail;
 
 	/* now send the end of headers marker */
 	if (!htx_add_endof(htx, HTX_BLK_EOH))
@@ -618,7 +522,7 @@ int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *ms
  */
 static struct htx_sl *h2_prepare_htx_stsline(uint32_t fields, struct ist *phdr, struct htx *htx, unsigned int *msgf)
 {
-	unsigned int status, flags = HTX_SL_F_NONE;
+	unsigned int status, flags = HTX_SL_F_IS_RESP;
 	struct htx_sl *sl;
 	struct ist stat;
 
@@ -671,6 +575,7 @@ static struct htx_sl *h2_prepare_htx_stsline(uint32_t fields, struct ist *phdr, 
 	else if (status == 204 || status == 304) {
 		*msgf &= ~H2_MSGF_BODY;
 		*msgf |= H2_MSGF_BODYLESS_RSP;
+		flags |= HTX_SL_F_BODYLESS_RESP;
 	}
 
 	/* Set HTX start-line flags */
@@ -721,7 +626,7 @@ int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *m
 
 	fields = 0;
 	for (idx = 0; list[idx].n.len != 0; idx++) {
-		if (!list[idx].n.ptr) {
+		if (!isttest(list[idx].n)) {
 			/* this is an indexed pseudo-header */
 			phdr = list[idx].n.len;
 		}
@@ -744,7 +649,7 @@ int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *m
 		 * rejecting NUL, CR and LF characters.
 		 */
 		ctl = ist_find_ctl(list[idx].v);
-		if (unlikely(ctl) && has_forbidden_char(list[idx].v, ctl))
+		if (unlikely(ctl) && http_header_has_forbidden_char(list[idx].v, ctl))
 			goto fail;
 
 		if (phdr > 0 && phdr < H2_PHDR_NUM_ENTRIES) {
@@ -778,10 +683,12 @@ int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *m
 		}
 
 		if (isteq(list[idx].n, ist("content-length"))) {
-			ret = h2_parse_cont_len_header(msgf, &list[idx].v, body_len);
+			ret = http_parse_cont_len_header(&list[idx].v, body_len,
+			                                 *msgf & H2_MSGF_BODY_CL);
 			if (ret < 0)
 				goto fail;
 
+			*msgf |= H2_MSGF_BODY_CL;
 			sl_flags |= HTX_SL_F_CLEN;
 			if (ret == 0)
 				continue; // skip this duplicate
@@ -828,7 +735,8 @@ int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *m
 	    (*msgf & H2_MSGF_BODY_TUNNEL)) {
 		/* Response without body or tunnel successfully established */
 		sl_flags |= HTX_SL_F_BODYLESS;
-		htx->flags |= HTX_FL_EOM;
+		if (*msgf & H2_MSGF_BODY_TUNNEL)
+		    htx->flags |= HTX_FL_EOM;
 	}
 
 	/* update the start line with last detected header info */
@@ -840,6 +748,10 @@ int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *m
 		 * encoding?
 		 */
 	}
+
+	/* Check the number of blocks agains "tune.http.maxhdr" value before adding EOH block */
+	if (htx_nbblks(htx) > global.tune.max_http_hdr)
+		goto fail;
 
 	/* now send the end of headers marker */
 	if (!htx_add_endof(htx, HTX_BLK_EOH))
@@ -873,7 +785,7 @@ int h2_make_htx_trailers(struct http_hdr *list, struct htx *htx)
 	int i;
 
 	for (idx = 0; list[idx].n.len != 0; idx++) {
-		if (!list[idx].n.ptr) {
+		if (!isttest(list[idx].n)) {
 			/* This is an indexed pseudo-header (RFC7540#8.1.2.1) */
 			goto fail;
 		}
@@ -901,12 +813,16 @@ int h2_make_htx_trailers(struct http_hdr *list, struct htx *htx)
 		 * rejecting NUL, CR and LF characters.
 		 */
 		ctl = ist_find_ctl(list[idx].v);
-		if (unlikely(ctl) && has_forbidden_char(list[idx].v, ctl))
+		if (unlikely(ctl) && http_header_has_forbidden_char(list[idx].v, ctl))
 			goto fail;
 
 		if (!htx_add_trailer(htx, list[idx].n, list[idx].v))
 			goto fail;
 	}
+
+	/* Check the number of blocks agains "tune.http.maxhdr" value before adding EOT block */
+	if (htx_nbblks(htx) > global.tune.max_http_hdr)
+		goto fail;
 
 	if (!htx_add_endof(htx, HTX_BLK_EOT))
 		goto fail;

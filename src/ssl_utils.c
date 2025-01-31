@@ -17,6 +17,7 @@
 #include <haproxy/chunk.h>
 #include <haproxy/openssl-compat.h>
 #include <haproxy/ssl_sock.h>
+#include <haproxy/ssl_utils.h>
 
 /* fill a buffer with the algorithm and size of a public key */
 int cert_get_pkey_algo(X509 *crt, struct buffer *out)
@@ -317,6 +318,35 @@ X509* ssl_sock_get_peer_certificate(SSL *ssl)
 }
 
 /*
+ * This function fetches the x509* for the root CA of client certificate
+ * from the verified chain. We use the SSL_get0_verified_chain and get the
+ * last certificate in the x509 stack.
+ *
+ * Returns NULL in case of failure.
+*/
+#ifdef HAVE_SSL_get0_verified_chain
+X509* ssl_sock_get_verified_chain_root(SSL *ssl)
+{
+	STACK_OF(X509) *chain = NULL;
+	X509 *crt = NULL;
+	int i;
+
+	chain = SSL_get0_verified_chain(ssl);
+	if (!chain)
+		return NULL;
+
+	for (i = 0; i < sk_X509_num(chain); i++) {
+		crt = sk_X509_value(chain, i);
+
+		if (X509_check_issued(crt, crt) == X509_V_OK)
+			break;
+	}
+
+	return crt;
+}
+#endif
+
+/*
  * Take an OpenSSL version in text format and return a numeric openssl version
  * Return 0 if it failed to parse the version
  *
@@ -416,3 +446,340 @@ void exclude_tls_grease(char *input, int len, struct buffer *output)
 	if (output->size - output->data > 0 && len - ptr > 0)
 		output->area[output->data++] = input[ptr];
 }
+
+/*
+ * The following generates an array <x509_v_codes> in which the X509_V_ERR_*
+ * codes are populated with there string equivalent. Depending on the version
+ * of the SSL library, some code does not exist, these will be populated as
+ * "-1" in the array.
+ *
+ * The list was taken from
+ * https://github.com/openssl/openssl/blob/master/include/openssl/x509_vfy.h.in
+ * and must be updated when new constant are introduced.
+ */
+
+#undef _Q
+#define _Q(x) (#x)
+#undef V
+#define V(x) { .code = -1, .value = _Q(x), .string = #x }
+
+static struct x509_v_codes {
+	int code;             // integer value of the code or -1 if undefined
+	const char *value;    // value of the macro as a string or its name
+	const char *string;   // name of the macro
+} x509_v_codes[] = {
+	V(X509_V_OK),
+	V(X509_V_ERR_UNSPECIFIED),
+	V(X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT),
+	V(X509_V_ERR_UNABLE_TO_GET_CRL),
+	V(X509_V_ERR_UNABLE_TO_DECRYPT_CERT_SIGNATURE),
+	V(X509_V_ERR_UNABLE_TO_DECRYPT_CRL_SIGNATURE),
+	V(X509_V_ERR_UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY),
+	V(X509_V_ERR_CERT_SIGNATURE_FAILURE),
+	V(X509_V_ERR_CRL_SIGNATURE_FAILURE),
+	V(X509_V_ERR_CERT_NOT_YET_VALID),
+	V(X509_V_ERR_CERT_HAS_EXPIRED),
+	V(X509_V_ERR_CRL_NOT_YET_VALID),
+	V(X509_V_ERR_CRL_HAS_EXPIRED),
+	V(X509_V_ERR_ERROR_IN_CERT_NOT_BEFORE_FIELD),
+	V(X509_V_ERR_ERROR_IN_CERT_NOT_AFTER_FIELD),
+	V(X509_V_ERR_ERROR_IN_CRL_LAST_UPDATE_FIELD),
+	V(X509_V_ERR_ERROR_IN_CRL_NEXT_UPDATE_FIELD),
+	V(X509_V_ERR_OUT_OF_MEM),
+	V(X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT),
+	V(X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN),
+	V(X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY),
+	V(X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE),
+	V(X509_V_ERR_CERT_CHAIN_TOO_LONG),
+	V(X509_V_ERR_CERT_REVOKED),
+	V(X509_V_ERR_NO_ISSUER_PUBLIC_KEY),
+	V(X509_V_ERR_PATH_LENGTH_EXCEEDED),
+	V(X509_V_ERR_INVALID_PURPOSE),
+	V(X509_V_ERR_CERT_UNTRUSTED),
+	V(X509_V_ERR_CERT_REJECTED),
+	V(X509_V_ERR_SUBJECT_ISSUER_MISMATCH),
+	V(X509_V_ERR_AKID_SKID_MISMATCH),
+	V(X509_V_ERR_AKID_ISSUER_SERIAL_MISMATCH),
+	V(X509_V_ERR_KEYUSAGE_NO_CERTSIGN),
+	V(X509_V_ERR_UNABLE_TO_GET_CRL_ISSUER),
+	V(X509_V_ERR_UNHANDLED_CRITICAL_EXTENSION),
+	V(X509_V_ERR_KEYUSAGE_NO_CRL_SIGN),
+	V(X509_V_ERR_UNHANDLED_CRITICAL_CRL_EXTENSION),
+	V(X509_V_ERR_INVALID_NON_CA),
+	V(X509_V_ERR_PROXY_PATH_LENGTH_EXCEEDED),
+	V(X509_V_ERR_KEYUSAGE_NO_DIGITAL_SIGNATURE),
+	V(X509_V_ERR_PROXY_CERTIFICATES_NOT_ALLOWED),
+	V(X509_V_ERR_INVALID_EXTENSION),
+	V(X509_V_ERR_INVALID_POLICY_EXTENSION),
+	V(X509_V_ERR_NO_EXPLICIT_POLICY),
+	V(X509_V_ERR_DIFFERENT_CRL_SCOPE),
+	V(X509_V_ERR_UNSUPPORTED_EXTENSION_FEATURE),
+	V(X509_V_ERR_UNNESTED_RESOURCE),
+	V(X509_V_ERR_PERMITTED_VIOLATION),
+	V(X509_V_ERR_EXCLUDED_VIOLATION),
+	V(X509_V_ERR_SUBTREE_MINMAX),
+	V(X509_V_ERR_APPLICATION_VERIFICATION),
+	V(X509_V_ERR_UNSUPPORTED_CONSTRAINT_TYPE),
+	V(X509_V_ERR_UNSUPPORTED_CONSTRAINT_SYNTAX),
+	V(X509_V_ERR_UNSUPPORTED_NAME_SYNTAX),
+	V(X509_V_ERR_CRL_PATH_VALIDATION_ERROR),
+	V(X509_V_ERR_PATH_LOOP),
+	V(X509_V_ERR_SUITE_B_INVALID_VERSION),
+	V(X509_V_ERR_SUITE_B_INVALID_ALGORITHM),
+	V(X509_V_ERR_SUITE_B_INVALID_CURVE),
+	V(X509_V_ERR_SUITE_B_INVALID_SIGNATURE_ALGORITHM),
+	V(X509_V_ERR_SUITE_B_LOS_NOT_ALLOWED),
+	V(X509_V_ERR_SUITE_B_CANNOT_SIGN_P_384_WITH_P_256),
+	V(X509_V_ERR_HOSTNAME_MISMATCH),
+	V(X509_V_ERR_EMAIL_MISMATCH),
+	V(X509_V_ERR_IP_ADDRESS_MISMATCH),
+	V(X509_V_ERR_DANE_NO_MATCH),
+	V(X509_V_ERR_EE_KEY_TOO_SMALL),
+	V(X509_V_ERR_CA_KEY_TOO_SMALL),
+	V(X509_V_ERR_CA_MD_TOO_WEAK),
+	V(X509_V_ERR_INVALID_CALL),
+	V(X509_V_ERR_STORE_LOOKUP),
+	V(X509_V_ERR_NO_VALID_SCTS),
+	V(X509_V_ERR_PROXY_SUBJECT_NAME_VIOLATION),
+	V(X509_V_ERR_OCSP_VERIFY_NEEDED),
+	V(X509_V_ERR_OCSP_VERIFY_FAILED),
+	V(X509_V_ERR_OCSP_CERT_UNKNOWN),
+	V(X509_V_ERR_UNSUPPORTED_SIGNATURE_ALGORITHM),
+	V(X509_V_ERR_SIGNATURE_ALGORITHM_MISMATCH),
+	V(X509_V_ERR_SIGNATURE_ALGORITHM_INCONSISTENCY),
+	V(X509_V_ERR_INVALID_CA),
+	V(X509_V_ERR_PATHLEN_INVALID_FOR_NON_CA),
+	V(X509_V_ERR_PATHLEN_WITHOUT_KU_KEY_CERT_SIGN),
+	V(X509_V_ERR_KU_KEY_CERT_SIGN_INVALID_FOR_NON_CA),
+	V(X509_V_ERR_ISSUER_NAME_EMPTY),
+	V(X509_V_ERR_SUBJECT_NAME_EMPTY),
+	V(X509_V_ERR_MISSING_AUTHORITY_KEY_IDENTIFIER),
+	V(X509_V_ERR_MISSING_SUBJECT_KEY_IDENTIFIER),
+	V(X509_V_ERR_EMPTY_SUBJECT_ALT_NAME),
+	V(X509_V_ERR_EMPTY_SUBJECT_SAN_NOT_CRITICAL),
+	V(X509_V_ERR_CA_BCONS_NOT_CRITICAL),
+	V(X509_V_ERR_AUTHORITY_KEY_IDENTIFIER_CRITICAL),
+	V(X509_V_ERR_SUBJECT_KEY_IDENTIFIER_CRITICAL),
+	V(X509_V_ERR_CA_CERT_MISSING_KEY_USAGE),
+	V(X509_V_ERR_EXTENSIONS_REQUIRE_VERSION_3),
+	V(X509_V_ERR_EC_KEY_EXPLICIT_PARAMS),
+	{ 0, NULL, NULL },
+};
+
+/*
+ * Return the X509_V_ERR code corresponding to the name of the constant.
+ * See https://github.com/openssl/openssl/blob/master/include/openssl/x509_vfy.h.in
+ * If not found, return -1
+ */
+int x509_v_err_str_to_int(const char *str)
+{
+	int i;
+
+	for (i = 0; x509_v_codes[i].string; i++) {
+		if (strcmp(str, x509_v_codes[i].string) == 0) {
+			return x509_v_codes[i].code;
+		}
+	}
+
+	return -1;
+}
+
+/*
+ * Return the constant name corresponding to the X509_V_ERR code
+ * See https://github.com/openssl/openssl/blob/master/include/openssl/x509_vfy.h.in
+ * If not found, return NULL;
+ */
+const char *x509_v_err_int_to_str(int code)
+{
+	int i;
+
+	if (code == -1)
+		return NULL;
+
+	for (i = 0; x509_v_codes[i].string; i++) {
+		if (x509_v_codes[i].code == code) {
+			return x509_v_codes[i].string;
+		}
+	}
+	return NULL;
+}
+
+void init_x509_v_err_tab(void)
+{
+	int i;
+
+	for (i = 0; x509_v_codes[i].string; i++) {
+		/* either the macro exists or it's equal to its own name */
+		if (strcmp(x509_v_codes[i].string, x509_v_codes[i].value) == 0)
+			continue;
+		x509_v_codes[i].code = atoi(x509_v_codes[i].value);
+	}
+}
+
+INITCALL0(STG_REGISTER, init_x509_v_err_tab);
+
+
+/*
+ *  This function returns the number of seconds  elapsed
+ *  since the Epoch, 1970-01-01 00:00:00 +0000 (UTC) and the
+ *  date presented un ASN1_GENERALIZEDTIME.
+ *
+ *  In parsing error case, it returns -1.
+ */
+long asn1_generalizedtime_to_epoch(ASN1_GENERALIZEDTIME *d)
+{
+	long epoch;
+	char *p, *end;
+	const unsigned short month_offset[12] = {
+		0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334
+	};
+	unsigned long year, month;
+
+	if (!d || (d->type != V_ASN1_GENERALIZEDTIME)) return -1;
+
+	p = (char *)d->data;
+	end = p + d->length;
+
+	if (end - p < 4) return -1;
+	year = 1000 * (p[0] - '0') + 100 * (p[1] - '0') + 10 * (p[2] - '0') + p[3] - '0';
+	p += 4;
+	if (end - p < 2) return -1;
+	month = 10 * (p[0] - '0') + p[1] - '0';
+	if (month < 1 || month > 12) return -1;
+	/* Compute the number of seconds since 1 jan 1970 and the beginning of current month
+	   We consider leap years and the current month (<marsh or not) */
+	epoch = (  ((year - 1970) * 365)
+		 + ((year - (month < 3)) / 4 - (year - (month < 3)) / 100 + (year - (month < 3)) / 400)
+		 - ((1970 - 1) / 4 - (1970 - 1) / 100 + (1970 - 1) / 400)
+		 + month_offset[month-1]
+		) * 24 * 60 * 60;
+	p += 2;
+	if (end - p < 2) return -1;
+	/* Add the number of seconds of completed days of current month */
+	epoch += (10 * (p[0] - '0') + p[1] - '0' - 1) * 24 * 60 * 60;
+	p += 2;
+	if (end - p < 2) return -1;
+	/* Add the completed hours of the current day */
+	epoch += (10 * (p[0] - '0') + p[1] - '0') * 60 * 60;
+	p += 2;
+	if (end - p < 2) return -1;
+	/* Add the completed minutes of the current hour */
+	epoch += (10 * (p[0] - '0') + p[1] - '0') * 60;
+	p += 2;
+	if (p == end) return -1;
+	/* Test if there is available seconds */
+	if (p[0] < '0' || p[0] > '9')
+		goto nosec;
+	if (end - p < 2) return -1;
+	/* Add the seconds of the current minute */
+	epoch += 10 * (p[0] - '0') + p[1] - '0';
+	p += 2;
+	if (p == end) return -1;
+	/* Ignore seconds float part if present */
+	if (p[0] == '.') {
+		do {
+			if (++p == end) return -1;
+		} while (p[0] >= '0' && p[0] <= '9');
+	}
+
+nosec:
+	if (p[0] == 'Z') {
+		if (end - p != 1) return -1;
+		return epoch;
+	}
+	else if (p[0] == '+') {
+		if (end - p != 5) return -1;
+		/* Apply timezone offset */
+		return epoch - ((10 * (p[1] - '0') + p[2] - '0') * 60 * 60 + (10 * (p[3] - '0') + p[4] - '0')) * 60;
+	}
+	else if (p[0] == '-') {
+		if (end - p != 5) return -1;
+		/* Apply timezone offset */
+		return epoch + ((10 * (p[1] - '0') + p[2] - '0') * 60 * 60 + (10 * (p[3] - '0') + p[4] - '0')) * 60;
+	}
+
+	return -1;
+}
+
+/* Return the nofAfter value as as string extracted from an X509 certificate
+ * The returned buffer is static and thread local.
+ */
+const char *x509_get_notafter(X509 *cert)
+{
+	BIO *bio = NULL;
+	int write;
+	static THREAD_LOCAL char buf[256];
+
+	memset(buf, 0, sizeof(buf));
+
+	if ((bio = BIO_new(BIO_s_mem())) ==  NULL)
+		goto end;
+	if (ASN1_TIME_print(bio, X509_getm_notAfter(cert)) == 0)
+		goto end;
+	write = BIO_read(bio, buf, sizeof(buf)-1);
+	buf[write] = '\0';
+	BIO_free(bio);
+
+	return buf;
+
+end:
+	BIO_free(bio);
+	return NULL;
+}
+
+/* Return the nofBefore value as as string extracted from an X509 certificate
+ * The returned buffer is static and thread local.
+ */
+const char *x509_get_notbefore(X509 *cert)
+{
+	BIO *bio = NULL;
+	int write;
+	static THREAD_LOCAL char buf[256];
+
+	memset(buf, 0, sizeof(buf));
+
+	if ((bio = BIO_new(BIO_s_mem())) ==  NULL)
+		goto end;
+	if (ASN1_TIME_print(bio, X509_getm_notBefore(cert)) == 0)
+		goto end;
+	write = BIO_read(bio, buf, sizeof(buf)-1);
+	buf[write] = '\0';
+	BIO_free(bio);
+
+	return buf;
+
+end:
+	BIO_free(bio);
+	return NULL;
+}
+
+#ifdef HAVE_ASN1_TIME_TO_TM
+/* Takes a ASN1_TIME and converts it into a time_t */
+time_t ASN1_to_time_t(ASN1_TIME *asn1_time)
+{
+	struct tm tm;
+	time_t ret = -1;
+
+	if (ASN1_TIME_to_tm(asn1_time, &tm) == 0)
+		goto error;
+
+	ret  = my_timegm(&tm);
+error:
+	return ret;
+}
+
+/* return the notAfter date of a X509 certificate in a time_t format */
+time_t x509_get_notafter_time_t(X509 *cert)
+{
+	time_t ret = -1;
+	ASN1_TIME *asn1_time;
+
+	if ((asn1_time = X509_getm_notAfter(cert)) == NULL)
+		goto error;
+
+	ret = ASN1_to_time_t(asn1_time);
+
+error:
+	return ret;
+}
+#endif

@@ -25,7 +25,6 @@
 
 #include <sys/time.h>
 
-#include <import/eb32sctree.h>
 #include <import/eb32tree.h>
 
 #include <haproxy/activity.h>
@@ -87,25 +86,15 @@
 /* tasklets are recognized with nice==-32768 */
 #define TASK_IS_TASKLET(t) ((t)->state & TASK_F_TASKLET)
 
-
 /* a few exported variables */
-extern volatile unsigned long global_tasks_mask; /* Mask of threads with tasks in the global runqueue */
-extern unsigned int grq_total;    /* total number of entries in the global run queue, atomic */
-extern unsigned int niced_tasks;  /* number of niced tasks in the run queue */
-
 extern struct pool_head *pool_head_task;
 extern struct pool_head *pool_head_tasklet;
 extern struct pool_head *pool_head_notification;
 
-#ifdef USE_THREAD
-extern struct eb_root timers;      /* sorted timers tree, global */
-extern struct eb_root rqueue;      /* tree constituting the run queue */
-#endif
-
-__decl_thread(extern HA_SPINLOCK_T rq_lock);  /* spin lock related to run queue */
-__decl_thread(extern HA_RWLOCK_T wq_lock);    /* RW lock related to the wait queue */
+__decl_thread(extern HA_RWLOCK_T wq_lock THREAD_ALIGNED(64));
 
 void __tasklet_wakeup_on(struct tasklet *tl, int thr);
+struct list *__tasklet_wakeup_after(struct list *head, struct tasklet *tl);
 void task_kill(struct task *t);
 void tasklet_kill(struct tasklet *t);
 void __task_wakeup(struct task *t);
@@ -148,9 +137,6 @@ static inline int total_run_queues()
 {
 	int thr, ret = 0;
 
-#ifdef USE_THREAD
-	ret = _HA_ATOMIC_LOAD(&grq_total);
-#endif
 	for (thr = 0; thr < global.nbthread; thr++)
 		ret += _HA_ATOMIC_LOAD(&ha_thread_ctx[thr].rq_total);
 	return ret;
@@ -166,6 +152,20 @@ static inline int total_allocated_tasks()
 
 	for (thr = ret = 0; thr < global.nbthread; thr++)
 		ret += _HA_ATOMIC_LOAD(&ha_thread_ctx[thr].nb_tasks);
+	return ret;
+}
+
+/* returns the number of running niced tasks+tasklets on the whole process.
+ * Note that this *is* racy since a task may move from the global to a local
+ * queue for example and be counted twice. This is only for statistics
+ * reporting.
+ */
+static inline int total_niced_running_tasks()
+{
+	int tgrp, ret = 0;
+
+	for (tgrp = 0; tgrp < global.nbtgroups; tgrp++)
+		ret += _HA_ATOMIC_LOAD(&ha_tgroup_ctx[tgrp].niced_tasks);
 	return ret;
 }
 
@@ -187,10 +187,16 @@ static inline int task_in_wq(struct task *t)
 /* returns true if the current thread has some work to do */
 static inline int thread_has_tasks(void)
 {
-	return (!!(global_tasks_mask & tid_bit) |
-		!eb_is_empty(&th_ctx->rqueue) |
-	        !!th_ctx->tl_class_mask |
-		!MT_LIST_ISEMPTY(&th_ctx->shared_tasklet_list));
+	return ((int)!eb_is_empty(&th_ctx->rqueue) |
+	        (int)!eb_is_empty(&th_ctx->rqueue_shared) |
+	        (int)!!th_ctx->tl_class_mask |
+		(int)!MT_LIST_ISEMPTY(&th_ctx->shared_tasklet_list));
+}
+
+/* returns the most recent known date of the task's call from the scheduler */
+static inline uint64_t task_mono_time(void)
+{
+	return th_ctx->sched_call_date;
 }
 
 /* puts the task <t> in run queue with reason flags <f>, and returns <t> */
@@ -199,25 +205,54 @@ static inline int thread_has_tasks(void)
  * the <file>:<line> from the call place are stored into the task for tracing
  * purposes.
  */
-#define task_wakeup(t, f) _task_wakeup(t, f, __FILE__, __LINE__)
-static inline void _task_wakeup(struct task *t, unsigned int f, const char *file, int line)
+#define task_wakeup(t, f) \
+	_task_wakeup(t, f, MK_CALLER(WAKEUP_TYPE_TASK_WAKEUP, 0, 0))
+
+static inline void _task_wakeup(struct task *t, unsigned int f, const struct ha_caller *caller)
 {
 	unsigned int state;
 
 	state = _HA_ATOMIC_OR_FETCH(&t->state, f);
 	while (!(state & (TASK_RUNNING | TASK_QUEUED))) {
 		if (_HA_ATOMIC_CAS(&t->state, &state, state | TASK_QUEUED)) {
+			if (likely(caller)) {
+				caller = HA_ATOMIC_XCHG(&t->caller, caller);
+				BUG_ON((ulong)caller & 1);
 #ifdef DEBUG_TASK
-			if ((unsigned int)t->debug.caller_idx > 1)
-				ABORT_NOW();
-			t->debug.caller_idx = !t->debug.caller_idx;
-			t->debug.caller_file[t->debug.caller_idx] = file;
-			t->debug.caller_line[t->debug.caller_idx] = line;
+				HA_ATOMIC_STORE(&t->debug.prev_caller, caller);
 #endif
+			}
 			__task_wakeup(t);
 			break;
 		}
 	}
+}
+
+/* Atomically drop the TASK_RUNNING bit while ensuring that any wakeup that
+ * happened since the flag was set will result in the task being queued (if
+ * it wasn't already). This is used to safely drop the flag from within the
+ * scheduler. The flag <f> is combined with existing flags before the test so
+ * that it's possible to unconditionally wakeup the task and drop the RUNNING
+ * flag if needed.
+ */
+static inline void task_drop_running(struct task *t, unsigned int f)
+{
+	unsigned int state, new_state;
+
+	state = _HA_ATOMIC_LOAD(&t->state);
+
+	while (1) {
+		new_state = state | f;
+		if (new_state & TASK_WOKEN_ANY)
+			new_state |= TASK_QUEUED;
+
+		if (_HA_ATOMIC_CAS(&t->state, &state, new_state & ~TASK_RUNNING))
+			break;
+		__ha_cpu_relax();
+	}
+
+	if ((new_state & ~state) & TASK_QUEUED)
+		__task_wakeup(t);
 }
 
 /*
@@ -241,8 +276,8 @@ static inline struct task *task_unlink_wq(struct task *t)
 	unsigned long locked;
 
 	if (likely(task_in_wq(t))) {
-		locked = t->state & TASK_SHARED_WQ;
-		BUG_ON(!locked && t->thread_mask != tid_bit);
+		locked = t->tid < 0;
+		BUG_ON(t->tid >= 0 && t->tid != tid && !(global.mode & MODE_STOPPING));
 		if (locked)
 			HA_RWLOCK_WRLOCK(TASK_WQ_LOCK, &wq_lock);
 		__task_unlink_wq(t);
@@ -258,7 +293,10 @@ static inline struct task *task_unlink_wq(struct task *t)
  * protected by the global wq_lock, otherwise by it necessarily belongs to the
  * current thread'sand is queued without locking.
  */
-static inline void task_queue(struct task *task)
+#define task_queue(t) \
+	_task_queue(t, MK_CALLER(WAKEUP_TYPE_TASK_QUEUE, 0, 0))
+
+static inline void _task_queue(struct task *task, const struct ha_caller *caller)
 {
 	/* If we already have a place in the wait queue no later than the
 	 * timeout we're trying to set, we'll stay there, because it is very
@@ -273,71 +311,60 @@ static inline void task_queue(struct task *task)
 		return;
 
 #ifdef USE_THREAD
-	if (task->state & TASK_SHARED_WQ) {
+	if (task->tid < 0) {
 		HA_RWLOCK_WRLOCK(TASK_WQ_LOCK, &wq_lock);
-		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key))
-			__task_queue(task, &timers);
+		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key)) {
+			if (likely(caller)) {
+				caller = HA_ATOMIC_XCHG(&task->caller, caller);
+				BUG_ON((ulong)caller & 1);
+#ifdef DEBUG_TASK
+				HA_ATOMIC_STORE(&task->debug.prev_caller, caller);
+#endif
+			}
+			__task_queue(task, &tg_ctx->timers);
+		}
 		HA_RWLOCK_WRUNLOCK(TASK_WQ_LOCK, &wq_lock);
 	} else
 #endif
 	{
-		BUG_ON(task->thread_mask != tid_bit); // should have TASK_SHARED_WQ
-		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key))
+		BUG_ON(task->tid != tid);
+		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key)) {
+			if (likely(caller)) {
+				caller = HA_ATOMIC_XCHG(&task->caller, caller);
+				BUG_ON((ulong)caller & 1);
+#ifdef DEBUG_TASK
+				HA_ATOMIC_STORE(&task->debug.prev_caller, caller);
+#endif
+			}
 			__task_queue(task, &th_ctx->timers);
+		}
 	}
 }
 
-/* change the thread affinity of a task to <thread_mask>.
+/* Change the thread affinity of a task to <thr>, which may either be a valid
+ * thread number from 0 to nbthread-1, or a negative value to allow the task
+ * to run on any thread.
+ *
  * This may only be done from within the running task itself or during its
  * initialization. It will unqueue and requeue the task from the wait queue
  * if it was in it. This is safe against a concurrent task_queue() call because
  * task_queue() itself will unlink again if needed after taking into account
  * the new thread_mask.
  */
-static inline void task_set_affinity(struct task *t, unsigned long thread_mask)
+static inline void task_set_thread(struct task *t, int thr)
 {
+#ifndef USE_THREAD
+	/* no shared queue without threads */
+	thr = 0;
+#endif
 	if (unlikely(task_in_wq(t))) {
 		task_unlink_wq(t);
-		t->thread_mask = thread_mask;
+		t->tid = thr;
 		task_queue(t);
 	}
-	else
-		t->thread_mask = thread_mask;
-}
-
-/*
- * Unlink the task <t> from the run queue if it's in it. The run queue size and
- * number of niced tasks are updated too. A pointer to the task itself is
- * returned. If the task is in the global run queue, the global run queue's
- * lock will be used during the operation.
- */
-static inline struct task *task_unlink_rq(struct task *t)
-{
-	int is_global = t->state & TASK_GLOBAL;
-	int done = 0;
-
-	if (is_global)
-		HA_SPIN_LOCK(TASK_RQ_LOCK, &rq_lock);
-
-	if (likely(task_in_rq(t))) {
-		eb32sc_delete(&t->rq);
-		done = 1;
+	else {
+		t->tid = thr;
 	}
-
-	if (is_global)
-		HA_SPIN_UNLOCK(TASK_RQ_LOCK, &rq_lock);
-
-	if (done) {
-		if (is_global) {
-			_HA_ATOMIC_AND(&t->state, ~TASK_GLOBAL);
-			_HA_ATOMIC_DEC(&grq_total);
-		}
-		else
-			_HA_ATOMIC_DEC(&th_ctx->rq_total);
-		if (t->nice)
-			_HA_ATOMIC_DEC(&niced_tasks);
-	}
-	return t;
 }
 
 /* schedules tasklet <tl> to run onto thread <thr> or the current thread if
@@ -346,11 +373,18 @@ static inline struct task *task_unlink_rq(struct task *t)
  * at least once scheduled on a specific thread. With DEBUG_TASK, the
  * <file>:<line> from the call place are stored into the tasklet for tracing
  * purposes.
+ *
+ * The macro accepts an optional 3rd argument that is passed as a set of flags
+ * to be set on the tasklet, among TASK_WOKEN_*, TASK_F_UEVT* etc to indicate a
+ * wakeup cause to the tasklet. When not set, the arg defaults to zero (i.e. no
+ * flag is added).
  */
-#define tasklet_wakeup_on(tl, thr) _tasklet_wakeup_on(tl, thr, __FILE__, __LINE__)
-static inline void _tasklet_wakeup_on(struct tasklet *tl, int thr, const char *file, int line)
+#define tasklet_wakeup_on(tl, thr, ...)					\
+	_tasklet_wakeup_on(tl, thr, DEFVAL(TASK_WOKEN_OTHER, ##__VA_ARGS__), MK_CALLER(WAKEUP_TYPE_TASKLET_WAKEUP, 0, 0))
+
+static inline void _tasklet_wakeup_on(struct tasklet *tl, int thr, uint f, const struct ha_caller *caller)
 {
-	unsigned int state = tl->state;
+	unsigned int state = _HA_ATOMIC_OR_FETCH(&tl->state, f);
 
 	do {
 		/* do nothing if someone else already added it */
@@ -359,15 +393,16 @@ static inline void _tasklet_wakeup_on(struct tasklet *tl, int thr, const char *f
 	} while (!_HA_ATOMIC_CAS(&tl->state, &state, state | TASK_IN_LIST));
 
 	/* at this point we're the first ones to add this task to the list */
+	if (likely(caller)) {
+		caller = HA_ATOMIC_XCHG(&tl->caller, caller);
+		BUG_ON((ulong)caller & 1);
 #ifdef DEBUG_TASK
-	if ((unsigned int)tl->debug.caller_idx > 1)
-		ABORT_NOW();
-	tl->debug.caller_idx = !tl->debug.caller_idx;
-	tl->debug.caller_file[tl->debug.caller_idx] = file;
-	tl->debug.caller_line[tl->debug.caller_idx] = line;
-	if (task_profiling_mask & tid_bit)
-		tl->call_date = now_mono_time();
+		HA_ATOMIC_STORE(&tl->debug.prev_caller, caller);
 #endif
+	}
+
+	if (_HA_ATOMIC_LOAD(&th_ctx->flags) & TH_FL_TASK_PROFILING)
+		tl->wake_date = now_mono_time();
 	__tasklet_wakeup_on(tl, thr);
 }
 
@@ -375,20 +410,122 @@ static inline void _tasklet_wakeup_on(struct tasklet *tl, int thr, const char *f
  * is either its owner thread if >= 0 or the current thread if < 0. When
  * DEBUG_TASK is set, the <file>:<line> from the call place are stored into the
  * task for tracing purposes.
+ *
+ * The macro accepts an optional 3rd argument that is passed as a set of flags
+ * to be set on the tasklet, among TASK_WOKEN_*, TASK_F_UEVT* etc to indicate a
+ * wakeup cause to the tasklet. When not set, the arg defaults to zero (i.e. no
+ * flag is added).
  */
-#define tasklet_wakeup(tl) _tasklet_wakeup_on(tl, (tl)->tid, __FILE__, __LINE__)
+#define tasklet_wakeup(tl, ...)						\
+	_tasklet_wakeup_on(tl, (tl)->tid, DEFVAL(TASK_WOKEN_OTHER, ##__VA_ARGS__), MK_CALLER(WAKEUP_TYPE_TASKLET_WAKEUP, 0, 0))
+
+/* instantly wakes up task <t> on its owner thread even if it's not the current
+ * one, bypassing the run queue. The purpose is to be able to avoid contention
+ * in the global run queue for massively remote tasks (e.g. queue) when there's
+ * no value in passing the task again through the priority ordering since it has
+ * already been subject to it once (e.g. before entering process_stream). The
+ * task goes directly into the shared mt_list as a tasklet and will run as
+ * TL_URGENT. Great care is taken to be certain it's not queued nor running
+ * already.
+ */
+#define task_instant_wakeup(t, f) \
+	_task_instant_wakeup(t, f, MK_CALLER(WAKEUP_TYPE_TASK_INSTANT_WAKEUP, 0, 0))
+
+static inline void _task_instant_wakeup(struct task *t, unsigned int f, const struct ha_caller *caller)
+{
+	int thr = t->tid;
+	unsigned int state;
+
+	if (thr < 0)
+		thr = tid;
+
+	/* first, let's update the task's state with the wakeup condition */
+	state = _HA_ATOMIC_OR_FETCH(&t->state, f);
+
+	/* next we need to make sure the task was not/will not be added to the
+	 * run queue because the tasklet list's mt_list uses the same storage
+	 * as the task's run_queue.
+	 */
+	do {
+		/* do nothing if someone else already added it */
+		if (state & (TASK_QUEUED|TASK_RUNNING))
+			return;
+	} while (!_HA_ATOMIC_CAS(&t->state, &state, state | TASK_QUEUED));
+
+	BUG_ON_HOT(task_in_rq(t));
+
+	/* at this point we're the first ones to add this task to the list */
+	if (likely(caller)) {
+		caller = HA_ATOMIC_XCHG(&t->caller, caller);
+		BUG_ON((ulong)caller & 1);
+#ifdef DEBUG_TASK
+		HA_ATOMIC_STORE(&t->debug.prev_caller, caller);
+#endif
+	}
+
+	if (_HA_ATOMIC_LOAD(&th_ctx->flags) & TH_FL_TASK_PROFILING)
+		t->wake_date = now_mono_time();
+	__tasklet_wakeup_on((struct tasklet *)t, thr);
+}
+
+/* schedules tasklet <tl> to run immediately after the current one is done
+ * <tl> will be queued after entry <head>, or at the head of the task list. Return
+ * the new head to be used to queue future tasks. This is used to insert multiple entries
+ * at the head of the tasklet list, typically to transfer processing from a tasklet
+ * to another one or a set of other ones. If <head> is NULL, the tasklet list of <thr>
+ * thread will be used.
+ * With DEBUG_TASK, the <file>:<line> from the call place are stored into the tasklet
+ * for tracing purposes.
+ *
+ * The macro accepts an optional 3rd argument that is passed as a set of flags
+ * to be set on the tasklet, among TASK_WOKEN_*, TASK_F_UEVT* etc to indicate a
+ * wakeup cause to the tasklet. When not set, the arg defaults to
+ * TASK_WOKEN_OTHER, so that tasklets can differentiate a unique explicit wakeup
+ * cause from a wakeup cause combined with other implicit ones. I.e. that may be
+ * used by muxes to decide whether or not to perform a short path for certain
+ * operations, or a complete one that also covers regular I/O.
+ */
+#define tasklet_wakeup_after(head, tl, ...)					\
+	_tasklet_wakeup_after(head, tl, DEFVAL(TASK_WOKEN_OTHER, ##__VA_ARGS__), MK_CALLER(WAKEUP_TYPE_TASKLET_WAKEUP_AFTER, 0, 0))
+
+static inline struct list *_tasklet_wakeup_after(struct list *head, struct tasklet *tl,
+                                                 uint f, const struct ha_caller *caller)
+{
+	unsigned int state = _HA_ATOMIC_OR_FETCH(&tl->state, f);
+
+	do {
+		/* do nothing if someone else already added it */
+		if (state & TASK_IN_LIST)
+			return head;
+	} while (!_HA_ATOMIC_CAS(&tl->state, &state, state | TASK_IN_LIST));
+
+	/* at this point we're the first one to add this task to the list */
+	if (likely(caller)) {
+		caller = HA_ATOMIC_XCHG(&tl->caller, caller);
+		BUG_ON((ulong)caller & 1);
+#ifdef DEBUG_TASK
+		HA_ATOMIC_STORE(&tl->debug.prev_caller, caller);
+#endif
+	}
+
+	if (th_ctx->flags & TH_FL_TASK_PROFILING)
+		tl->wake_date = now_mono_time();
+	return __tasklet_wakeup_after(head, tl);
+}
 
 /* This macro shows the current function name and the last known caller of the
  * task (or tasklet) wakeup.
  */
 #ifdef DEBUG_TASK
-#define DEBUG_TASK_PRINT_CALLER(t) do {				\
-	printf("%s woken up from %s:%d\n", __FUNCTION__,		\
-	       (t)->debug.caller_file[(t)->debug.caller_idx],	\
-	       (t)->debug.caller_line[(t)->debug.caller_idx]);	\
+#define DEBUG_TASK_PRINT_CALLER(t) do {						\
+	const struct ha_caller *__caller = (t)->caller;			\
+	printf("%s woken up from %s(%s:%d)\n", __FUNCTION__,		\
+	       __caller ? __caller->func : NULL, \
+	       __caller ? __caller->file : NULL, \
+	       __caller ? __caller->line : 0); \
 } while (0)
 #else
-#define DEBUG_TASK_PRINT_CALLER(t)
+#define DEBUG_TASK_PRINT_CALLER(t) do { } while (0)
 #endif
 
 
@@ -400,7 +537,7 @@ static inline void _tasklet_wakeup_on(struct tasklet *tl, int thr, const char *f
  */
 static inline void tasklet_remove_from_tasklet_list(struct tasklet *t)
 {
-	if (MT_LIST_DELETE((struct mt_list *)&t->list)) {
+	if (MT_LIST_DELETE(list_to_mt_list(&t->list))) {
 		_HA_ATOMIC_AND(&t->state, ~TASK_IN_LIST);
 		_HA_ATOMIC_DEC(&ha_thread_ctx[t->tid >= 0 ? t->tid : tid].rq_total);
 	}
@@ -409,26 +546,23 @@ static inline void tasklet_remove_from_tasklet_list(struct tasklet *t)
 /*
  * Initialize a new task. The bare minimum is performed (queue pointers and
  * state).  The task is returned. This function should not be used outside of
- * task_new(). If the thread mask contains more than one thread, TASK_SHARED_WQ
- * is set.
+ * task_new(). If the thread ID is < 0, the task may run on any thread.
  */
-static inline struct task *task_init(struct task *t, unsigned long thread_mask)
+static inline struct task *task_init(struct task *t, int tid)
 {
 	t->wq.node.leaf_p = NULL;
 	t->rq.node.leaf_p = NULL;
 	t->state = TASK_SLEEPING;
-	t->thread_mask = thread_mask;
-	if (atleast2(thread_mask))
-		t->state |= TASK_SHARED_WQ;
+#ifndef USE_THREAD
+	/* no shared wq without threads */
+	tid = 0;
+#endif
+	t->tid = tid;
 	t->nice = 0;
 	t->calls = 0;
-	t->call_date = 0;
-	t->cpu_time = 0;
-	t->lat_time = 0;
+	t->wake_date = 0;
 	t->expire = TICK_ETERNITY;
-#ifdef DEBUG_TASK
-	t->debug.caller_idx = 0;
-#endif
+	t->caller = NULL;
 	return t;
 }
 
@@ -442,9 +576,8 @@ static inline void tasklet_init(struct tasklet *t)
 	t->state = TASK_F_TASKLET;
 	t->process = NULL;
 	t->tid = -1;
-#ifdef DEBUG_TASK
-	t->debug.caller_idx = 0;
-#endif
+	t->wake_date = 0;
+	t->caller = NULL;
 	LIST_INIT(&t->list);
 }
 
@@ -462,29 +595,20 @@ static inline struct tasklet *tasklet_new(void)
 }
 
 /*
- * Allocate and initialise a new task. The new task is returned, or NULL in
- * case of lack of memory. The task count is incremented. This API might change
- * in the near future, so prefer one of the task_new_*() wrappers below which
- * are usually more suitable. Tasks must be freed using task_free().
+ * Allocate and initialize a new task, to run on global thread <thr>, or any
+ * thread if negative. The task count is incremented. The new task is returned,
+ * or NULL in case of lack of memory. It's up to the caller to pass a valid
+ * thread number (in tid space, 0 to nbthread-1, or <0 for any). Tasks created
+ * this way must be freed using task_destroy().
  */
-static inline struct task *task_new(unsigned long thread_mask)
+static inline struct task *task_new_on(int thr)
 {
 	struct task *t = pool_alloc(pool_head_task);
 	if (t) {
 		th_ctx->nb_tasks++;
-		task_init(t, thread_mask);
+		task_init(t, thr);
 	}
 	return t;
-}
-
-/* Allocate and initialize a new task, to run on global thread <thr>. The new
- * task is returned, or NULL in case of lack of memory. It's up to the caller
- * to pass a valid thread number (in tid space, 0 to nbthread-1). The task
- * count is incremented.
- */
-static inline struct task *task_new_on(uint thr)
-{
-	return task_new(1UL << thr);
 }
 
 /* Allocate and initialize a new task, to run on the calling thread. The new
@@ -493,7 +617,7 @@ static inline struct task *task_new_on(uint thr)
  */
 static inline struct task *task_new_here()
 {
-	return task_new(tid_bit);
+	return task_new_on(tid);
 }
 
 /* Allocate and initialize a new task, to run on any thread. The new task is
@@ -501,7 +625,7 @@ static inline struct task *task_new_here()
  */
 static inline struct task *task_new_anywhere()
 {
-	return task_new(MAX_THREADS_MASK);
+	return task_new_on(-1);
 }
 
 /*
@@ -516,11 +640,11 @@ static inline void __task_free(struct task *t)
 	}
 	BUG_ON(task_in_wq(t) || task_in_rq(t));
 
+	BUG_ON((ulong)t->caller & 1);
 #ifdef DEBUG_TASK
-	if ((unsigned int)t->debug.caller_idx > 1)
-		ABORT_NOW();
-	t->debug.caller_idx |= 2; // keep parity and make sure to crash if used after free
+	HA_ATOMIC_STORE(&t->debug.prev_caller, HA_ATOMIC_LOAD(&t->caller));
 #endif
+	HA_ATOMIC_STORE(&t->caller, (void*)1); // make sure to crash if used after free
 
 	pool_free(pool_head_task, t);
 	th_ctx->nb_tasks--;
@@ -556,14 +680,17 @@ static inline void task_destroy(struct task *t)
 /* Should only be called by the thread responsible for the tasklet */
 static inline void tasklet_free(struct tasklet *tl)
 {
-	if (MT_LIST_DELETE((struct mt_list *)&tl->list))
+	if (!tl)
+		return;
+
+	if (MT_LIST_DELETE(list_to_mt_list(&tl->list)))
 		_HA_ATOMIC_DEC(&ha_thread_ctx[tl->tid >= 0 ? tl->tid : tid].rq_total);
 
+	BUG_ON((ulong)tl->caller & 1);
 #ifdef DEBUG_TASK
-	if ((unsigned int)tl->debug.caller_idx > 1)
-		ABORT_NOW();
-	tl->debug.caller_idx |= 2; // keep parity and make sure to crash if used after free
+	HA_ATOMIC_STORE(&tl->debug.prev_caller, HA_ATOMIC_LOAD(&tl->caller));
 #endif
+	HA_ATOMIC_STORE(&tl->caller, (void*)1); // make sure to crash if used after free
 	pool_free(pool_head_tasklet, tl);
 	if (unlikely(stopping))
 		pool_flush(pool_head_tasklet);
@@ -582,33 +709,69 @@ static inline void tasklet_set_tid(struct tasklet *tl, int tid)
  * now_ms without using tick_add() will definitely make this happen once every
  * 49.7 days.
  */
-static inline void task_schedule(struct task *task, int when)
+#define task_schedule(t, w) \
+	_task_schedule(t, w, MK_CALLER(WAKEUP_TYPE_TASK_SCHEDULE, 0, 0))
+
+static inline void _task_schedule(struct task *task, int when, const struct ha_caller *caller)
 {
 	/* TODO: mthread, check if there is no tisk with this test */
 	if (task_in_rq(task))
 		return;
 
 #ifdef USE_THREAD
-	if (task->state & TASK_SHARED_WQ) {
+	if (task->tid < 0) {
 		/* FIXME: is it really needed to lock the WQ during the check ? */
 		HA_RWLOCK_WRLOCK(TASK_WQ_LOCK, &wq_lock);
 		if (task_in_wq(task))
 			when = tick_first(when, task->expire);
 
 		task->expire = when;
-		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key))
-			__task_queue(task, &timers);
+		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key)) {
+			if (likely(caller)) {
+				caller = HA_ATOMIC_XCHG(&task->caller, caller);
+				BUG_ON((ulong)caller & 1);
+#ifdef DEBUG_TASK
+				HA_ATOMIC_STORE(&task->debug.prev_caller, caller);
+#endif
+			}
+			__task_queue(task, &tg_ctx->timers);
+		}
 		HA_RWLOCK_WRUNLOCK(TASK_WQ_LOCK, &wq_lock);
 	} else
 #endif
 	{
-		BUG_ON((task->thread_mask & tid_bit) == 0); // should have TASK_SHARED_WQ
+		BUG_ON(task->tid != tid);
 		if (task_in_wq(task))
 			when = tick_first(when, task->expire);
 
 		task->expire = when;
-		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key))
+		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key)) {
+			if (likely(caller)) {
+				caller = HA_ATOMIC_XCHG(&task->caller, caller);
+				BUG_ON((ulong)caller & 1);
+#ifdef DEBUG_TASK
+				HA_ATOMIC_STORE(&task->debug.prev_caller, caller);
+#endif
+			}
 			__task_queue(task, &th_ctx->timers);
+		}
+	}
+}
+
+/* returns the string corresponding to a task type as found in the task caller
+ * locations.
+ */
+static inline const char *task_wakeup_type_str(uint t)
+{
+	switch (t) {
+	case WAKEUP_TYPE_TASK_WAKEUP          : return "task_wakeup";
+	case WAKEUP_TYPE_TASK_INSTANT_WAKEUP  : return "task_instant_wakeup";
+	case WAKEUP_TYPE_TASKLET_WAKEUP       : return "tasklet_wakeup";
+	case WAKEUP_TYPE_TASKLET_WAKEUP_AFTER : return "tasklet_wakeup_after";
+	case WAKEUP_TYPE_TASK_QUEUE           : return "task_queue";
+	case WAKEUP_TYPE_TASK_SCHEDULE        : return "task_schedule";
+	case WAKEUP_TYPE_APPCTX_WAKEUP        : return "appctx_wakeup";
+	default                               : return "?";
 	}
 }
 

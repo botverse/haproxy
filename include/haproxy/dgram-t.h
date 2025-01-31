@@ -22,12 +22,15 @@
 #ifndef _HAPROXY_HAPROXY_DGRAM_T_H
 #define _HAPROXY_HAPROXY_DGRAM_T_H
 
+#include <haproxy/api-t.h>
+#include <haproxy/thread-t.h>
 #include <arpa/inet.h>
 
 /*
  * datagram related structure
  */
 struct dgram_conn {
+	__decl_thread(HA_SPINLOCK_T lock);
 	const struct dgram_data_cb *data;	/* data layer callbacks. Must be set before */
 	void *owner;				/* pointer to upper layer's entity */
 	union {					/* definitions which depend on connection type */

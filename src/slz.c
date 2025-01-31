@@ -374,7 +374,13 @@ static void copy_lit_huff(struct slz_stream *strm, const unsigned char *buf, uin
 static inline uint32_t slz_hash(uint32_t a)
 {
 #if defined(__ARM_FEATURE_CRC32)
+#  if defined(__ARM_ARCH_ISA_A64)
+	// 64 bit mode
 	__asm__ volatile("crc32w %w0,%w0,%w1" : "+r"(a) : "r"(0));
+#  else
+	// 32 bit mode (e.g. armv7 compiler building for armv8
+	__asm__ volatile("crc32w %0,%0,%1" : "+r"(a) : "r"(0));
+#  endif
 	return a >> (32 - HASH_BITS);
 #else
 	return ((a << 19) + (a << 6) - a) >> (32 - HASH_BITS);
@@ -572,6 +578,8 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 		int max_lookup = 2; // 0 = no limit
 
 		for (scan = pos - 1; scan < pos && (unsigned long)(pos - scan - 1) < 32768; scan--) {
+			int len;
+
 			if (*(uint32_t *)(in + scan) != word)
 				continue;
 
@@ -710,6 +718,42 @@ int slz_rfc1951_init(struct slz_stream *strm, int level)
 	strm->qbits = 0;
 	strm->queue = 0;
 	return 0;
+}
+
+/* Flushes any pending data for stream <strm> into buffer <buf>, then emits an
+ * empty literal block to byte-align the output, allowing to completely flush
+ * the queue. This requires that the output buffer still has the size of the
+ * queue available (up to 4 bytes), plus one byte for (BFINAL,BTYPE), plus 4
+ * bytes for LEN+NLEN, or a total of 9 bytes in the worst case. The number of
+ * bytes emitted is returned. It is guaranteed that the queue is empty on
+ * return. This may cause some overhead by adding needless 5-byte blocks if
+ * called to often.
+ */
+int slz_rfc1951_flush(struct slz_stream *strm, unsigned char *buf)
+{
+	strm->outbuf = buf;
+
+	/* The queue is always empty on INIT, DONE, and END */
+	if (!strm->qbits)
+		return 0;
+
+	/* we may need to terminate a huffman output. Lit is always in EOB state */
+	if (strm->state != SLZ_ST_EOB) {
+		strm->state = (strm->state == SLZ_ST_LAST) ? SLZ_ST_DONE : SLZ_ST_EOB;
+		send_eob(strm);
+	}
+
+	/* send BFINAL according to state, and BTYPE=00 (lit) */
+	enqueue8(strm, (strm->state == SLZ_ST_DONE) ? 1 : 0, 3);
+	flush_bits(strm);             // emit pending bits
+	copy_32b(strm, 0xFFFF0000U);  // len=0, nlen=~0
+
+	/* Now the queue is empty, EOB was sent, BFINAL might have been sent if
+	 * we completed the last block, and a zero-byte block was sent to byte-
+	 * align the output. The last state reflects all this. Let's just
+	 * return the number of bytes added to the output buffer.
+	 */
+	return strm->outbuf - buf;
 }
 
 /* Flushes any pending for stream <strm> into buffer <buf>, then sends BTYPE=1
@@ -870,7 +914,13 @@ static inline uint32_t crc32_char(uint32_t crc, uint8_t x)
 {
 #if defined(__ARM_FEATURE_CRC32)
 	crc = ~crc;
+#  if defined(__ARM_ARCH_ISA_A64)
+	// 64 bit mode
 	__asm__ volatile("crc32b %w0,%w0,%w1" : "+r"(crc) : "r"(x));
+#  else
+	// 32 bit mode (e.g. armv7 compiler building for armv8
+	__asm__ volatile("crc32b %0,%0,%1" : "+r"(crc) : "r"(x));
+#  endif
 	crc = ~crc;
 #else
 	crc = crc32_fast[0][(crc ^ x) & 0xff] ^ (crc >> 8);
@@ -881,7 +931,13 @@ static inline uint32_t crc32_char(uint32_t crc, uint8_t x)
 static inline uint32_t crc32_uint32(uint32_t data)
 {
 #if defined(__ARM_FEATURE_CRC32)
+#  if defined(__ARM_ARCH_ISA_A64)
+	// 64 bit mode
 	__asm__ volatile("crc32w %w0,%w0,%w1" : "+r"(data) : "r"(~0UL));
+#  else
+	// 32 bit mode (e.g. armv7 compiler building for armv8
+	__asm__ volatile("crc32w %0,%0,%1" : "+r"(data) : "r"(~0UL));
+#  endif
 	data = ~data;
 #else
 	data = crc32_fast[3][(data >>  0) & 0xff] ^
@@ -913,10 +969,19 @@ uint32_t slz_crc32_by4(uint32_t crc, const unsigned char *buf, int len)
 #ifdef UNALIGNED_LE_OK
 #if defined(__ARM_FEATURE_CRC32)
 		crc = ~crc;
+#  if defined(__ARM_ARCH_ISA_A64)
+	// 64 bit mode
 		__asm__ volatile("crc32w %w0,%w0,%w1" : "+r"(crc) : "r"(*(uint32_t*)(buf)));
 		__asm__ volatile("crc32w %w0,%w0,%w1" : "+r"(crc) : "r"(*(uint32_t*)(buf + 4)));
 		__asm__ volatile("crc32w %w0,%w0,%w1" : "+r"(crc) : "r"(*(uint32_t*)(buf + 8)));
 		__asm__ volatile("crc32w %w0,%w0,%w1" : "+r"(crc) : "r"(*(uint32_t*)(buf + 12)));
+#  else
+	// 32 bit mode (e.g. armv7 compiler building for armv8
+		__asm__ volatile("crc32w %0,%0,%1" : "+r"(crc) : "r"(*(uint32_t*)(buf)));
+		__asm__ volatile("crc32w %0,%0,%1" : "+r"(crc) : "r"(*(uint32_t*)(buf + 4)));
+		__asm__ volatile("crc32w %0,%0,%1" : "+r"(crc) : "r"(*(uint32_t*)(buf + 8)));
+		__asm__ volatile("crc32w %0,%0,%1" : "+r"(crc) : "r"(*(uint32_t*)(buf + 12)));
+#  endif
 		crc = ~crc;
 #else
 		crc ^= *(uint32_t *)buf;
@@ -1022,6 +1087,27 @@ int slz_rfc1952_init(struct slz_stream *strm, int level)
 	strm->qbits  = 0;
 	strm->queue  = 0;
 	return 0;
+}
+
+/* Flushes any pending data for stream <strm> into buffer <buf>, then emits an
+ * empty literal block to byte-align the output, allowing to completely flush
+ * the queue. Note that if the initial header was never sent, it will be sent
+ * first as well (10 extra bytes). This requires that the output buffer still
+ * has this plus the size of the queue available (up to 4 bytes), plus one byte
+ * for (BFINAL,BTYPE), plus 4 bytes for LEN+NLEN, or a total of 19 bytes in the
+ * worst case. The number of bytes emitted is returned. It is guaranteed that
+ * the queue is empty on return. This may cause some overhead by adding
+ * needless 5-byte blocks if called to often.
+ */
+int slz_rfc1952_flush(struct slz_stream *strm, unsigned char *buf)
+{
+	int sent = 0;
+
+	if (__builtin_expect(strm->state == SLZ_ST_INIT, 0))
+		sent = slz_rfc1952_send_header(strm, buf);
+
+	sent += slz_rfc1951_flush(strm, buf + sent);
+	return sent;
 }
 
 /* Flushes pending bits and sends the gzip trailer for stream <strm> into
@@ -1277,6 +1363,27 @@ int slz_rfc1950_init(struct slz_stream *strm, int level)
 	strm->qbits  = 0;
 	strm->queue  = 0;
 	return 0;
+}
+
+/* Flushes any pending data for stream <strm> into buffer <buf>, then emits an
+ * empty literal block to byte-align the output, allowing to completely flush
+ * the queue. Note that if the initial header was never sent, it will be sent
+ * first as well (2 extra bytes). This requires that the output buffer still
+ * has this plus the size of the queue available (up to 4 bytes), plus one byte
+ * for (BFINAL,BTYPE), plus 4 bytes for LEN+NLEN, or a total of 11 bytes in the
+ * worst case. The number of bytes emitted is returned. It is guaranteed that
+ * the queue is empty on return. This may cause some overhead by adding
+ * needless 5-byte blocks if called to often.
+ */
+int slz_rfc1950_flush(struct slz_stream *strm, unsigned char *buf)
+{
+	int sent = 0;
+
+	if (__builtin_expect(strm->state == SLZ_ST_INIT, 0))
+		sent = slz_rfc1950_send_header(strm, buf);
+
+	sent += slz_rfc1951_flush(strm, buf + sent);
+	return sent;
 }
 
 /* Flushes pending bits and sends the gzip trailer for stream <strm> into

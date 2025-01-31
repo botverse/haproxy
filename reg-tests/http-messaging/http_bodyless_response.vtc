@@ -12,7 +12,7 @@ server s1 {
         rxreq
         txresp \
           -status 200 \
-          -bodylen 20000
+          -bodylen 50000
 
         rxreq
         txresp \
@@ -21,13 +21,14 @@ server s1 {
        chunkedlen 15
        chunkedlen 1024
        chunkedlen 4048
+       chunkedlen 50000
        chunkedlen 0
 
         rxreq
         txresp \
           -status 200 \
           -body "last response"
-} -repeat 2 -start
+} -repeat 3 -start
 
 haproxy h1 -conf {
     global

@@ -12,7 +12,6 @@
 
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,13 +64,7 @@ static int bind_parse_transparent(char **args, int cur_arg, struct proxy *px, st
 /* parse the "defer-accept" bind keyword */
 static int bind_parse_defer_accept(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	struct listener *l;
-
-	list_for_each_entry(l, &conf->listeners, by_bind) {
-		if (l->rx.addr.ss_family == AF_INET || l->rx.addr.ss_family == AF_INET6)
-			l->options |= LI_O_DEF_ACCEPT;
-	}
-
+	conf->options |= BC_O_DEF_ACCEPT;
 	return 0;
 }
 #endif
@@ -80,13 +73,7 @@ static int bind_parse_defer_accept(char **args, int cur_arg, struct proxy *px, s
 /* parse the "tfo" bind keyword */
 static int bind_parse_tfo(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	struct listener *l;
-
-	list_for_each_entry(l, &conf->listeners, by_bind) {
-		if (l->rx.addr.ss_family == AF_INET || l->rx.addr.ss_family == AF_INET6)
-			l->options |= LI_O_TCP_FO;
-	}
-
+	conf->options |= BC_O_TCP_FO;
 	return 0;
 }
 #endif
@@ -95,7 +82,6 @@ static int bind_parse_tfo(char **args, int cur_arg, struct proxy *px, struct bin
 /* parse the "mss" bind keyword */
 static int bind_parse_mss(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	struct listener *l;
 	int mss;
 
 	if (!*args[cur_arg + 1]) {
@@ -109,11 +95,7 @@ static int bind_parse_mss(char **args, int cur_arg, struct proxy *px, struct bin
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	list_for_each_entry(l, &conf->listeners, by_bind) {
-		if (l->rx.addr.ss_family == AF_INET || l->rx.addr.ss_family == AF_INET6)
-			l->maxseg = mss;
-	}
-
+	conf->maxseg = mss;
 	return 0;
 }
 #endif
@@ -123,7 +105,6 @@ static int bind_parse_mss(char **args, int cur_arg, struct proxy *px, struct bin
 static int bind_parse_tcp_ut(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	const char *ptr = NULL;
-	struct listener *l;
 	unsigned int timeout;
 
 	if (!*args[cur_arg + 1]) {
@@ -147,11 +128,7 @@ static int bind_parse_tcp_ut(char **args, int cur_arg, struct proxy *px, struct 
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	list_for_each_entry(l, &conf->listeners, by_bind) {
-		if (l->rx.addr.ss_family == AF_INET || l->rx.addr.ss_family == AF_INET6)
-			l->tcp_ut = timeout;
-	}
-
+	conf->tcp_ut = timeout;
 	return 0;
 }
 #endif
@@ -165,7 +142,12 @@ static int bind_parse_interface(char **args, int cur_arg, struct proxy *px, stru
 		return ERR_ALERT | ERR_FATAL;
 	}
 
+	ha_free(&conf->settings.interface);
 	conf->settings.interface = strdup(args[cur_arg + 1]);
+	if (!conf->settings.interface) {
+		memprintf(err, "'%s %s' : out of memory", args[cur_arg], args[cur_arg + 1]);
+		return ERR_ALERT | ERR_FATAL;
+	}
 	return 0;
 }
 #endif
@@ -191,6 +173,8 @@ static int bind_parse_namespace(char **args, int cur_arg, struct proxy *px, stru
 		ha_alert("Cannot open namespace '%s'.\n", args[cur_arg + 1]);
 		return ERR_ALERT | ERR_FATAL;
 	}
+	global.last_checks |= LSTCHK_SYSADM;
+
 	return 0;
 }
 #endif

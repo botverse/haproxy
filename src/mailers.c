@@ -20,7 +20,7 @@
 #include <haproxy/list.h>
 #include <haproxy/mailers.h>
 #include <haproxy/pool.h>
-#include <haproxy/proxy-t.h>
+#include <haproxy/proxy.h>
 #include <haproxy/server-t.h>
 #include <haproxy/task.h>
 #include <haproxy/tcpcheck.h>
@@ -30,6 +30,11 @@
 
 
 struct mailers *mailers = NULL;
+
+/* Set to 1 to disable email sending through checks even if the
+ * mailers are configured to do so. (e.g.: disable from lua)
+ */
+int send_email_disabled = 0;
 
 DECLARE_STATIC_POOL(pool_head_email_alert,   "email_alert",   sizeof(struct email_alert));
 
@@ -75,7 +80,7 @@ static struct task *process_email_alert(struct task *t, void *context, unsigned 
 
 			alert = LIST_NEXT(&q->email_alerts, typeof(alert), list);
 			LIST_DELETE(&alert->list);
-			t->expire             = now_ms;
+			t->expire             = tick_add(now_ms, 0);
 			check->tcpcheck_rules = &alert->rules;
 			check->status         = HCHK_STATUS_INI;
 			check->state         |= CHK_ST_ENABLED;
@@ -108,6 +113,10 @@ int init_email_alert(struct mailers *mls, struct proxy *p, char **err)
 	const char          *err_str;
 	int                  i = 0;
 
+	if (!send_email_disabled)
+		ha_warning("Legacy mailers used by %s '%s' will not be supported anymore in version 3.3. You should use Lua to send email-alerts, see 'examples/lua/mailers.lua' file.\n",
+			   proxy_type_str(p), p->id);
+
 	if ((queues = calloc(mls->count, sizeof(*queues))) == NULL) {
 		memprintf(err, "out of memory while allocating mailer alerts queues");
 		goto fail_no_queue;
@@ -120,6 +129,7 @@ int init_email_alert(struct mailers *mls, struct proxy *p, char **err)
 
 		LIST_INIT(&q->email_alerts);
 		HA_SPIN_INIT(&q->lock);
+		check->obj_type = OBJ_TYPE_CHECK;
 		check->inter = mls->timeout.mail;
 		check->rise = DEF_AGENT_RISETIME;
 		check->proxy = p;
@@ -144,13 +154,14 @@ int init_email_alert(struct mailers *mls, struct proxy *p, char **err)
 
 		/* check this in one ms */
 		t->expire    = TICK_ETERNITY;
-		check->start = now;
+		check->start = now_ns;
 		task_queue(t);
 	}
 
 	mls->users++;
 	free(p->email_alert.mailers.name);
 	p->email_alert.mailers.m = mls;
+	p->email_alert.flags |= PR_EMAIL_ALERT_RESOLVED;
 	p->email_alert.queues    = queues;
 	return 0;
 
@@ -164,6 +175,15 @@ int init_email_alert(struct mailers *mls, struct proxy *p, char **err)
 	free(queues);
   fail_no_queue:
 	return 1;
+}
+
+void free_email_alert(struct proxy *p)
+{
+	if (!(p->email_alert.flags & PR_EMAIL_ALERT_RESOLVED))
+		ha_free(&p->email_alert.mailers.name);
+	ha_free(&p->email_alert.from);
+	ha_free(&p->email_alert.to);
+	ha_free(&p->email_alert.myhostname);
 }
 
 static int enqueue_one_email_alert(struct proxy *p, struct server *s,
@@ -195,7 +215,7 @@ static int enqueue_one_email_alert(struct proxy *p, struct server *s,
 		goto error;
 
 	{
-		const char * const strs[4] = { "EHLO ", p->email_alert.myhostname, "\r\n" };
+		const char * const strs[4] = { "HELO ", p->email_alert.myhostname, "\r\n" };
 		if (!add_tcpcheck_send_strs(&alert->rules, strs))
 			goto error;
 	}
@@ -303,6 +323,9 @@ void send_email_alert(struct server *s, int level, const char *format, ...)
 	char buf[1024];
 	int len;
 	struct proxy *p = s->proxy;
+
+	if (send_email_disabled)
+		return;
 
 	if (!p->email_alert.mailers.m || level > p->email_alert.level || format == NULL)
 		return;

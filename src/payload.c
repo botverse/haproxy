@@ -23,6 +23,7 @@
 #include <haproxy/pattern.h>
 #include <haproxy/payload.h>
 #include <haproxy/sample.h>
+#include <haproxy/stconn.h>
 #include <haproxy/tools.h>
 
 
@@ -64,7 +65,7 @@ smp_fetch_len(const struct arg *args, struct sample *smp, const char *kw, void *
 		struct check *check = __objt_check(smp->sess->origin);
 
 		/* Not accurate but kept for backward compatibility purpose */
-		smp->data.u.sint = ((check->cs && IS_HTX_CS(check->cs)) ? (htxbuf(&check->bi))->data: b_data(&check->bi));
+		smp->data.u.sint = ((check->sc && IS_HTX_SC(check->sc)) ? (htxbuf(&check->bi))->data: b_data(&check->bi));
 	}
 	else
 		return 0;
@@ -1019,7 +1020,7 @@ smp_fetch_payload_lv(const struct arg *arg_p, struct sample *smp, const char *kw
 		struct check *check = __objt_check(smp->sess->origin);
 
 		/* meaningless for HTX buffers */
-		if (check->cs && IS_HTX_CS(check->cs))
+		if (check->sc && IS_HTX_SC(check->sc))
 			return 0;
 		head = b_head(&check->bi);
 		data = b_data(&check->bi);
@@ -1088,7 +1089,7 @@ smp_fetch_payload(const struct arg *arg_p, struct sample *smp, const char *kw, v
 		struct check *check = __objt_check(smp->sess->origin);
 
 		/* meaningless for HTX buffers */
-		if (check->cs && IS_HTX_CS(check->cs))
+		if (check->sc && IS_HTX_SC(check->sc))
 			return 0;
 		head = b_head(&check->bi);
 		data = b_data(&check->bi);
@@ -1385,9 +1386,9 @@ int val_distcc(struct arg *arg, char **err_msg)
 /************************************************************************/
 
 /* Note: must not be declared <const> as its list will be overwritten.
- * Note: fetches that may return multiple types must be declared as the lowest
- * common denominator, the type that can be casted into all other ones. For
- * instance IPv4/IPv6 must be declared IPv4.
+ * Note: fetches that may return multiple types should be declared using the
+ * appropriate pseudo-type. If not available it must be declared as the lowest
+ * common denominator, the type that can be casted into all other ones.
  */
 static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ "distcc_body",         smp_fetch_distcc_body,    ARG2(1,STR,SINT),       val_distcc,     SMP_T_BIN,  SMP_USE_L6REQ|SMP_USE_L6RES },

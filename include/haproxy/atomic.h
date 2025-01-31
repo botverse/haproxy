@@ -23,6 +23,8 @@
 #ifndef _HAPROXY_ATOMIC_H
 #define _HAPROXY_ATOMIC_H
 
+#include <haproxy/compiler.h>
+
 /* A few notes for the macros and functions here:
  *  - this file is painful to edit, most operations exist in 3 variants,
  *    no-thread, threads with gcc<4.7, threads with gcc>=4.7. Be careful when
@@ -183,6 +185,7 @@
 #define __ha_barrier_full()         do { } while (0)
 #define __ha_compiler_barrier()     do { } while (0)
 #define __ha_cpu_relax()            ({ 1; })
+#define __ha_cpu_relax_for_read()   ({ 1; })
 
 #else /* !USE_THREAD */
 
@@ -194,13 +197,13 @@
 #if defined(__GNUC__) && (__GNUC__ < 4 || __GNUC__ == 4 && __GNUC_MINOR__ < 7) && !defined(__clang__)
 /* gcc < 4.7 */
 
-#define HA_ATOMIC_LOAD(val)						\
-        ({								\
-	        typeof(*(val)) ret;					\
-		__sync_synchronize();					\
-		ret = *(volatile typeof(val))val;			\
-		__sync_synchronize();					\
-		ret;							\
+#define HA_ATOMIC_LOAD(val)						      \
+        ({								      \
+		typeof((val)) __val_load = (val);			      \
+		typeof(*(val)) __ret_val =				      \
+			({ __sync_synchronize(); *(volatile typeof(__val_load))__val_load; }); \
+		__sync_synchronize();					      \
+		__ret_val;						      \
 	})
 
 #define HA_ATOMIC_STORE(val, new)					\
@@ -209,7 +212,7 @@
 		typeof(*(val)) __old_store;				\
 		typeof((new)) __new_store = (new);			\
 		do { __old_store = *__val_store;			\
-		} while (!__sync_bool_compare_and_swap(__val_store, __old_store, __new_store)); \
+		} while (!__sync_bool_compare_and_swap(__val_store, __old_store, __new_store) && __ha_cpu_relax()); \
 	})
 
 #define HA_ATOMIC_XCHG(val, new)					\
@@ -218,7 +221,7 @@
 		typeof(*(val)) __old_xchg;				\
 		typeof((new)) __new_xchg = (new);			\
 		do { __old_xchg = *__val_xchg;				\
-		} while (!__sync_bool_compare_and_swap(__val_xchg, __old_xchg, __new_xchg)); \
+		} while (!__sync_bool_compare_and_swap(__val_xchg, __old_xchg, __new_xchg) && __ha_cpu_relax()); \
 		__old_xchg;						\
 	})
 
@@ -269,7 +272,7 @@
 		do {							\
 			__oldv_cas = *__val_cas;			\
 			__ret_cas = __sync_bool_compare_and_swap(__val_cas, *__oldp_cas, __new_cas); \
-		} while (!__ret_cas && *__oldp_cas == __oldv_cas);	\
+		} while (!__ret_cas && *__oldp_cas == __oldv_cas && __ha_cpu_relax()); \
 		if (!__ret_cas)						\
 			*__oldp_cas = __oldv_cas;			\
 		__ret_cas;						\
@@ -285,7 +288,7 @@
 		typeof(*(val)) __new_max = (new);			\
 									\
 		while (__old_max < __new_max &&				\
-		       !HA_ATOMIC_CAS(__val, &__old_max, __new_max));	\
+		       !HA_ATOMIC_CAS(__val, &__old_max, __new_max) && __ha_cpu_relax()); \
 		*__val;							\
 	})
 
@@ -296,7 +299,7 @@
 		typeof(*(val)) __new_min = (new);			\
 									\
 		while (__old_min > __new_min &&				\
-		       !HA_ATOMIC_CAS(__val, &__old_min, __new_min));	\
+		       !HA_ATOMIC_CAS(__val, &__old_min, __new_min) && __ha_cpu_relax()); \
 		*__val;							\
 	})
 
@@ -404,7 +407,7 @@
 		typeof(*(val)) __new_max = (new);			\
 									\
 		while (__old_max < __new_max &&				\
-		       !HA_ATOMIC_CAS(__val, &__old_max, __new_max));	\
+		       !HA_ATOMIC_CAS(__val, &__old_max, __new_max) && __ha_cpu_relax()); \
 		*__val;							\
 	})
 
@@ -415,7 +418,7 @@
 		typeof(*(val)) __new_min = (new);			\
 									\
 		while (__old_min > __new_min &&				\
-		       !HA_ATOMIC_CAS(__val, &__old_min, __new_min));	\
+		       !HA_ATOMIC_CAS(__val, &__old_min, __new_min) && __ha_cpu_relax()); \
 		*__val;							\
 	})
 
@@ -585,6 +588,9 @@ __ha_cas_dw(void *target, void *compare, const void *set)
 /* short-lived CPU relaxation */
 #define __ha_cpu_relax() ({ asm volatile("rep;nop\n"); 1; })
 
+/* dummy relaxation: x86 prefers not to wait at all in read loops */
+#define __ha_cpu_relax_for_read() ({ 1; })
+
 #elif defined(__arm__) && (defined(__ARM_ARCH_7__) || defined(__ARM_ARCH_7A__))
 
 static __inline void
@@ -650,6 +656,9 @@ static __inline int __ha_cas_dw(void *target, void *compare, const void *set)
 /* short-lived CPU relaxation */
 #define __ha_cpu_relax() ({ asm volatile(""); 1; })
 
+/* short wait in read loops */
+#define __ha_cpu_relax_for_read() ({ asm volatile(""); 1; })
+
 #elif defined (__aarch64__)
 
 static __inline void
@@ -695,6 +704,9 @@ __ha_barrier_atomic_full(void)
  * modern ARMv8 cores such as Neoverse N1.
  */
 #define __ha_cpu_relax() ({ asm volatile("isb" ::: "memory"); 1; })
+
+/* aarch64 prefers to wait for real in read loops */
+#define __ha_cpu_relax_for_read() ({ asm volatile("isb" ::: "memory"); 1; })
 
 #if defined(__ARM_FEATURE_ATOMICS) && !defined(__clang__) // ARMv8.1-A atomics
 
@@ -797,6 +809,9 @@ static __inline int __ha_cas_dw(void *target, void *compare, void *set)
 
 /* short-lived CPU relaxation */
 #define __ha_cpu_relax() ({ asm volatile(""); 1; })
+
+/* default wait in read loops */
+#define __ha_cpu_relax_for_read() ({ asm volatile(""); 1; })
 
 #endif /* end of arch-specific barrier/dwcas */
 

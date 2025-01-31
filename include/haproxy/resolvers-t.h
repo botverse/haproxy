@@ -97,7 +97,6 @@ struct resolv_query_item {
 	char           name[DNS_MAX_NAME_SIZE+1]; /* query name */
 	unsigned short type;                      /* question type */
 	unsigned short class;                     /* query class */
-	struct list    list;
 };
 
 /* NOTE: big endian structure */
@@ -124,7 +123,6 @@ struct resolv_answer_item {
 
 struct resolv_response {
 	struct dns_header header;
-	struct list       query_list;
 	struct eb_root    answer_tree;
 	/* authority ignored for now */
 };
@@ -136,7 +134,7 @@ struct resolv_response {
 struct resolvers {
 	__decl_thread(HA_SPINLOCK_T lock);
 	unsigned int accepted_payload_size; /* maximum payload size we accept for responses */
-	int          nb_nameservers;        /* total number of active nameservers in a resolvers section */
+	int          nb_nameservers;        /* total number of nameservers in a resolvers section */
 	int          resolve_retries;       /* number of retries before giving up */
 	struct {                            /* time to: */
 		int resolve;                /*     wait between 2 queries for the same resolution */
@@ -165,6 +163,7 @@ struct resolvers {
 	struct {
 		const char *file;           /* file where the section appears */
 		int         line;           /* line where the section appears */
+		int         implicit;       /* config was auto-generated and must be silent */
 	} conf;                             /* config information */
 };
 
@@ -275,10 +274,7 @@ enum {
 	                            * OR provided IP found and preference is not match and an IP
 	                            * matching preference was found.
 	                            */
-	RSLV_UPD_CNAME,            /* CNAME without any IP provided in the response */
-	RSLV_UPD_NAME_ERROR,       /* name in the response did not match the query */
 	RSLV_UPD_NO_IP_FOUND,      /* no IP could be found in the response */
-	RSLV_UPD_OBSOLETE_IP,      /* The server IP was obsolete, and no other IP was found */
 };
 
 struct proxy;

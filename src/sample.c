@@ -19,11 +19,13 @@
 #include <import/mjson.h>
 #include <import/sha1.h>
 
+#include <haproxy/acl.h>
 #include <haproxy/api.h>
 #include <haproxy/arg.h>
 #include <haproxy/auth.h>
 #include <haproxy/base64.h>
 #include <haproxy/buf.h>
+#include <haproxy/cfgparse.h>
 #include <haproxy/chunk.h>
 #include <haproxy/clock.h>
 #include <haproxy/errors.h>
@@ -31,6 +33,7 @@
 #include <haproxy/global.h>
 #include <haproxy/hash.h>
 #include <haproxy/http.h>
+#include <haproxy/http_ana-t.h>
 #include <haproxy/istbuf.h>
 #include <haproxy/mqtt.h>
 #include <haproxy/net_helper.h>
@@ -38,8 +41,10 @@
 #include <haproxy/proxy.h>
 #include <haproxy/regex.h>
 #include <haproxy/sample.h>
+#include <haproxy/sc_strm.h>
 #include <haproxy/sink.h>
 #include <haproxy/stick_table.h>
+#include <haproxy/time.h>
 #include <haproxy/tools.h>
 #include <haproxy/uri_auth-t.h>
 #include <haproxy/vars.h>
@@ -49,6 +54,7 @@
 /* sample type names */
 const char *smp_to_type[SMP_TYPES] = {
 	[SMP_T_ANY]  = "any",
+	[SMP_T_SAME] = "same",
 	[SMP_T_BOOL] = "bool",
 	[SMP_T_SINT] = "sint",
 	[SMP_T_ADDR] = "addr",
@@ -58,6 +64,21 @@ const char *smp_to_type[SMP_TYPES] = {
 	[SMP_T_BIN]  = "bin",
 	[SMP_T_METH] = "meth",
 };
+
+/* Returns SMP_T_* smp matching with <type> name or SMP_TYPES if
+ * not found.
+ */
+int type_to_smp(const char *type)
+{
+	int it = 0;
+
+	while (it < SMP_TYPES) {
+		if (strcmp(type, smp_to_type[it]) == 0)
+			break; // found
+		it += 1;
+	}
+	return it;
+}
 
 /* static sample used in sample_process() when <p> is NULL */
 static THREAD_LOCAL struct sample temp_smp;
@@ -327,22 +348,52 @@ static const char *fetch_ckp_names[SMP_CKP_ENTRIES] = {
 	[SMP_CKP_FE_HRS_BDY] = "frontend http-response body rule",
 	[SMP_CKP_FE_LOG_END] = "logs",
 	[SMP_CKP_BE_CHK_RUL] = "backend tcp-check rule",
+	[SMP_CKP_CFG_PARSER] = "configuration parser",
+	[SMP_CKP_CLI_PARSER] = "CLI parser",
 };
 
-/* This function returns the type of the data returned by the sample_expr.
- * It assumes that the <expr> and all of its converters are properly
- * initialized.
+/* This function returns the most accurate expected type of the data returned
+ * by the sample_expr. It assumes that the <expr> and all of its converters are
+ * properly initialized.
  */
-inline
 int smp_expr_output_type(struct sample_expr *expr)
 {
-	struct sample_conv_expr *smp_expr;
+	struct sample_conv_expr *cur_smp = NULL;
+	int cur_type = SMP_T_ANY;  /* current type in the chain */
+	int next_type = SMP_T_ANY; /* next type in the chain */
 
 	if (!LIST_ISEMPTY(&expr->conv_exprs)) {
-		smp_expr = LIST_PREV(&expr->conv_exprs, struct sample_conv_expr *, list);
-		return smp_expr->conv->out_type;
+		/* Ignore converters that output SMP_T_SAME if switching to them is
+		 * conversion-free. (such converter's output match with input, thus only
+		 * their input is considered)
+		 *
+		 * We start looking at the end of conv list and then loop back until the
+		 * sample fetch for better performance (it is more likely to find the last
+		 * effective output type near the end of the chain)
+		 */
+		do {
+			struct list *cur_head = (cur_smp) ? &cur_smp->list : &expr->conv_exprs;
+
+			cur_smp = LIST_PREV(cur_head, struct sample_conv_expr *, list);
+			if (cur_smp->conv->out_type != SMP_T_SAME) {
+				/* current converter has effective out_type */
+				cur_type = cur_smp->conv->out_type;
+				goto out;
+			}
+			else if (sample_casts[cur_type][next_type] != c_none)
+				return next_type; /* switching to next type is not conversion-free */
+
+			next_type = cur_smp->conv->in_type;
+		} while (cur_smp != LIST_NEXT(&expr->conv_exprs, struct sample_conv_expr *, list));
 	}
-	return expr->fetch->out_type;
+	/* conv list empty or doesn't have effective out_type,
+	 * falling back to sample fetch out_type
+	 */
+	cur_type = expr->fetch->out_type;
+ out:
+	if (sample_casts[cur_type][next_type] != c_none)
+		return next_type; /* switching to next type is not conversion-free */
+	return cur_type;
 }
 
 
@@ -432,6 +483,123 @@ struct sample_fetch *find_sample_fetch(const char *kw, int len)
 	return NULL;
 }
 
+/* dump list of registered sample fetch keywords on stdout */
+void smp_dump_fetch_kw(void)
+{
+	struct sample_fetch_kw_list *kwl;
+	struct sample_fetch *kwp, *kw;
+	uint64_t mask;
+	int index;
+	int arg;
+	int bit;
+
+	for (bit = 0; bit <= SMP_CKP_ENTRIES + 1; bit++) {
+		putchar('#');
+		for (index = 0; bit + index <= SMP_CKP_ENTRIES; index++)
+			putchar(' ');
+		for (index = 0; index < bit && index < SMP_CKP_ENTRIES; index++)
+			printf((bit <= SMP_CKP_ENTRIES) ? "/ " : " |");
+		for (index = bit; bit < SMP_CKP_ENTRIES && index < SMP_CKP_ENTRIES + 2; index++)
+			if (index == bit)
+				putchar('_');
+			else if (index == bit + 1)
+				putchar('.');
+			else
+				putchar('-');
+		printf(" %s\n", (bit < SMP_CKP_ENTRIES) ? fetch_ckp_names[bit] : "");
+	}
+
+	for (kw = kwp = NULL;; kwp = kw) {
+		list_for_each_entry(kwl, &sample_fetches.list, list) {
+			for (index = 0; kwl->kw[index].kw != NULL; index++) {
+				if (strordered(kwp ? kwp->kw : NULL,
+					       kwl->kw[index].kw,
+					       kw != kwp ? kw->kw : NULL))
+					kw = &kwl->kw[index];
+			}
+		}
+
+		if (kw == kwp)
+			break;
+
+		printf("[ ");
+		for (bit = 0; bit < SMP_CKP_ENTRIES; bit++)
+			printf("%s", (kw->val & (1 << bit)) ? "Y " : ". ");
+
+		printf("] %s", kw->kw);
+		if (kw->arg_mask) {
+			mask = kw->arg_mask >> ARGM_BITS;
+			printf("(");
+			for (arg = 0;
+			     arg < ARGM_NBARGS && ((mask >> (arg * ARGT_BITS)) & ARGT_MASK);
+			     arg++) {
+				if (arg == (kw->arg_mask & ARGM_MASK)) {
+					/* now dumping extra args */
+					printf("[");
+				}
+				if (arg)
+					printf(",");
+				printf("%s", arg_type_names[(mask >> (arg * ARGT_BITS)) & ARGT_MASK]);
+			}
+			if (arg > (kw->arg_mask & ARGM_MASK)) {
+				/* extra args were dumped */
+				printf("]");
+			}
+			printf(")");
+		}
+		printf(": %s", smp_to_type[kw->out_type]);
+		printf("\n");
+	}
+}
+
+/* dump list of registered sample converter keywords on stdout */
+void smp_dump_conv_kw(void)
+{
+	struct sample_conv_kw_list *kwl;
+	struct sample_conv *kwp, *kw;
+	uint64_t mask;
+	int index;
+	int arg;
+
+	for (kw = kwp = NULL;; kwp = kw) {
+		list_for_each_entry(kwl, &sample_convs.list, list) {
+			for (index = 0; kwl->kw[index].kw != NULL; index++) {
+				if (strordered(kwp ? kwp->kw : NULL,
+					       kwl->kw[index].kw,
+					       kw != kwp ? kw->kw : NULL))
+					kw = &kwl->kw[index];
+			}
+		}
+
+		if (kw == kwp)
+			break;
+
+		printf("%s", kw->kw);
+		if (kw->arg_mask) {
+			mask = kw->arg_mask >> ARGM_BITS;
+			printf("(");
+			for (arg = 0;
+			     arg < ARGM_NBARGS && ((mask >> (arg * ARGT_BITS)) & ARGT_MASK);
+			     arg++) {
+				if (arg == (kw->arg_mask & ARGM_MASK)) {
+					/* now dumping extra args */
+					printf("[");
+				}
+				if (arg)
+					printf(",");
+				printf("%s", arg_type_names[(mask >> (arg * ARGT_BITS)) & ARGT_MASK]);
+			}
+			if (arg > (kw->arg_mask & ARGM_MASK)) {
+				/* extra args were dumped */
+				printf("]");
+			}
+			printf(")");
+		}
+		printf(": %s => %s", smp_to_type[kw->out_type], smp_to_type[kw->in_type]);
+		printf("\n");
+	}
+}
+
 /* This function browses the list of available sample fetches. <current> is
  * the last used sample fetch. If it is the first call, it must set to NULL.
  * <idx> is the index of the next sample fetch entry. It is used as private
@@ -450,7 +618,7 @@ struct sample_fetch *sample_fetch_getnext(struct sample_fetch *current, int *idx
 		kwl = LIST_NEXT(&sample_fetches.list, struct sample_fetch_kw_list *, list);
 		(*idx) = 0;
 	} else {
-		/* Get kwl corresponding to the curret entry. */
+		/* Get kwl corresponding to the current entry. */
 		base = current + 1 - (*idx);
 		kwl = container_of(base, struct sample_fetch_kw_list, kw);
 	}
@@ -493,7 +661,7 @@ struct sample_conv *sample_conv_getnext(struct sample_conv *current, int *idx)
 		kwl = LIST_NEXT(&sample_convs.list, struct sample_conv_kw_list *, list);
 		(*idx) = 0;
 	} else {
-		/* Get kwl corresponding to the curret entry. */
+		/* Get kwl corresponding to the current entry. */
 		base = current + 1 - (*idx);
 		kwl = container_of(base, struct sample_conv_kw_list, kw);
 	}
@@ -704,7 +872,7 @@ int smp_dup(struct sample *smp)
 	case SMP_T_METH:
 		if (smp->data.u.meth.meth != HTTP_METH_OTHER)
 			break;
-		/* Fall through */
+		__fallthrough;
 
 	case SMP_T_STR:
 		trash = get_trash_chunk();
@@ -743,6 +911,22 @@ int smp_dup(struct sample *smp)
 int c_none(struct sample *smp)
 {
 	return 1;
+}
+
+/* special converter function used by pseudo types in the compatibility matrix
+ * to inform that the conversion is theoretically allowed at parsing time.
+ *
+ * However, being a pseudo type, it may not be emitted by fetches or converters
+ * so this function should never be called. If this is the case, then it means
+ * that a pseudo type has been used as a final output type at runtime, which is
+ * considered as a bug and should be fixed. To help spot this kind of bug, the
+ * process will crash in this case.
+ */
+int c_pseudo(struct sample *smp)
+{
+	ABORT_NOW(); // die loudly
+	/* never reached */
+	return 0;
 }
 
 static int c_str2int(struct sample *smp)
@@ -839,6 +1023,17 @@ static int c_int2bin(struct sample *smp)
 	return 1;
 }
 
+static int c_bool2bin(struct sample *smp)
+{
+	struct buffer *chk = get_trash_chunk();
+
+	*(unsigned long long int *)chk->area = my_htonll(!!smp->data.u.sint);
+	chk->data = 8;
+	smp->data.u.str = *chk;
+	smp->data.type = SMP_T_BIN;
+	return 1;
+}
+
 
 /*****************************************************************/
 /*      Sample casts matrix:                                     */
@@ -847,116 +1042,53 @@ static int c_int2bin(struct sample *smp)
 /*****************************************************************/
 
 sample_cast_fct sample_casts[SMP_TYPES][SMP_TYPES] = {
-/*            to:  ANY     BOOL       SINT       ADDR        IPV4      IPV6        STR         BIN         METH */
-/* from:  ANY */ { c_none, c_none,    c_none,    c_none,     c_none,   c_none,     c_none,     c_none,     c_none,     },
-/*       BOOL */ { c_none, c_none,    c_none,    NULL,       NULL,     NULL,       c_int2str,  NULL,       NULL,       },
-/*       SINT */ { c_none, c_none,    c_none,    c_int2ip,   c_int2ip, c_int2ipv6, c_int2str,  c_int2bin,  NULL,       },
-/*       ADDR */ { c_none, NULL,      NULL,      NULL,       NULL,     NULL,       NULL,       NULL,       NULL,       },
-/*       IPV4 */ { c_none, NULL,      c_ip2int,  c_none,     c_none,   c_ip2ipv6,  c_ip2str,   c_addr2bin, NULL,       },
-/*       IPV6 */ { c_none, NULL,      NULL,      c_none,     c_ipv62ip,c_none,     c_ipv62str, c_addr2bin, NULL,       },
-/*        STR */ { c_none, c_str2int, c_str2int, c_str2addr, c_str2ip, c_str2ipv6, c_none,     c_none,     c_str2meth, },
-/*        BIN */ { c_none, NULL,      NULL,      NULL,       NULL,     NULL,       c_bin2str,  c_none,     c_str2meth, },
-/*       METH */ { c_none, NULL,      NULL,      NULL,       NULL,     NULL,       c_meth2str, c_meth2str, c_none,     }
+/*            to:  ANY     SAME      BOOL       SINT       ADDR        IPV4       IPV6        STR         BIN         METH */
+/* from:  ANY */ { c_none, NULL,     c_pseudo,  c_pseudo,  c_pseudo,   c_pseudo,  c_pseudo,   c_pseudo,   c_pseudo,   c_pseudo   },
+/*       SAME */ { NULL,   NULL,     NULL,      NULL,      NULL,       NULL,      NULL,       NULL,       NULL,       NULL       },
+/*       BOOL */ { c_none, NULL,     c_none,    c_none,    NULL,       NULL,      NULL,       c_int2str,  c_bool2bin, NULL       },
+/*       SINT */ { c_none, NULL,     c_none,    c_none,    c_int2ip,   c_int2ip,  c_int2ipv6, c_int2str,  c_int2bin,  NULL       },
+/*       ADDR */ { c_none, NULL,     NULL,      NULL,      c_pseudo,   c_pseudo,  c_pseudo,   c_pseudo,   c_pseudo,   NULL       },
+/*       IPV4 */ { c_none, NULL,     NULL,      c_ip2int,  c_none,     c_none,    c_ip2ipv6,  c_ip2str,   c_addr2bin, NULL       },
+/*       IPV6 */ { c_none, NULL,     NULL,      NULL,      c_none,     c_ipv62ip, c_none,     c_ipv62str, c_addr2bin, NULL       },
+/*        STR */ { c_none, NULL,     c_str2int, c_str2int, c_str2addr, c_str2ip,  c_str2ipv6, c_none,     c_none,     c_str2meth },
+/*        BIN */ { c_none, NULL,     NULL,      NULL,      NULL,       NULL,      NULL,       c_bin2str,  c_none,     c_str2meth },
+/*       METH */ { c_none, NULL,     NULL,      NULL,      NULL,       NULL,      NULL,       c_meth2str, c_meth2str, c_none     }
 };
 
-/*
- * Parse a sample expression configuration:
- *        fetch keyword followed by format conversion keywords.
- * Returns a pointer on allocated sample expression structure.
- * <al> is an arg_list serving as a list head to report missing dependencies.
- * It may be NULL if such dependencies are not allowed. Otherwise, the caller
- * must have set al->ctx if al is set.
+/* Process the converters (if any) for a sample expr after the first fetch
+ * keyword. We have two supported syntaxes for the converters, which can be
+ * combined:
+ *  - comma-delimited list of converters just after the keyword and args ;
+ *  - one converter per keyword (if <idx> != NULL)
+ *    FIXME: should we continue to support this old syntax?
+ * The combination allows to have each keyword being a comma-delimited
+ * series of converters.
+ *
+ * We want to process the former first, then the latter. For this we start
+ * from the beginning of the supposed place in the exiting conv chain, which
+ * starts at the last comma (<start> which is then referred to as endt).
+ *
  * If <endptr> is non-nul, it will be set to the first unparsed character
  * (which may be the final '\0') on success. If it is nul, the expression
  * must be properly terminated by a '\0' otherwise an error is reported.
+ *
+ * <expr> should point the the sample expression that is already initialized
+ * with the sample fetch that precedes the converters chain.
+ *
+ * The function returns a positive value for success and 0 for failure, in which
+ * case <err_msg> will point to an allocated string that brings some info
+ * about the failure. It is the caller's responsibility to free it.
  */
-struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, int line, char **err_msg, struct arg_list *al, char **endptr)
+int sample_parse_expr_cnv(char **str, int *idx, char **endptr, char **err_msg, struct arg_list *al, const char *file, int line,
+                          struct sample_expr *expr, const char *start)
 {
-	const char *begw; /* beginning of word */
-	const char *endw; /* end of word */
-	const char *endt; /* end of term */
-	struct sample_expr *expr = NULL;
-	struct sample_fetch *fetch;
 	struct sample_conv *conv;
-	unsigned long prev_type;
-	char *fkw = NULL;
+	const char *endt = start; /* end of term */
+	const char *begw;         /* beginning of word */
+	const char *endw;         /* end of word */
 	char *ckw = NULL;
-	int err_arg;
-
-	begw = str[*idx];
-	for (endw = begw; is_idchar(*endw); endw++)
-		;
-
-	if (endw == begw) {
-		memprintf(err_msg, "missing fetch method");
-		goto out_error;
-	}
-
-	/* keep a copy of the current fetch keyword for error reporting */
-	fkw = my_strndup(begw, endw - begw);
-
-	fetch = find_sample_fetch(begw, endw - begw);
-	if (!fetch) {
-		memprintf(err_msg, "unknown fetch method '%s'", fkw);
-		goto out_error;
-	}
-
-	/* At this point, we have :
-	 *   - begw : beginning of the keyword
-	 *   - endw : end of the keyword, first character not part of keyword
-	 */
-
-	if (fetch->out_type >= SMP_TYPES) {
-		memprintf(err_msg, "returns type of fetch method '%s' is unknown", fkw);
-		goto out_error;
-	}
-	prev_type = fetch->out_type;
-
-	expr = calloc(1, sizeof(*expr));
-	if (!expr)
-		goto out_error;
-
-	LIST_INIT(&(expr->conv_exprs));
-	expr->fetch = fetch;
-	expr->arg_p = empty_arg_list;
-
-	/* Note that we call the argument parser even with an empty string,
-	 * this allows it to automatically create entries for mandatory
-	 * implicit arguments (eg: local proxy name).
-	 */
-	if (al) {
-		al->kw = expr->fetch->kw;
-		al->conv = NULL;
-	}
-	if (make_arg_list(endw, -1, fetch->arg_mask, &expr->arg_p, err_msg, &endt, &err_arg, al) < 0) {
-		memprintf(err_msg, "fetch method '%s' : %s", fkw, *err_msg);
-		goto out_error;
-	}
-
-	/* now endt is our first char not part of the arg list, typically the
-	 * comma after the sample fetch name or after the closing parenthesis,
-	 * or the NUL char.
-	 */
-
-	if (!expr->arg_p) {
-		expr->arg_p = empty_arg_list;
-	}
-	else if (fetch->val_args && !fetch->val_args(expr->arg_p, err_msg)) {
-		memprintf(err_msg, "invalid args in fetch method '%s' : %s", fkw, *err_msg);
-		goto out_error;
-	}
-
-	/* Now process the converters if any. We have two supported syntaxes
-	 * for the converters, which can be combined :
-	 *  - comma-delimited list of converters just after the keyword and args ;
-	 *  - one converter per keyword
-	 * The combination allows to have each keyword being a comma-delimited
-	 * series of converters.
-	 *
-	 * We want to process the former first, then the latter. For this we start
-	 * from the beginning of the supposed place in the exiting conv chain, which
-	 * starts at the last comma (endt).
-	 */
+	unsigned long prev_type = expr->fetch->out_type;
+	int success = 1;
 
 	while (1) {
 		struct sample_conv_expr *conv_expr;
@@ -971,7 +1103,7 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 			if (ckw)
 				memprintf(err_msg, "missing comma after converter '%s'", ckw);
 			else
-				memprintf(err_msg, "missing comma after fetch keyword '%s'", fkw);
+				memprintf(err_msg, "missing comma after fetch keyword");
 			goto out_error;
 		}
 
@@ -984,7 +1116,9 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 		begw = endt; /* start of converter */
 
 		if (!*begw) {
-			/* none ? skip to next string */
+			/* none ? skip to next string if idx is set */
+			if (!idx)
+				break; /* end of converters */
 			(*idx)++;
 			begw = str[*idx];
 			if (!begw || !*begw)
@@ -994,13 +1128,13 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 		for (endw = begw; is_idchar(*endw); endw++)
 			;
 
-		free(ckw);
+		ha_free(&ckw);
 		ckw = my_strndup(begw, endw - begw);
 
 		conv = find_sample_conv(begw, endw - begw);
 		if (!conv) {
 			/* we found an isolated keyword that we don't know, it's not ours */
-			if (begw == str[*idx]) {
+			if (idx && begw == str[*idx]) {
 				endt = begw;
 				break;
 			}
@@ -1009,7 +1143,7 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 		}
 
 		if (conv->in_type >= SMP_TYPES || conv->out_type >= SMP_TYPES) {
-			memprintf(err_msg, "returns type of converter '%s' is unknown", ckw);
+			memprintf(err_msg, "return type of converter '%s' is unknown", ckw);
 			goto out_error;
 		}
 
@@ -1019,7 +1153,15 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 			goto out_error;
 		}
 
-		prev_type = conv->out_type;
+		/* Ignore converters that output SMP_T_SAME if switching to them is
+		 * conversion-free. (such converter's output match with input, thus only
+		 * their input is considered)
+		 */
+		if (conv->out_type != SMP_T_SAME)
+			prev_type = conv->out_type;
+		else if (sample_casts[prev_type][conv->in_type] != c_none)
+			prev_type = conv->in_type;
+
 		conv_expr = calloc(1, sizeof(*conv_expr));
 		if (!conv_expr)
 			goto out_error;
@@ -1055,16 +1197,146 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 		/* end found, let's stop here */
 		*endptr = (char *)endt;
 	}
+ out:
+	free(ckw);
+	return success;
+
+ out_error:
+	success = 0;
+	goto out;
+}
+
+/*
+ * Parse a sample expression configuration:
+ *        fetch keyword followed by format conversion keywords.
+ *
+ * <al> is an arg_list serving as a list head to report missing dependencies.
+ * It may be NULL if such dependencies are not allowed. Otherwise, the caller
+ * must have set al->ctx if al is set.
+ *
+ * Returns a pointer on allocated sample expression structure or NULL in case
+ * of error, in which case <err_msg> will point to an allocated string that
+ * brings some info about the failure. It is the caller's responsibility to
+ * free it.
+ */
+struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, int line, char **err_msg, struct arg_list *al, char **endptr)
+{
+	const char *begw; /* beginning of word */
+	const char *endw; /* end of word */
+	const char *endt; /* end of term */
+	struct sample_expr *expr = NULL;
+	struct sample_fetch *fetch;
+	char *fkw = NULL;
+	int err_arg;
+
+	begw = str[*idx];
+	for (endw = begw; is_idchar(*endw); endw++)
+		;
+
+	if (endw == begw) {
+		memprintf(err_msg, "missing fetch method");
+		goto out_error;
+	}
+
+	/* keep a copy of the current fetch keyword for error reporting */
+	fkw = my_strndup(begw, endw - begw);
+
+	fetch = find_sample_fetch(begw, endw - begw);
+	if (!fetch) {
+		memprintf(err_msg, "unknown fetch method '%s'", fkw);
+		goto out_error;
+	}
+
+	/* At this point, we have :
+	 *   - begw : beginning of the keyword
+	 *   - endw : end of the keyword, first character not part of keyword
+	 */
+
+	if (fetch->out_type >= SMP_TYPES) {
+		memprintf(err_msg, "returns type of fetch method '%s' is unknown", fkw);
+		goto out_error;
+	}
+
+	expr = calloc(1, sizeof(*expr));
+	if (!expr)
+		goto out_error;
+
+	LIST_INIT(&(expr->conv_exprs));
+	expr->fetch = fetch;
+	expr->arg_p = empty_arg_list;
+
+	/* Note that we call the argument parser even with an empty string,
+	 * this allows it to automatically create entries for mandatory
+	 * implicit arguments (eg: local proxy name).
+	 */
+	if (al) {
+		al->kw = expr->fetch->kw;
+		al->conv = NULL;
+	}
+	if (make_arg_list(endw, -1, fetch->arg_mask, &expr->arg_p, err_msg, &endt, &err_arg, al) < 0) {
+		memprintf(err_msg, "fetch method '%s' : %s", fkw, *err_msg);
+		goto out_error;
+	}
+
+	/* now endt is our first char not part of the arg list, typically the
+	 * comma after the sample fetch name or after the closing parenthesis,
+	 * or the NUL char.
+	 */
+
+	if (!expr->arg_p) {
+		expr->arg_p = empty_arg_list;
+	}
+	else if (fetch->val_args && !fetch->val_args(expr->arg_p, err_msg)) {
+		memprintf(err_msg, "invalid args in fetch method '%s' : %s", fkw, *err_msg);
+		goto out_error;
+	}
+
+	if (!sample_parse_expr_cnv(str, idx, endptr, err_msg, al, file, line, expr, endt))
+		goto out_error;
 
  out:
 	free(fkw);
-	free(ckw);
 	return expr;
 
 out_error:
 	release_sample_expr(expr);
 	expr = NULL;
 	goto out;
+}
+
+/*
+ * Helper function to process the converter list of a given sample expression
+ * <expr> using the sample <p> (which is assumed to be properly initialized)
+ * as input.
+ *
+ * Returns 1 on success and 0 on failure.
+ */
+int sample_process_cnv(struct sample_expr *expr, struct sample *p)
+{
+	struct sample_conv_expr *conv_expr;
+
+	list_for_each_entry(conv_expr, &expr->conv_exprs, list) {
+		/* we want to ensure that p->type can be casted into
+		 * conv_expr->conv->in_type. We have 3 possibilities :
+		 *  - NULL   => not castable.
+		 *  - c_none => nothing to do (let's optimize it)
+		 *  - other  => apply cast and prepare to fail
+		 */
+		if (p->data.type != conv_expr->conv->in_type) {
+			if (!sample_casts[p->data.type][conv_expr->conv->in_type])
+				return 0;
+
+			if (sample_casts[p->data.type][conv_expr->conv->in_type] != c_none &&
+			    !sample_casts[p->data.type][conv_expr->conv->in_type](p))
+				return 0;
+		}
+
+		/* OK cast succeeded */
+
+		if (!conv_expr->conv->process(conv_expr->arg_p, p, conv_expr->conv->private))
+			return 0;
+	}
+	return 1;
 }
 
 /*
@@ -1095,8 +1367,6 @@ struct sample *sample_process(struct proxy *px, struct session *sess,
                               struct stream *strm, unsigned int opt,
                               struct sample_expr *expr, struct sample *p)
 {
-	struct sample_conv_expr *conv_expr;
-
 	if (p == NULL) {
 		p = &temp_smp;
 		memset(p, 0, sizeof(*p));
@@ -1106,25 +1376,8 @@ struct sample *sample_process(struct proxy *px, struct session *sess,
 	if (!expr->fetch->process(expr->arg_p, p, expr->fetch->kw, expr->fetch->private))
 		return NULL;
 
-	list_for_each_entry(conv_expr, &expr->conv_exprs, list) {
-		/* we want to ensure that p->type can be casted into
-		 * conv_expr->conv->in_type. We have 3 possibilities :
-		 *  - NULL   => not castable.
-		 *  - c_none => nothing to do (let's optimize it)
-		 *  - other  => apply cast and prepare to fail
-		 */
-		if (!sample_casts[p->data.type][conv_expr->conv->in_type])
-			return NULL;
-
-		if (sample_casts[p->data.type][conv_expr->conv->in_type] != c_none &&
-		    !sample_casts[p->data.type][conv_expr->conv->in_type](p))
-			return NULL;
-
-		/* OK cast succeeded */
-
-		if (!conv_expr->conv->process(conv_expr->arg_p, p, conv_expr->conv->private))
-			return NULL;
-	}
+	if (!sample_process_cnv(expr, p))
+		return NULL;
 	return p;
 }
 
@@ -1176,8 +1429,11 @@ int smp_resolve_args(struct proxy *p, char **err)
 		case ARGC_ACL:   ctx = "ACL keyword"; break;
 		case ARGC_SRV:   where = "in server directive in"; break;
 		case ARGC_SPOE:  where = "in spoe-message directive in"; break;
+		case ARGC_UBK:   where = "in use_backend expression in"; break;
+		case ARGC_USRV:  where = "in use-server or balance expression in"; break;
 		case ARGC_HERR:  where = "in http-error directive in"; break;
 		case ARGC_OT:    where = "in ot-scope directive in"; break;
+		case ARGC_OPT:   where = "in option directive in"; break;
 		case ARGC_TCO:   where = "in tcp-request connection expression in"; break;
 		case ARGC_TSE:   where = "in tcp-request session expression in"; break;
 		case ARGC_TRQ:   where = "in tcp-request content expression in"; break;
@@ -1192,6 +1448,20 @@ int smp_resolve_args(struct proxy *p, char **err)
 		pname = p->id;
 
 		switch (arg->type) {
+		case ARGT_ID:
+			err2 = NULL;
+
+			if (arg->resolve_ptr && !arg->resolve_ptr(arg, &err2)) {
+				memprintf(err, "%sparsing [%s:%d]: error in identifier '%s' in arg %d of %s%s%s%s '%s' %s proxy '%s' : %s.\n",
+					  *err ? *err : "", cur->file, cur->line,
+					 arg->data.str.area,
+					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id, err2);
+				ha_free(&err2);
+				cfgerr++;
+				continue;
+			}
+			break;
+
 		case ARGT_SRV:
 			if (!arg->data.str.data) {
 				memprintf(err, "%sparsing [%s:%d]: missing server name in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
@@ -1386,6 +1656,7 @@ int smp_resolve_args(struct proxy *p, char **err)
 					  *err ? *err : "", cur->file, cur->line,
 					 arg->data.str.area,
 					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id, err2);
+				ha_free(&err2);
 				cfgerr++;
 				continue;
 			}
@@ -1440,11 +1711,14 @@ struct sample *sample_fetch_as_type(struct proxy *px, struct session *sess,
 		return NULL;
 	}
 
-	if (!sample_casts[smp->data.type][smp_type])
-		return NULL;
+	if (smp->data.type != smp_type) {
+		if (!sample_casts[smp->data.type][smp_type])
+			return NULL;
 
-	if (!sample_casts[smp->data.type][smp_type](smp))
-		return NULL;
+		if (sample_casts[smp->data.type][smp_type] != c_none &&
+		    !sample_casts[smp->data.type][smp_type](smp))
+			return NULL;
+	}
 
 	smp->flags &= ~SMP_F_MAY_CHANGE;
 	return smp;
@@ -1539,7 +1813,7 @@ static int sample_conv_debug(const struct arg *arg_p, struct sample *smp, void *
 
  done:
 	line = ist2(buf->area, buf->data);
-	sink_write(sink, &line, 1, 0, 0, NULL);
+	sink_write(sink, LOG_HEADER_NONE, 0, &line, 1);
  end:
 	free_trash_chunk(buf);
 	return 1;
@@ -1564,9 +1838,9 @@ static int smp_check_debug(struct arg *args, struct sample_conv *conv,
 	if (args[1].type == ARGT_STR)
 		name = args[1].data.str.area;
 
-	sink = sink_find(name);
+	sink = sink_find_early(name, "debug converter", file, line);
 	if (!sink) {
-		memprintf(err, "No such sink '%s'", name);
+		memprintf(err, "Memory error while setting up sink '%s'", name);
 		return 0;
 	}
 
@@ -1941,6 +2215,202 @@ static int sample_conv_ipmask(const struct arg *args, struct sample *smp, void *
 	return 1;
 }
 
+/*
+ * This function implement a conversion specifier seeker for %N so it could be
+ * replaced before doing strftime.
+ *
+ * <format> is the input format string which is used as a haystack
+ *
+ * The function fills multiple variables:
+ * <skip> is the len of the conversion specifier string which was found (ex: strlen(%N):2, strlen(%3N):3 strlen(%123N): 5)
+ * <width> is the width argument, default width is 9 (ex: %3N: 3, %4N: 4: %N: 9, %5N: 5)
+ *
+ * Returns a ptr to the first character of the conversion specifier or NULL if not found
+ */
+static const char *lookup_convspec_N(const char *format, int *skip, int *width)
+{
+	const char *p, *needle;
+	const char *digits;
+	int state;
+
+	p = format;
+
+	/* this looks for % in loop. The iteration stops when a %N conversion
+	 * specifier was found or there is no '%' anymore */
+lookagain:
+	while (p && *p) {
+		state = 0;
+		digits = NULL;
+
+		p = needle = strchr(p, '%');
+		/* Once we find a % we try to move forward in the string
+		 *
+		 * state 0: found %
+		 * state 1: digits (precision)
+		 * state 2: N
+		 */
+		while (p && *p) {
+			switch (state) {
+				case 0:
+					state = 1;
+					break;
+
+				case 1:
+					if (isdigit((unsigned char)*p) && !digits) /* set the start of the digits */
+						digits = p;
+
+					if (isdigit((unsigned char)*p))
+						break;
+					else
+						state = 2;
+					/* if this is not a number anymore, we
+					* don't want to increment p but try the
+					* next state directly */
+					__fallthrough;
+				case 2:
+					if (*p == 'N')
+						goto found;
+					else
+						/* this was not a %N, start again */
+						goto lookagain;
+					break;
+			}
+			p++;
+		}
+	}
+
+	*skip = 0;
+	*width = 0;
+	return NULL;
+
+found:
+	*skip = p - needle + 1;
+	if (digits)
+		*width = atoi(digits);
+	else
+		*width = 9;
+	return needle;
+}
+
+ /*
+  * strftime(3) does not implement nanoseconds, but we still want them in our
+  * date format.
+  *
+  * This function implements %N like in date(1) which gives you the nanoseconds part of the timestamp
+  * An optional field width can be specified, a maximum width of 9 is supported (ex: %3N %6N %9N)
+  *
+  * <format> is the format string
+  * <curr_date> in seconds since epoch
+  * <ns> only the nanoseconds part of the timestamp
+  * <local> chose the localtime instead of UTC time
+  *
+  * Return the results of strftime in the trash buffer
+  */
+static struct buffer *conv_time_common(const char *format, time_t curr_date, uint64_t ns, int local)
+{
+	struct buffer *tmp_format = NULL;
+	struct buffer *res = NULL;
+	struct tm tm;
+	const char *p;
+	char ns_str[10] = {};
+	int set = 0;
+
+	if (local)
+		get_localtime(curr_date, &tm);
+	else
+		get_gmtime(curr_date, &tm);
+
+
+	/* we need to iterate in order to replace all the %N in the string */
+
+	p = format;
+	while (*p) {
+		const char *needle;
+		int skip = 0;
+		int cpy = 0;
+		int width = 0;
+
+		/* look for the next %N onversion specifier */
+		if (!(needle = lookup_convspec_N(p, &skip, &width)))
+			break;
+
+		if (width > 9) /* we don't handle more that 9 */
+			width = 9;
+		cpy = needle - p;
+
+		if (!tmp_format)
+			tmp_format = alloc_trash_chunk();
+		if (!tmp_format)
+			goto error;
+
+		if (set != 9) /* if the snprintf wasn't done yet */
+			set = snprintf(ns_str, sizeof(ns_str), "%.9llu", (unsigned long long)ns);
+
+		if (chunk_istcat(tmp_format, ist2(p, cpy)) == 0) /* copy before the %N */
+			goto error;
+		if (chunk_istcat(tmp_format, ist2(ns_str, width)) == 0) /* copy the %N result with the right precision  */
+			goto error;
+
+		p += skip + cpy; /* skip the %N */
+	}
+
+
+	if (tmp_format) { /* %N was found */
+		if (chunk_strcat(tmp_format, p) == 0)  /* copy the end of the string if needed or just the \0 */
+			goto error;
+		res = get_trash_chunk();
+		res->data = strftime(res->area, res->size, tmp_format->area , &tm);
+	} else {
+		res = get_trash_chunk();
+		res->data = strftime(res->area, res->size, format, &tm);
+	}
+
+error:
+	free_trash_chunk(tmp_format);
+	return res;
+}
+
+
+
+/*
+ * same as sample_conv_ltime but input is us and %N is supported
+ */
+static int sample_conv_us_ltime(const struct arg *args, struct sample *smp, void *private)
+{
+	struct buffer *temp;
+	time_t curr_date = smp->data.u.sint / 1000000; /* convert us to s */
+	uint64_t ns = (smp->data.u.sint % 1000000) * 1000; /*  us part to ns */
+
+	/* add offset */
+	if (args[1].type == ARGT_SINT)
+		curr_date += args[1].data.sint;
+
+	temp = conv_time_common(args[0].data.str.area, curr_date, ns, 1);
+	smp->data.u.str = *temp;
+	smp->data.type = SMP_T_STR;
+	return 1;
+}
+
+/*
+ * same as sample_conv_ltime but input is ms and %N is supported
+ */
+static int sample_conv_ms_ltime(const struct arg *args, struct sample *smp, void *private)
+{
+	struct buffer *temp;
+	time_t curr_date = smp->data.u.sint / 1000; /* convert ms to s */
+	uint64_t ns = (smp->data.u.sint % 1000) * 1000000; /*  ms part to ns */
+
+	/* add offset */
+	if (args[1].type == ARGT_SINT)
+		curr_date += args[1].data.sint;
+
+	temp = conv_time_common(args[0].data.str.area, curr_date, ns, 1);
+	smp->data.u.str = *temp;
+	smp->data.type = SMP_T_STR;
+	return 1;
+}
+
+
 /* takes an UINT value on input supposed to represent the time since EPOCH,
  * adds an optional offset found in args[1] and emits a string representing
  * the local time in the format specified in args[1] using strftime().
@@ -1973,6 +2443,44 @@ static int sample_conv_sdbm(const struct arg *arg_p, struct sample *smp, void *p
 	if (arg_p->data.sint)
 		smp->data.u.sint = full_hash(smp->data.u.sint);
 	smp->data.type = SMP_T_SINT;
+	return 1;
+}
+
+/*
+ * same as sample_conv_utime but input is us and %N is supported
+ */
+static int sample_conv_us_utime(const struct arg *args, struct sample *smp, void *private)
+{
+	struct buffer *temp;
+	time_t curr_date = smp->data.u.sint / 1000000; /* convert us to s */
+	uint64_t ns = (smp->data.u.sint % 1000000) * 1000; /*  us part to ns */
+
+	/* add offset */
+	if (args[1].type == ARGT_SINT)
+		curr_date += args[1].data.sint;
+
+	temp = conv_time_common(args[0].data.str.area, curr_date, ns, 0);
+	smp->data.u.str = *temp;
+	smp->data.type = SMP_T_STR;
+	return 1;
+}
+
+/*
+ * same as sample_conv_utime but input is ms and %N is supported
+ */
+static int sample_conv_ms_utime(const struct arg *args, struct sample *smp, void *private)
+{
+	struct buffer *temp;
+	time_t curr_date = smp->data.u.sint / 1000; /* convert ms to s */
+	uint64_t ns = (smp->data.u.sint % 1000) * 1000000; /*  ms part to ns */
+
+	/* add offset */
+	if (args[1].type == ARGT_SINT)
+		curr_date += args[1].data.sint;
+
+	temp = conv_time_common(args[0].data.str.area, curr_date, ns, 0);
+	smp->data.u.str = *temp;
+	smp->data.type = SMP_T_STR;
 	return 1;
 }
 
@@ -2249,20 +2757,60 @@ static int sample_conv_json(const struct arg *arg_p, struct sample *smp, void *p
  * Optional second arg is the length to truncate */
 static int sample_conv_bytes(const struct arg *arg_p, struct sample *smp, void *private)
 {
-	if (smp->data.u.str.data <= arg_p[0].data.sint) {
-		smp->data.u.str.data = 0;
-		return 1;
+	struct sample smp_arg0, smp_arg1;
+	long long start_idx, length;
+
+	// determine the start_idx and length of the output
+	smp_set_owner(&smp_arg0, smp->px, smp->sess, smp->strm, smp->opt);
+	if (!sample_conv_var2smp_sint(&arg_p[0], &smp_arg0) || smp_arg0.data.u.sint < 0) {
+		/* invalid or negative value */
+		goto fail;
 	}
 
-	if (smp->data.u.str.size)
-			smp->data.u.str.size -= arg_p[0].data.sint;
-	smp->data.u.str.data -= arg_p[0].data.sint;
-	smp->data.u.str.area += arg_p[0].data.sint;
+	if (smp_arg0.data.u.sint >= smp->data.u.str.data) {
+		// arg0 >= the input length
+		if (smp->opt & SMP_OPT_FINAL) {
+			// empty output value on final smp
+			smp->data.u.str.data = 0;
+			goto end;
+		}
+		goto wait;
+	}
+	start_idx = smp_arg0.data.u.sint;
 
-	if ((arg_p[1].type == ARGT_SINT) && (arg_p[1].data.sint < smp->data.u.str.data))
-		smp->data.u.str.data = arg_p[1].data.sint;
+	// length comes from arg1 if present, otherwise it's the remaining length
+	length = smp->data.u.str.data - start_idx;
+	if (arg_p[1].type != ARGT_STOP) {
+		smp_set_owner(&smp_arg1, smp->px, smp->sess, smp->strm, smp->opt);
+		if (!sample_conv_var2smp_sint(&arg_p[1], &smp_arg1) || smp_arg1.data.u.sint < 0) {
+			// invalid or negative value
+			goto fail;
+		}
 
+		if (smp_arg1.data.u.sint > (smp->data.u.str.data - start_idx)) {
+			// arg1 value is greater than the remaining length
+			if (smp->opt & SMP_OPT_FINAL) {
+				// truncate to remaining length
+				length = smp->data.u.str.data - start_idx;
+				goto end;
+			}
+			goto wait;
+		}
+		length = smp_arg1.data.u.sint;
+	}
+
+	// update the output using the start_idx and length
+	smp->data.u.str.area += start_idx;
+	smp->data.u.str.data = length;
+
+  end:
 	return 1;
+
+  fail:
+	smp->flags &= ~SMP_F_MAY_CHANGE;
+  wait:
+	smp->data.u.str.data = 0;
+	return 0;
 }
 
 static int sample_conv_field_check(struct arg *args, struct sample_conv *conv,
@@ -2454,7 +3002,7 @@ static int sample_conv_word(const struct arg *arg_p, struct sample *smp, void *p
 	/* Field not found */
 	if (word != arg_p[0].data.sint) {
 		smp->data.u.str.data = 0;
-		return 1;
+		return 0;
 	}
 found:
 	smp->data.u.str.data = end - start;
@@ -2463,14 +3011,78 @@ found:
 	if (!smp->data.u.str.data)
 		return 1;
 
-	smp->data.u.str.area = start;
 
 	/* Compute remaining size if needed
            Note: smp->data.u.str.size cannot be set to 0 */
 	if (smp->data.u.str.size)
 		smp->data.u.str.size -= start - smp->data.u.str.area;
 
+	smp->data.u.str.area = start;
+
 	return 1;
+}
+
+static int sample_conv_param_check(struct arg *arg, struct sample_conv *conv,
+                                   const char *file, int line, char **err)
+{
+	if (arg[1].type == ARGT_STR && arg[1].data.str.data != 1) {
+		memprintf(err, "Delimiter must be exactly 1 character.");
+		return 0;
+	}
+
+	return 1;
+}
+
+static int sample_conv_param(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	char *pos, *end, *pend, *equal;
+	char delim = '&';
+	const char *name = arg_p[0].data.str.area;
+	size_t name_l = arg_p[0].data.str.data;
+
+	if (arg_p[1].type == ARGT_STR)
+		delim = *arg_p[1].data.str.area;
+
+	pos = smp->data.u.str.area;
+	end = pos + smp->data.u.str.data;
+	while (pos < end) {
+		equal = pos + name_l;
+		/* Parameter not found */
+		if (equal > end)
+			break;
+
+		if (equal == end || *equal == delim) {
+			if (memcmp(pos, name, name_l) == 0) {
+				/* input contains parameter, but no value is supplied */
+				smp->data.u.str.data = 0;
+				return 1;
+			}
+			pos = equal + 1;
+			continue;
+		}
+
+		if (*equal == '=' && memcmp(pos, name, name_l) == 0) {
+			pos = equal + 1;
+			pend = memchr(pos, delim, end - pos);
+			if (pend == NULL)
+				pend = end;
+
+			if (smp->data.u.str.size)
+				smp->data.u.str.size -= pos - smp->data.u.str.area;
+			smp->data.u.str.area = pos;
+			smp->data.u.str.data = pend - pos;
+			return 1;
+		}
+		/* find the next delimiter and set position to character after that */
+		pos = memchr(pos, delim, end - pos);
+		if (pos == NULL)
+			pos = end;
+		else
+			pos++;
+	}
+	/* Parameter not found */
+	smp->data.u.str.data = 0;
+	return 0;
 }
 
 static int sample_conv_regsub_check(struct arg *args, struct sample_conv *conv,
@@ -2599,7 +3211,10 @@ static int check_operator(struct arg *args, struct sample_conv *conv,
 	const char *end;
 	long long int i;
 
-	/* Try to decode a variable. */
+	/* Try to decode a variable. The 'err' variable is intentionnaly left
+	 * NULL since the operators accept an integer as argument in which case
+	 * vars_check_arg call will fail.
+	 */
 	if (vars_check_arg(&args[0], NULL))
 		return 1;
 
@@ -2705,12 +3320,12 @@ static inline long long int arith_add(long long int a, long long int b)
 	 * +------+----------+----------+
 	 */
 	if ((a ^ b) >= 0) {
-		/* signs are different. */
+		/* signs are same. */
 		if (a < 0) {
 			if (LLONG_MIN - a > b)
 				return LLONG_MIN;
 		}
-		if (LLONG_MAX - a < b)
+		else if (LLONG_MAX - a < b)
 			return LLONG_MAX;
 	}
 	return a + b;
@@ -3003,6 +3618,103 @@ static int smp_check_concat(struct arg *args, struct sample_conv *conv,
 	return 1;
 }
 
+/* Append delimiter (only to a non empty input) followed by the optional
+ * variable contents concatenated with the optional sufix.
+ */
+static int sample_conv_add_item(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct buffer *tmpbuf;
+	struct sample tmp;
+	size_t max;
+	int var_available;
+
+	tmpbuf = alloc_trash_chunk();
+	if (!tmpbuf)
+		return 0;
+
+	tmpbuf->data = smp->data.u.str.data;
+	if (tmpbuf->data > tmpbuf->size - 1)
+		tmpbuf->data = tmpbuf->size - 1;
+
+	memcpy(tmpbuf->area, smp->data.u.str.area, tmpbuf->data);
+	tmpbuf->area[tmpbuf->data] = 0;
+
+	/* Check if variable is found and we can turn into a string. */
+	var_available = 0;
+	smp_set_owner(&tmp, smp->px, smp->sess, smp->strm, smp->opt);
+	if (arg_p[1].type == ARGT_VAR && vars_get_by_desc(&arg_p[1].data.var, &tmp, NULL) &&
+	    (sample_casts[tmp.data.type][SMP_T_STR] == c_none ||
+	     sample_casts[tmp.data.type][SMP_T_STR](&tmp)))
+		var_available = 1;
+
+	/* Append delimiter only if input is not empty and either
+	 * the variable or the suffix are not empty
+	 */
+	if (smp->data.u.str.data && ((var_available && tmp.data.u.str.data) ||
+	    arg_p[2].data.str.data)) {
+		max = arg_p[0].data.str.data;
+		if (max > tmpbuf->size - 1 - tmpbuf->data)
+			max = tmpbuf->size - 1 - tmpbuf->data;
+
+		if (max) {
+			memcpy(tmpbuf->area + tmpbuf->data, arg_p[0].data.str.area, max);
+			tmpbuf->data += max;
+			tmpbuf->area[tmpbuf->data] = 0;
+		}
+	}
+
+	/* Append variable contents if variable is found and turned into string. */
+	if (var_available) {
+		max = tmp.data.u.str.data;
+		if (max > tmpbuf->size - 1 - tmpbuf->data)
+			max = tmpbuf->size - 1 - tmpbuf->data;
+
+		if (max) {
+			memcpy(tmpbuf->area + tmpbuf->data, tmp.data.u.str.area, max);
+			tmpbuf->data += max;
+			tmpbuf->area[tmpbuf->data] = 0;
+		}
+	}
+
+	/* Append optional suffix. */
+	max = arg_p[2].data.str.data;
+	if (max > tmpbuf->size - 1 - tmpbuf->data)
+		max = tmpbuf->size - 1 - tmpbuf->data;
+
+	if (max) {
+		memcpy(tmpbuf->area + tmpbuf->data, arg_p[2].data.str.area, max);
+		tmpbuf->data += max;
+		tmpbuf->area[tmpbuf->data] = 0;
+	}
+
+	smp->data.u.str = *tmpbuf;
+	smp->data.type = SMP_T_STR;
+	smp_dup(smp);
+	free_trash_chunk(tmpbuf);
+	return 1;
+}
+
+/* Check the "add_item" converter's arguments and extracts the
+ * variable name and its scope.
+ */
+static int smp_check_add_item(struct arg *args, struct sample_conv *conv,
+                           const char *file, int line, char **err)
+{
+	/* Try to decode a variable. */
+	if (args[1].data.str.data > 0 && !vars_check_arg(&args[1], NULL)) {
+		memprintf(err, "failed to register variable name '%s'",
+			  args[1].data.str.area);
+		return 0;
+	}
+
+	if (args[1].data.str.data == 0 && args[2].data.str.data == 0) {
+		memprintf(err, "one of the optional arguments has to be nonempty");
+		return 0;
+	}
+
+	return 1;
+}
+
 /* Compares string with a variable containing a string. Return value
  * is compatible with strcmp(3)'s return value.
  */
@@ -3035,6 +3747,58 @@ static int sample_conv_strcmp(const struct arg *arg_p, struct sample *smp, void 
 	smp->data.type = SMP_T_SINT;
 	return 1;
 }
+/*
+ * This converter can takes a Host header value as defined by rfc9110#section-7.2
+ * Host = uri-host [ ":" port ] ;
+ * It returns the uri-host value in lowecase with the port stripped.
+ */
+static int sample_conv_host_only(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	/* Working cases: hostname00, hostname00:80, 127.0.0.1, 127.0.0.1:80, [::1], [::1]:80 */
+	char *beg = smp->data.u.str.area;
+	char *end = smp->data.u.str.area + smp->data.u.str.data - 1;
+	char *p;
+
+	for (p = end; p >= beg; p--) {
+		if (*p == ':' || *p == ']')
+			break;
+	}
+
+	if (p >= beg && *p == ':')
+		smp->data.u.str.data = p - beg;
+	/* if no port part was found, the hostname is the whole string */
+
+	smp->data.type = SMP_T_STR;
+
+	return sample_conv_str2lower(arg_p, smp, NULL);
+}
+
+/*
+ * This converter can takes a Host header value as defined by rfc9110#section-7.2
+ * Host = uri-host [ ":" port ] ;
+ * It returns the port value as a int.
+ */
+static int sample_conv_port_only(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	/* Working cases: hostname00, hostname00:80, 127.0.0.1, 127.0.0.1:80, [::1], [::1]:80 */
+	char *beg = smp->data.u.str.area;
+	char *end = smp->data.u.str.area + smp->data.u.str.data - 1;
+	char *p;
+
+	for (p = end; p >= beg; p--) {
+		if (*p == ':' || *p == ']')
+			break;
+	}
+
+	smp->data.type = SMP_T_SINT;
+	if (p >= beg && *p == ':' && ++p <= end) {
+		smp->data.u.sint = strl2ui(p, smp->data.u.str.data + smp->data.u.str.area - p);
+	} else {
+		smp->data.u.sint = 0;
+	}
+	return 1;
+}
+
 
 /* Takes a boolean as input. Returns the first argument if that boolean is true and
  * the second argument otherwise.
@@ -3053,6 +3817,177 @@ static int sample_conv_iif(const struct arg *arg_p, struct sample *smp, void *pr
 		smp->data.u.str.area = arg_p[1].data.str.area;
 	}
 
+	return 1;
+}
+
+enum {
+	WHEN_COND_STOPPING,
+	WHEN_COND_NORMAL,
+	WHEN_COND_ERROR,
+	WHEN_COND_FORWARDED,
+	WHEN_COND_TOAPPLET,
+	WHEN_COND_PROCESSED,
+	WHEN_COND_ACL,
+	WHEN_COND_CONDITIONS
+};
+
+const char *when_cond_kw[WHEN_COND_CONDITIONS] = {
+	[WHEN_COND_STOPPING]    = "stopping",
+	[WHEN_COND_NORMAL]      = "normal",
+	[WHEN_COND_ERROR]       = "error",
+	[WHEN_COND_FORWARDED]	= "forwarded",
+	[WHEN_COND_TOAPPLET]	= "toapplet",
+	[WHEN_COND_PROCESSED]	= "processed",
+	[WHEN_COND_ACL]         = "acl",
+};
+
+/* Evaluates a condition and decides whether or not to pass the input sample
+ * to the output. The purpose is to hide some info when certain conditions are
+ * (not) met. These conditions belong to a fixed list that can verify internal
+ * states (debug mode, too high load, reloading, server down, stream in error
+ * etc). The condition's sign is placed in arg_p[0].data.int. 0=direct, 1=inv.
+ * The condition keyword is in arg_p[1].data.int (WHEN_COND_*).
+ */
+static int sample_conv_when(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct session *sess = smp->sess;
+	struct stream *strm = smp->strm;
+	int neg  = arg_p[0].data.sint;
+	int cond = arg_p[1].data.sint;
+	struct acl_sample *acl_sample;
+	int ret = 0;
+
+	switch (cond) {
+	case WHEN_COND_STOPPING:
+		ret = !!stopping;
+		break;
+
+	case WHEN_COND_NORMAL:
+		neg = !neg;
+		__fallthrough;
+
+	case WHEN_COND_ERROR:
+		if (strm &&
+		    ((strm->flags & SF_REDISP) ||
+		     ((strm->flags & SF_ERR_MASK) > SF_ERR_LOCAL) ||
+		     (((strm->flags & SF_ERR_MASK) == SF_ERR_NONE) && strm->conn_retries) ||
+		     ((sess->fe->mode == PR_MODE_HTTP) && strm->txn && strm->txn->status >= 500)))
+			ret = 1;
+		break;
+
+	case WHEN_COND_FORWARDED: // true if forwarded to a connection
+		ret = !!sc_conn(smp->strm->scb);
+		break;
+
+	case WHEN_COND_TOAPPLET:  // true if handled as an applet
+		ret = !!sc_appctx(smp->strm->scb);
+		break;
+
+	case WHEN_COND_PROCESSED: // true if forwarded or appctx
+		ret = sc_conn(smp->strm->scb) || sc_appctx(smp->strm->scb);
+		break;
+
+	case WHEN_COND_ACL: // true if the ACL pointed to by args[2] evaluates to true
+		acl_sample = arg_p[2].data.ptr;
+		ret = acl_exec_cond(&acl_sample->cond, smp->px, smp->sess, smp->strm, smp->opt) == ACL_TEST_PASS;
+		break;
+	}
+
+	ret = !!ret ^ !!neg;
+	if (!ret) {
+		/* kill the sample */
+		return 0;
+	}
+
+	/* pass the sample as-is */
+	return 1;
+}
+
+/* checks and resolves the type of the argument passed to when().
+ * It supports an optional '!' to negate the condition, followed by
+ * a keyword among the list above. Note that we're purposely declaring
+ * one extra arg because the first one will be split into two.
+ */
+static int check_when_cond(struct arg *args, struct sample_conv *conv,
+                             const char *file, int line, char **err)
+{
+	struct acl_sample *acl_sample;
+	const char *kw;
+	int neg = 0;
+	int i;
+
+	kw = args[0].data.str.area;
+	if (*kw == '!') {
+		kw++;
+		neg = 1;
+	}
+
+	for (i = 0; i < WHEN_COND_CONDITIONS; i++) {
+		if (strcmp(kw, when_cond_kw[i]) == 0)
+			break;
+	}
+
+	if (i == WHEN_COND_CONDITIONS) {
+		memprintf(err, "expects a supported keyword among {");
+		for (i = 0; i < WHEN_COND_CONDITIONS; i++)
+			memprintf(err, "%s%s%s", *err, when_cond_kw[i],  (i == WHEN_COND_CONDITIONS - 1) ? "}" : ",");
+		memprintf(err, "%s but got '%s'", *err, kw);
+		return 0;
+	}
+
+	if (i == WHEN_COND_ACL) {
+		if (args[1].type != ARGT_STR || !*args[1].data.str.area) {
+			memprintf(err, "'acl' selector requires an extra argument with the ACL name");
+			return 0;
+		}
+
+		if (!curproxy) {
+			memprintf(err, "'acl' selector may only be used in the context of a proxy");
+			return 0;
+		}
+
+		acl_sample = calloc(1, sizeof(struct acl_sample) + sizeof(struct acl_term));
+		if (!acl_sample) {
+			memprintf(err, "not enough memory for 'acl' selector");
+			return 0;
+		}
+
+		LIST_INIT(&acl_sample->suite.terms);
+		LIST_INIT(&acl_sample->cond.suites);
+		LIST_APPEND(&acl_sample->cond.suites, &acl_sample->suite.list);
+		LIST_APPEND(&acl_sample->suite.terms, &acl_sample->terms[0].list);
+		acl_sample->cond.val = ~0U; // the keyword is valid everywhere for now.
+
+		/* build one term based on the ACL kw */
+		if (!(acl_sample->terms[0].acl = find_acl_by_name(args[1].data.str.area, &curproxy->acl)) &&
+		    !(acl_sample->terms[0].acl = find_acl_default(args[1].data.str.area, &curproxy->acl, err, NULL, NULL, 0))) {
+			memprintf(err, "ACL '%s' not found", args[1].data.str.area);
+			return 0;
+		}
+
+		acl_sample->cond.use |= acl_sample->terms[0].acl->use;
+		acl_sample->cond.val &= acl_sample->terms[0].acl->val;
+
+		args[2].type = ARGT_PTR;
+		args[2].unresolved = 0;
+		args[2].resolve_ptr = NULL;
+		args[2].data.ptr = acl_sample;
+	}
+
+	chunk_destroy(&args[0].data.str);
+	if (args[1].type == ARGT_STR)
+		chunk_destroy(&args[1].data.str);
+
+	if (args[2].type == ARGT_STR)
+		chunk_destroy(&args[2].data.str);
+
+	// store condition
+	args[0].type = ARGT_SINT;
+	args[0].data.sint = neg; // '!' present
+
+	// and keyword
+	args[1].type = ARGT_SINT;
+	args[1].data.sint = i;
 	return 1;
 }
 
@@ -3077,7 +4012,7 @@ static int sample_conv_ungrpc(const struct arg *arg_p, struct sample *smp, void 
 	while (grpc_left > GRPC_MSG_HEADER_SZ) {
 		size_t grpc_msg_len, left;
 
-		grpc_msg_len = left = ntohl(*(uint32_t *)(pos + GRPC_MSG_COMPRESS_FLAG_SZ));
+		grpc_msg_len = left = ntohl(read_u32(pos + GRPC_MSG_COMPRESS_FLAG_SZ));
 
 		pos += GRPC_MSG_HEADER_SZ;
 		grpc_left -= GRPC_MSG_HEADER_SZ;
@@ -3490,8 +4425,15 @@ static int sample_conv_json_query(const struct arg *args, struct sample *smp, vo
 
 			return 1;
 		}
+               case MJSON_TOK_ARRAY: {
+                       // We copy the complete array, including square brackets into the return buffer
+                       // result looks like: ["manage-account","manage-account-links","view-profile"]
+                       trash->data = b_putblk(trash, token, token_size);
+                       smp->data.u.str = *trash;
+                       smp->data.type = SMP_T_STR;
+                       return 1;
+               }
 		case MJSON_TOK_NULL:
-		case MJSON_TOK_ARRAY:
 		case MJSON_TOK_OBJECT:
 			/* We cannot handle these. */
 			return 0;
@@ -3514,30 +4456,31 @@ static int sample_conv_json_query(const struct arg *args, struct sample *smp, vo
 static int sample_conv_jwt_verify_check(struct arg *args, struct sample_conv *conv,
 					const char *file, int line, char **err)
 {
+	enum jwt_alg alg = JWT_ALG_DEFAULT;
+
 	vars_check_arg(&args[0], NULL);
 	vars_check_arg(&args[1], NULL);
 
 	if (args[0].type == ARGT_STR) {
-		enum jwt_alg alg = jwt_parse_alg(args[0].data.str.area, args[0].data.str.data);
+		alg = jwt_parse_alg(args[0].data.str.area, args[0].data.str.data);
 
-		switch(alg) {
-		case JWT_ALG_DEFAULT:
+		if (alg == JWT_ALG_DEFAULT) {
 			memprintf(err, "unknown JWT algorithm: %s", args[0].data.str.area);
 			return 0;
-
-		case JWS_ALG_PS256:
-		case JWS_ALG_PS384:
-		case JWS_ALG_PS512:
-			memprintf(err, "RSASSA-PSS JWS signing not managed yet");
-			return 0;
-
-		default:
-			break;
 		}
 	}
 
 	if (args[1].type == ARGT_STR) {
-		jwt_tree_load_cert(args[1].data.str.area, args[1].data.str.data, err);
+		switch (alg) {
+			JWS_ALG_HS256:
+			JWS_ALG_HS384:
+			JWS_ALG_HS512:
+			/* don't try to load a file with HMAC algorithms */
+				break;
+			default:
+				jwt_tree_load_cert(args[1].data.str.area, args[1].data.str.data, err);
+				break;
+		}
 	}
 
 	return 1;
@@ -3547,9 +4490,7 @@ static int sample_conv_jwt_verify_check(struct arg *args, struct sample_conv *co
 static int sample_conv_jwt_verify(const struct arg *args, struct sample *smp, void *private)
 {
 	struct sample alg_smp, key_smp;
-
-	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = 0;
+	enum jwt_vrfy_status ret;
 
 	smp_set_owner(&alg_smp, smp->px, smp->sess, smp->strm, smp->opt);
 	smp_set_owner(&key_smp, smp->px, smp->sess, smp->strm, smp->opt);
@@ -3558,9 +4499,10 @@ static int sample_conv_jwt_verify(const struct arg *args, struct sample *smp, vo
 	if (!sample_conv_var2smp_str(&args[1], &key_smp))
 		return 0;
 
-	smp->data.u.sint = jwt_verify(&smp->data.u.str,  &alg_smp.data.u.str,
-				      &key_smp.data.u.str);
+	ret = jwt_verify(&smp->data.u.str,  &alg_smp.data.u.str, &key_smp.data.u.str);
 
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = ret;
 	return 1;
 }
 
@@ -3582,10 +4524,6 @@ static int sample_conv_jwt_member_query(const struct arg *args, struct sample *s
 	jwt_tokenize(&smp->data.u.str, items, &item_num);
 
 	if (item_num < member + 1)
-		goto end;
-
-	decoded_header = alloc_trash_chunk();
-	if (!decoded_header)
 		goto end;
 
 	ret = base64urldec(items[member].start, items[member].length,
@@ -3654,6 +4592,17 @@ static int sample_conv_jwt_payload_query(const struct arg *args, struct sample *
 /************************************************************************/
 /*       All supported sample fetch functions must be declared here     */
 /************************************************************************/
+
+
+/* returns the actconn */
+static int
+smp_fetch_actconn(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = actconn;
+	return 1;
+}
+
 
 /* force TRUE to be returned at the fetch level */
 static int
@@ -3793,6 +4742,16 @@ smp_fetch_nbproc(const struct arg *args, struct sample *smp, const char *kw, voi
 	return 1;
 }
 
+/* returns the PID of the current process */
+static int
+smp_fetch_pid(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = pid;
+	return 1;
+}
+
+
 /* returns the number of the current process (between 1 and nbproc */
 static int
 smp_fetch_proc(const struct arg *args, struct sample *smp, const char *kw, void *private)
@@ -3817,7 +4776,7 @@ smp_fetch_thread(const struct arg *args, struct sample *smp, const char *kw, voi
 static int
 smp_fetch_rand(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	smp->data.u.sint = ha_random32();
+	smp->data.u.sint = statistical_prng();
 
 	/* reduce if needed. Don't do a modulo, use all bits! */
 	if (args[0].type == ARGT_SINT)
@@ -3857,7 +4816,7 @@ smp_fetch_cpu_ns_avg(const struct arg *args, struct sample *smp, const char *kw,
 		return 0;
 
 	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = smp->strm->task->calls ? smp->strm->task->cpu_time / smp->strm->task->calls : 0;
+	smp->data.u.sint = smp->strm->task->calls ? smp->strm->cpu_time / smp->strm->task->calls : 0;
 	return 1;
 }
 
@@ -3869,7 +4828,7 @@ smp_fetch_cpu_ns_tot(const struct arg *args, struct sample *smp, const char *kw,
 		return 0;
 
 	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = smp->strm->task->cpu_time;
+	smp->data.u.sint = smp->strm->cpu_time;
 	return 1;
 }
 
@@ -3881,7 +4840,7 @@ smp_fetch_lat_ns_avg(const struct arg *args, struct sample *smp, const char *kw,
 		return 0;
 
 	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = smp->strm->task->calls ? smp->strm->task->lat_time / smp->strm->task->calls : 0;
+	smp->data.u.sint = smp->strm->task->calls ? smp->strm->lat_time / smp->strm->task->calls : 0;
 	return 1;
 }
 
@@ -3893,7 +4852,7 @@ smp_fetch_lat_ns_tot(const struct arg *args, struct sample *smp, const char *kw,
 		return 0;
 
 	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = smp->strm->task->lat_time;
+	smp->data.u.sint = smp->strm->lat_time;
 	return 1;
 }
 
@@ -3988,7 +4947,7 @@ static int smp_check_const_meth(struct arg *args, char **err)
 		args[0].type = ARGT_SINT;
 		args[0].data.sint = meth;
 	} else {
-		/* Check method avalaibility. A method is a token defined as :
+		/* Check method availability. A method is a token defined as :
 		 * tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
 		 *         "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
 		 * token = 1*tchar
@@ -4027,36 +4986,345 @@ static int smp_check_uuid(struct arg *args, char **err)
 	if (!args[0].type) {
 		args[0].type = ARGT_SINT;
 		args[0].data.sint = 4;
-	}
-	else if (args[0].data.sint != 4) {
-		memprintf(err, "Unsupported UUID version: '%lld'", args[0].data.sint);
-		return 0;
+	} else {
+		switch (args[0].data.sint) {
+		case 4:
+		case 7:
+			break;
+		default:
+			memprintf(err, "Unsupported UUID version: '%lld'", args[0].data.sint);
+			return 0;
+		}
 	}
 
 	return 1;
 }
 
-// Generate a RFC4122 UUID (default is v4 = fully random)
+// Generate a RFC 9562 UUID (default is v4 = fully random)
 static int smp_fetch_uuid(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	if (args[0].data.sint == 4 || !args[0].type) {
-		ha_generate_uuid(&trash);
-		smp->data.type = SMP_T_STR;
-		smp->flags = SMP_F_VOL_TEST | SMP_F_MAY_CHANGE;
-		smp->data.u.str = trash;
-		return 1;
+	long long int type = -1;
+
+	if (!args[0].type) {
+		type = 4;
+	} else {
+		type = args[0].data.sint;
 	}
 
-	// more implementations of other uuid formats possible here
+	switch (type) {
+	case 4:
+		ha_generate_uuid_v4(&trash);
+		break;
+	case 7:
+		ha_generate_uuid_v7(&trash);
+		break;
+	default:
+		return 0;
+	}
+
+	smp->data.type = SMP_T_STR;
+	smp->flags = SMP_F_VOL_TEST | SMP_F_MAY_CHANGE;
+	smp->data.u.str = trash;
+	return 1;
+}
+
+/* returns the uptime in seconds */
+static int
+smp_fetch_uptime(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = ns_to_sec(now_ns - start_time_ns);
+	return 1;
+}
+
+
+/* Check if QUIC support was compiled and was not disabled by "no-quic" global option */
+static int smp_fetch_quic_enabled(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	smp->data.type = SMP_T_BOOL;
+	smp->flags = 0;
+#ifdef USE_QUIC
+	smp->data.u.sint = !(global.tune.options & GTUNE_NO_QUIC);
+#else
+	smp->data.u.sint = 0;
+#endif
+	return smp->data.u.sint;
+}
+
+/* Timing events re{q,s}.timer.  */
+static int smp_fetch_reX_timers(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct strm_logs *logs;
+	int t_request = -1;
+
+	if (!smp->strm)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->flags = 0;
+
+	logs = &smp->strm->logs;
+
+
+	if ((llong)(logs->request_ts - logs->accept_ts) >= 0)
+		t_request = ns_to_ms(logs->request_ts - logs->accept_ts);
+
+	/* req.timer. */
+	if (kw[2] == 'q') {
+
+		switch (kw[10]) {
+
+			/* req.timer.idle (%Ti)  */
+			case 'i':
+				smp->data.u.sint = logs->t_idle;
+				break;
+
+			/* req.timer.tq (%Tq) */
+			case 't':
+				smp->data.u.sint = t_request;
+				break;
+
+			/* req.timer.hdr (%TR) */
+			case 'h':
+				smp->data.u.sint = (t_request >= 0) ? t_request - logs->t_idle - logs->t_handshake : -1;
+				break;
+
+			/* req.timer.queue (%Tw) */
+			case 'q':
+				smp->data.u.sint = (logs->t_queue >= 0) ? logs->t_queue - t_request : -1;
+				break;
+
+			default:
+				goto error;
+
+		}
+	} else {
+		/* res.timer. */
+		switch (kw[10]) {
+			/* res.timer.hdr (%Tr) */
+			case 'h':
+				smp->data.u.sint = (logs->t_data >= 0) ? logs->t_data - logs->t_connect : -1;
+			break;
+
+			/* res.timer.data (%Td) */
+			case 'd':
+				smp->data.u.sint = (logs->t_data >= 0) ? logs->t_close - logs->t_data : -1;
+			break;
+
+			default:
+				goto error;
+
+		}
+
+	}
+
+		return 1;
+error:
+
+		return 0;
+	}
+
+
+/* Timing events  txn. */
+static int smp_fetch_txn_timers(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct strm_logs *logs;
+
+	if (!smp->strm)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->flags = 0;
+
+	logs = &smp->strm->logs;
+
+	/* txn.timer. */
+	switch (kw[10]) {
+
+		/* txn.timer.total (%Ta) */
+		case 't':
+			smp->data.u.sint = logs->t_close - (logs->t_idle >= 0 ? logs->t_idle + logs->t_handshake : 0);
+		break;
+
+
+		/* txn.timer.user (%Tu) */
+		case 'u':
+			smp->data.u.sint = logs->t_close - (logs->t_idle >= 0 ? logs->t_idle : 0);
+		break;
+
+		default:
+			goto error;
+
+	}
+
+	return 1;
+error:
+
 	return 0;
 }
 
+/* Server conn queueing infos - bc_{be,srv}_queue */
+static int smp_fetch_conn_queues(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct strm_logs *logs;
+
+	if (!smp->strm)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->flags = 0;
+
+	logs = &smp->strm->logs;
+
+	if (kw[3] == 'b') {
+		/* bc_be_queue */
+		smp->data.u.sint = logs->prx_queue_pos;
+	}
+	else {
+		/* bc_srv_queue */
+		smp->data.u.sint = logs->srv_queue_pos;
+	}
+	return 1;
+}
+
+/* Timing events {f,bc}.timer.  */
+static int smp_fetch_conn_timers(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct strm_logs *logs;
+
+	if (!smp->strm)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->flags = 0;
+
+	logs = &smp->strm->logs;
+
+	if (kw[0] == 'b') {
+		/* fc.timer. */
+		switch (kw[9]) {
+
+			/* bc.timer.connect (%Tc) */
+			case 'c':
+				smp->data.u.sint = (logs->t_connect >= 0) ? logs->t_connect - logs->t_queue : -1;
+				break;
+
+			default:
+				goto error;
+		}
+
+	} else {
+
+		/* fc.timer. */
+		switch (kw[9]) {
+
+			/* fc.timer.handshake (%Th) */
+			case 'h':
+				smp->data.u.sint = logs->t_handshake;
+				break;
+
+			/* fc,timer.total (%Tt) */
+			case 't':
+				smp->data.u.sint = logs->t_close;
+				break;
+
+			default:
+				goto error;
+		}
+
+	}
+
+	return 1;
+error:
+
+	return 0;
+}
+
+/* bytes_{in,out} */
+static int smp_fetch_bytes(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct strm_logs *logs;
+
+	if (!smp->strm)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->flags = 0;
+
+	logs = &smp->strm->logs;
+	if (!logs)
+		return 0;
+
+	if (kw[6] == 'i') { /* bytes_in */
+		smp->data.u.sint = logs->bytes_in;
+	} else { /* bytes_out */
+		smp->data.u.sint = logs->bytes_out;
+	}
+
+	return 1;
+}
+
+static int sample_conv_bytes_check(struct arg *args, struct sample_conv *conv,
+                          const char *file, int line, char **err)
+{
+	// arg0 is not optional, must be >= 0
+	if (!check_operator(&args[0], conv, file, line, err)) {
+		return 0;
+	}
+	if (args[0].type != ARGT_VAR) {
+		if (args[0].type != ARGT_SINT || args[0].data.sint < 0) {
+			memprintf(err, "expects a non-negative integer");
+			return 0;
+		}
+	}
+	// arg1 is optional, must be > 0
+	if (args[1].type != ARGT_STOP) {
+		if (!check_operator(&args[1], conv, file, line, err)) {
+			return 0;
+		}
+		if (args[1].type != ARGT_VAR) {
+			if (args[1].type != ARGT_SINT || args[1].data.sint <= 0) {
+				memprintf(err, "expects a positive integer");
+				return 0;
+			}
+		}
+	}
+
+	return 1;
+}
+
+static struct sample_fetch_kw_list smp_logs_kws = {ILH, {
+	{ "bytes_in",             smp_fetch_bytes,        0,         NULL, SMP_T_SINT, SMP_USE_INTRN },
+	{ "bytes_out",            smp_fetch_bytes,        0,         NULL, SMP_T_SINT, SMP_USE_INTRN },
+
+	{ "txn.timer.total",      smp_fetch_txn_timers,   0,         NULL, SMP_T_SINT, SMP_USE_TXFIN }, /* "Ta" */
+	{ "txn.timer.user",       smp_fetch_txn_timers,   0,         NULL, SMP_T_SINT, SMP_USE_TXFIN }, /* "Tu" */
+
+	{ "bc.timer.connect",     smp_fetch_conn_timers,  0,         NULL, SMP_T_SINT, SMP_USE_L4SRV }, /* "Tc" */
+	{ "bc_be_queue",          smp_fetch_conn_queues,  0,         NULL, SMP_T_SINT, SMP_USE_L4SRV }, /* "bq" */
+	{ "bc_srv_queue",         smp_fetch_conn_queues,  0,         NULL, SMP_T_SINT, SMP_USE_L4SRV }, /* "sq" */
+
+	{ "fc.timer.handshake",   smp_fetch_conn_timers,  0,         NULL, SMP_T_SINT, SMP_USE_L4CLI }, /* "Th" */
+	{ "fc.timer.total",       smp_fetch_conn_timers,  0,         NULL, SMP_T_SINT, SMP_USE_SSFIN }, /* "Tt" */
+
+	{ "req.timer.idle",       smp_fetch_reX_timers,   0,         NULL, SMP_T_SINT, SMP_USE_HRQHV }, /* "Ti" */
+	{ "req.timer.tq",         smp_fetch_reX_timers,   0,         NULL, SMP_T_SINT, SMP_USE_HRQHV }, /* "Tq" */
+	{ "req.timer.hdr",        smp_fetch_reX_timers,   0,         NULL, SMP_T_SINT, SMP_USE_HRQHV }, /* "TR" */
+	{ "req.timer.queue",      smp_fetch_reX_timers,   0,         NULL, SMP_T_SINT, SMP_USE_L4SRV }, /* "Tw" */
+	{ "res.timer.data",       smp_fetch_reX_timers,   0,         NULL, SMP_T_SINT, SMP_USE_RSFIN }, /* "Td" */
+	{ "res.timer.hdr",        smp_fetch_reX_timers,   0,         NULL, SMP_T_SINT, SMP_USE_HRSHV }, /* "Tr" */
+	{ /* END */ },
+}};
+
+INITCALL1(STG_REGISTER, sample_register_fetches, &smp_logs_kws);
+
 /* Note: must not be declared <const> as its list will be overwritten.
- * Note: fetches that may return multiple types must be declared as the lowest
- * common denominator, the type that can be casted into all other ones. For
- * instance IPv4/IPv6 must be declared IPv4.
+ * Note: fetches that may return multiple types should be declared using the
+ * appropriate pseudo-type. If not available it must be declared as the lowest
+ * common denominator, the type that can be casted into all other ones.
  */
 static struct sample_fetch_kw_list smp_kws = {ILH, {
+	{ "act_conn",     smp_fetch_actconn, 0,          NULL, SMP_T_SINT, SMP_USE_CONST },
 	{ "always_false", smp_fetch_false, 0,            NULL, SMP_T_BOOL, SMP_USE_CONST },
 	{ "always_true",  smp_fetch_true,  0,            NULL, SMP_T_BOOL, SMP_USE_CONST },
 	{ "env",          smp_fetch_env,   ARG1(1,STR),  NULL, SMP_T_STR,  SMP_USE_CONST },
@@ -4064,10 +5332,13 @@ static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ "date_us",      smp_fetch_date_us,  0,         NULL, SMP_T_SINT, SMP_USE_CONST },
 	{ "hostname",     smp_fetch_hostname, 0,         NULL, SMP_T_STR,  SMP_USE_CONST },
 	{ "nbproc",       smp_fetch_nbproc,0,            NULL, SMP_T_SINT, SMP_USE_CONST },
+	{ "pid",          smp_fetch_pid,   0,            NULL, SMP_T_SINT, SMP_USE_CONST },
 	{ "proc",         smp_fetch_proc,  0,            NULL, SMP_T_SINT, SMP_USE_CONST },
+	{ "quic_enabled", smp_fetch_quic_enabled, 0,     NULL, SMP_T_BOOL, SMP_USE_CONST },
 	{ "thread",       smp_fetch_thread,  0,          NULL, SMP_T_SINT, SMP_USE_CONST },
 	{ "rand",         smp_fetch_rand,  ARG1(0,SINT), NULL, SMP_T_SINT, SMP_USE_CONST },
 	{ "stopping",     smp_fetch_stopping, 0,         NULL, SMP_T_BOOL, SMP_USE_INTRN },
+	{ "uptime",       smp_fetch_uptime,   0,         NULL, SMP_T_SINT, SMP_USE_CONST },
 	{ "uuid",         smp_fetch_uuid,  ARG1(0, SINT),      smp_check_uuid, SMP_T_STR, SMP_USE_CONST },
 
 	{ "cpu_calls",    smp_fetch_cpu_calls,  0,       NULL, SMP_T_SINT, SMP_USE_INTRN },
@@ -4091,9 +5362,11 @@ INITCALL1(STG_REGISTER, sample_register_fetches, &smp_kws);
 
 /* Note: must not be declared <const> as its list will be overwritten */
 static struct sample_conv_kw_list sample_conv_kws = {ILH, {
-	{ "debug",   sample_conv_debug,        ARG2(0,STR,STR),       smp_check_debug,          SMP_T_ANY,  SMP_T_ANY  },
+	{ "add_item",sample_conv_add_item,     ARG3(2,STR,STR,STR),   smp_check_add_item,       SMP_T_STR,  SMP_T_STR  },
+	{ "debug",   sample_conv_debug,        ARG2(0,STR,STR),       smp_check_debug,          SMP_T_ANY,  SMP_T_SAME },
 	{ "b64dec",  sample_conv_base642bin,   0,                     NULL,                     SMP_T_STR,  SMP_T_BIN  },
 	{ "base64",  sample_conv_bin2base64,   0,                     NULL,                     SMP_T_BIN,  SMP_T_STR  },
+	{ "concat",  sample_conv_concat,       ARG3(1,STR,STR,STR),   smp_check_concat,         SMP_T_STR,  SMP_T_STR  },
 	{ "ub64enc", sample_conv_bin2base64url,0,                     NULL,                     SMP_T_BIN,  SMP_T_STR  },
 	{ "ub64dec", sample_conv_base64url2bin,0,                     NULL,                     SMP_T_STR,  SMP_T_BIN  },
 	{ "upper",   sample_conv_str2upper,    0,                     NULL,                     SMP_T_STR,  SMP_T_STR  },
@@ -4103,9 +5376,13 @@ static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "be2hex",  sample_conv_be2hex,       ARG3(1,STR,SINT,SINT), sample_conv_be2hex_check, SMP_T_BIN,  SMP_T_STR  },
 	{ "hex",     sample_conv_bin2hex,      0,                     NULL,                     SMP_T_BIN,  SMP_T_STR  },
 	{ "hex2i",   sample_conv_hex2int,      0,                     NULL,                     SMP_T_STR,  SMP_T_SINT },
-	{ "ipmask",  sample_conv_ipmask,       ARG2(1,MSK4,MSK6),     NULL,                     SMP_T_ADDR, SMP_T_IPV4 },
+	{ "ipmask",  sample_conv_ipmask,       ARG2(1,MSK4,MSK6),     NULL,                     SMP_T_ADDR, SMP_T_ADDR },
 	{ "ltime",   sample_conv_ltime,        ARG2(1,STR,SINT),      NULL,                     SMP_T_SINT, SMP_T_STR  },
+	{ "ms_ltime",   sample_conv_ms_ltime,        ARG2(1,STR,SINT),      NULL,                     SMP_T_SINT, SMP_T_STR  },
+	{ "us_ltime",   sample_conv_us_ltime,        ARG2(1,STR,SINT),      NULL,                     SMP_T_SINT, SMP_T_STR  },
 	{ "utime",   sample_conv_utime,        ARG2(1,STR,SINT),      NULL,                     SMP_T_SINT, SMP_T_STR  },
+	{ "ms_utime",   sample_conv_ms_utime,        ARG2(1,STR,SINT),      NULL,                     SMP_T_SINT, SMP_T_STR  },
+	{ "us_utime",   sample_conv_us_utime,        ARG2(1,STR,SINT),      NULL,                     SMP_T_SINT, SMP_T_STR  },
 	{ "crc32",   sample_conv_crc32,        ARG1(0,SINT),          NULL,                     SMP_T_BIN,  SMP_T_SINT },
 	{ "crc32c",  sample_conv_crc32c,       ARG1(0,SINT),          NULL,                     SMP_T_BIN,  SMP_T_SINT },
 	{ "djb2",    sample_conv_djb2,         ARG1(0,SINT),          NULL,                     SMP_T_BIN,  SMP_T_SINT },
@@ -4115,13 +5392,15 @@ static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "xxh32",   sample_conv_xxh32,        ARG1(0,SINT),          NULL,                     SMP_T_BIN,  SMP_T_SINT },
 	{ "xxh64",   sample_conv_xxh64,        ARG1(0,SINT),          NULL,                     SMP_T_BIN,  SMP_T_SINT },
 	{ "json",    sample_conv_json,         ARG1(1,STR),           sample_conv_json_check,   SMP_T_STR,  SMP_T_STR  },
-	{ "bytes",   sample_conv_bytes,        ARG2(1,SINT,SINT),     NULL,                     SMP_T_BIN,  SMP_T_BIN  },
+	{ "bytes",   sample_conv_bytes,        ARG2(1,STR,STR),       sample_conv_bytes_check,  SMP_T_BIN,  SMP_T_BIN  },
 	{ "field",   sample_conv_field,        ARG3(2,SINT,STR,SINT), sample_conv_field_check,  SMP_T_STR,  SMP_T_STR  },
 	{ "word",    sample_conv_word,         ARG3(2,SINT,STR,SINT), sample_conv_field_check,  SMP_T_STR,  SMP_T_STR  },
+	{ "param",   sample_conv_param,        ARG2(1,STR,STR),       sample_conv_param_check,  SMP_T_STR,  SMP_T_STR  },
 	{ "regsub",  sample_conv_regsub,       ARG3(2,REG,STR,STR),   sample_conv_regsub_check, SMP_T_STR,  SMP_T_STR  },
 	{ "sha1",    sample_conv_sha1,         0,                     NULL,                     SMP_T_BIN,  SMP_T_BIN  },
-	{ "concat",  sample_conv_concat,       ARG3(1,STR,STR,STR),   smp_check_concat,         SMP_T_STR,  SMP_T_STR  },
 	{ "strcmp",  sample_conv_strcmp,       ARG1(1,STR),           smp_check_strcmp,         SMP_T_STR,  SMP_T_SINT },
+	{ "host_only", sample_conv_host_only,  0,                     NULL,                     SMP_T_STR,  SMP_T_STR  },
+	{ "port_only", sample_conv_port_only,  0,                     NULL,                     SMP_T_STR,  SMP_T_SINT },
 
 	/* gRPC converters. */
 	{ "ungrpc", sample_conv_ungrpc,    ARG2(1,PBUF_FNUM,STR), sample_conv_protobuf_check, SMP_T_BIN, SMP_T_BIN  },
@@ -4164,6 +5443,7 @@ static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "jwt_payload_query", sample_conv_jwt_payload_query, ARG2(0,STR,STR), sample_conv_jwt_query_check,   SMP_T_BIN, SMP_T_ANY },
 	{ "jwt_verify",        sample_conv_jwt_verify,        ARG2(2,STR,STR), sample_conv_jwt_verify_check,  SMP_T_BIN, SMP_T_SINT },
 #endif
+	{ "when",              sample_conv_when,              ARG3(1,STR,STR,STR), check_when_cond,               SMP_T_ANY, SMP_T_ANY  },
 	{ NULL, NULL, 0, 0, 0 },
 }};
 

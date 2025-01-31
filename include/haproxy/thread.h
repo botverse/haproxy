@@ -43,8 +43,11 @@ int parse_nbthread(const char *arg, char **err);
 void ha_tkill(unsigned int thr, int sig);
 void ha_tkillall(int sig);
 void ha_thread_relax(void);
+int thread_detect_binding_discrepancies(void);
+int thread_detect_more_than_cpus(void);
 int thread_map_to_groups();
-int thread_resolve_group_mask(uint igid, ulong imask, uint *ogid, ulong *omask, char **err);
+int thread_resolve_group_mask(struct thread_set *ts, int defgrp, char **err);
+int parse_thread_set(const char *arg, struct thread_set *ts, char **err);
 extern int thread_cpus_enabled_at_boot;
 
 
@@ -55,11 +58,7 @@ extern int thread_cpus_enabled_at_boot;
 /* Only way found to replace variables with constants that are optimized away
  * at build time.
  */
-enum { all_threads_mask = 1UL };
-enum { threads_harmless_mask = 0 };
-enum { threads_idle_mask = 0 };
-enum { threads_sync_mask = 0 };
-enum { threads_want_rdv_mask = 0 };
+enum { all_tgroups_mask = 1UL };
 enum { tid_bit = 1UL };
 enum { tid = 0 };
 enum { tgid = 1 };
@@ -119,7 +118,16 @@ static inline void thread_harmless_now()
 {
 }
 
+static inline int is_thread_harmless()
+{
+	return 1;
+}
+
 static inline void thread_harmless_end()
+{
+}
+
+static inline void thread_harmless_end_sig()
 {
 }
 
@@ -132,10 +140,6 @@ static inline void thread_isolate_full()
 }
 
 static inline void thread_release()
-{
-}
-
-static inline void thread_sync_release()
 {
 }
 
@@ -165,13 +169,13 @@ static inline unsigned long long ha_get_pthread_id(unsigned int thr)
 
 /********************** THREADS ENABLED ************************/
 
+#define PLOCK_LORW_INLINE_WAIT
 #include <import/plock.h>
 
 void thread_harmless_till_end(void);
 void thread_isolate(void);
 void thread_isolate_full(void);
 void thread_release(void);
-void thread_sync_release(void);
 void ha_spin_init(HA_SPINLOCK_T *l);
 void ha_rwlock_init(HA_RWLOCK_T *l);
 void setup_extra_threads(void *(*handler)(void *));
@@ -179,40 +183,11 @@ void wait_for_threads_completion();
 void set_thread_cpu_affinity();
 unsigned long long ha_get_pthread_id(unsigned int thr);
 
-extern volatile unsigned long all_threads_mask;
-extern volatile unsigned long threads_harmless_mask;
-extern volatile unsigned long threads_idle_mask;
-extern volatile unsigned long threads_sync_mask;
-extern volatile unsigned long threads_want_rdv_mask;
-extern THREAD_LOCAL unsigned long tid_bit; /* The bit corresponding to the thread id */
+extern volatile unsigned long all_tgroups_mask;
+extern volatile unsigned int rdv_requests;
+extern volatile unsigned int isolated_thread;
 extern THREAD_LOCAL unsigned int tid;      /* The thread id */
 extern THREAD_LOCAL unsigned int tgid;     /* The thread group id (starts at 1) */
-
-/* explanation for threads_want_rdv_mask, threads_harmless_mask, and
- * threads_sync_mask :
- * - threads_want_rdv_mask is a bit field indicating all threads that have
- *   requested a rendez-vous of other threads using thread_isolate().
- * - threads_harmless_mask is a bit field indicating all threads that are
- *   currently harmless in that they promise not to access a shared resource.
- * - threads_sync_mask is a bit field indicating that a thread waiting for
- *   others to finish wants to leave synchronized with others and as such
- *   promises to do so as well using thread_sync_release().
- *
- * For a given thread, its bits in want_rdv and harmless can be translated like
- * this :
- *
- *  ----------+----------+----------------------------------------------------
- *   want_rdv | harmless | description
- *  ----------+----------+----------------------------------------------------
- *       0    |     0    | thread not interested in RDV, possibly harmful
- *       0    |     1    | thread not interested in RDV but harmless
- *       1    |     1    | thread interested in RDV and waiting for its turn
- *       1    |     0    | thread currently working isolated from others
- *  ----------+----------+----------------------------------------------------
- *
- * thread_sync_mask only delays the leaving of threads_sync_release() to make
- * sure that each thread's harmless bit is cleared before leaving the function.
- */
 
 #define ha_sigmask(how, set, oldset)  pthread_sigmask(how, set, oldset)
 
@@ -223,23 +198,23 @@ extern THREAD_LOCAL unsigned int tgid;     /* The thread group id (starts at 1) 
 static inline void ha_set_thread(const struct thread_info *thr)
 {
 	if (thr) {
-		BUG_ON(!thr->tid_bit);
+		BUG_ON(!thr->ltid_bit);
 		BUG_ON(!thr->tg);
-		BUG_ON(!thr->tg->tgid);
+		BUG_ON(!thr->tgid);
 
 		ti      = thr;
 		tg      = thr->tg;
 		tid     = thr->tid;
-		tid_bit = thr->tid_bit;
+		tgid    = thr->tgid;
 		th_ctx  = &ha_thread_ctx[tid];
-		tgid    = tg->tgid;
+		tg_ctx  = &ha_tgroup_ctx[tgid-1];
 	} else {
 		tgid    = 1;
 		tid     = 0;
-		tid_bit = 1;
 		ti      = &ha_thread_info[0];
 		tg      = &ha_tgroup_info[0];
 		th_ctx  = &ha_thread_ctx[0];
+		tg_ctx  = &ha_tgroup_ctx[0];
 	}
 }
 
@@ -252,7 +227,7 @@ static inline void ha_set_thread(const struct thread_info *thr)
  */
 static inline void thread_idle_now()
 {
-	HA_ATOMIC_OR(&threads_idle_mask, tid_bit);
+	HA_ATOMIC_OR(&tg_ctx->threads_idle, ti->ltid_bit);
 }
 
 /* Ends the harmless period started by thread_idle_now(), i.e. the thread is
@@ -269,7 +244,7 @@ static inline void thread_idle_now()
  */
 static inline void thread_idle_end()
 {
-	HA_ATOMIC_AND(&threads_idle_mask, ~tid_bit);
+	HA_ATOMIC_AND(&tg_ctx->threads_idle, ~ti->ltid_bit);
 }
 
 
@@ -281,7 +256,13 @@ static inline void thread_idle_end()
  */
 static inline void thread_harmless_now()
 {
-	HA_ATOMIC_OR(&threads_harmless_mask, tid_bit);
+	HA_ATOMIC_OR(&tg_ctx->threads_harmless, ti->ltid_bit);
+}
+
+/* Returns non-zero if the current thread is already harmless */
+static inline int is_thread_harmless()
+{
+	return !!(HA_ATOMIC_LOAD(&tg_ctx->threads_harmless) & ti->ltid_bit);
 }
 
 /* Ends the harmless period started by thread_harmless_now(). Usually this is
@@ -292,17 +273,29 @@ static inline void thread_harmless_now()
 static inline void thread_harmless_end()
 {
 	while (1) {
-		HA_ATOMIC_AND(&threads_harmless_mask, ~tid_bit);
-		if (likely((threads_want_rdv_mask & all_threads_mask & ~tid_bit) == 0))
+		HA_ATOMIC_AND(&tg_ctx->threads_harmless, ~ti->ltid_bit);
+		if (likely(_HA_ATOMIC_LOAD(&rdv_requests) == 0))
 			break;
 		thread_harmless_till_end();
 	}
 }
 
-/* an isolated thread has harmless cleared and want_rdv set */
+/* Ends the harmless period started by thread_harmless_now(), but without
+ * waiting for isolated requests. This is meant to be used from signal handlers
+ * which might be called recursively while a thread already requested an
+ * isolation that must be ignored. It must not be used past a checkpoint where
+ * another thread could return and see the current thread as harmless before
+ * this call (or this could validate an isolation request by accident).
+ */
+static inline void thread_harmless_end_sig()
+{
+	HA_ATOMIC_AND(&tg_ctx->threads_harmless, ~ti->ltid_bit);
+}
+
+/* an isolated thread has its ID in isolated_thread */
 static inline unsigned long thread_isolated()
 {
-	return threads_want_rdv_mask & ~threads_harmless_mask & tid_bit;
+	return _HA_ATOMIC_LOAD(&isolated_thread) == tid;
 }
 
 /* Returns 1 if the cpu set is currently restricted for the process else 0.
@@ -393,60 +386,6 @@ int thread_cpu_mask_forced(void);
 #define HA_RWLOCK_TRYSKLOCK(lbl,l) __ha_rwlock_trysklock(lbl, l, __func__, __FILE__, __LINE__)
 #define HA_RWLOCK_TRYRDTOSK(lbl,l) __ha_rwlock_tryrdtosk(lbl, l, __func__, __FILE__, __LINE__)
 
-/* WARNING!!! if you update this enum, please also keep lock_label() up to date
- * below.
- */
-enum lock_label {
-	TASK_RQ_LOCK,
-	TASK_WQ_LOCK,
-	LISTENER_LOCK,
-	PROXY_LOCK,
-	SERVER_LOCK,
-	LBPRM_LOCK,
-	SIGNALS_LOCK,
-	STK_TABLE_LOCK,
-	STK_SESS_LOCK,
-	APPLETS_LOCK,
-	PEER_LOCK,
-	SHCTX_LOCK,
-	SSL_LOCK,
-	SSL_GEN_CERTS_LOCK,
-	PATREF_LOCK,
-	PATEXP_LOCK,
-	VARS_LOCK,
-	COMP_POOL_LOCK,
-	LUA_LOCK,
-	NOTIF_LOCK,
-	SPOE_APPLET_LOCK,
-	DNS_LOCK,
-	PID_LIST_LOCK,
-	EMAIL_ALERTS_LOCK,
-	PIPES_LOCK,
-	TLSKEYS_REF_LOCK,
-	AUTH_LOCK,
-	LOGSRV_LOCK,
-	DICT_LOCK,
-	PROTO_LOCK,
-	QUEUE_LOCK,
-	CKCH_LOCK,
-	SNI_LOCK,
-	SSL_SERVER_LOCK,
-	SFT_LOCK, /* sink forward target */
-	IDLE_CONNS_LOCK,
-	QUIC_LOCK,
-	OTHER_LOCK,
-	/* WT: make sure never to use these ones outside of development,
-	 * we need them for lock profiling!
-	 */
-	DEBUG1_LOCK,
-	DEBUG2_LOCK,
-	DEBUG3_LOCK,
-	DEBUG4_LOCK,
-	DEBUG5_LOCK,
-	LOCK_LABELS
-};
-
-
 /* Following functions are used to collect some stats about locks. We wrap
  * pthread functions to known how much time we wait in a lock. */
 
@@ -490,11 +429,5 @@ void __spin_unlock(enum lock_label lbl, struct ha_spinlock *l,
 #endif  /* DEBUG_THREAD */
 
 #endif /* USE_THREAD */
-
-/* returns a mask if set, otherwise all_threads_mask */
-static inline unsigned long thread_mask(unsigned long mask)
-{
-	return mask ? mask : all_threads_mask;
-}
 
 #endif /* _HAPROXY_THREAD_H */

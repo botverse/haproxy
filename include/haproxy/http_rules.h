@@ -34,23 +34,13 @@ extern struct action_kw_list http_after_res_keywords;
 struct act_rule *parse_http_req_cond(const char **args, const char *file, int linenum, struct proxy *proxy);
 struct act_rule *parse_http_res_cond(const char **args, const char *file, int linenum, struct proxy *proxy);
 struct act_rule *parse_http_after_res_cond(const char **args, const char *file, int linenum, struct proxy *proxy);
+void  http_free_redirect_rule(struct redirect_rule *rdr);
 struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, struct proxy *curproxy,
                                                const char **args, char **errmsg, int use_fmt, int dir);
 
-static inline void http_req_keywords_register(struct action_kw_list *kw_list)
-{
-	LIST_APPEND(&http_req_keywords.list, &kw_list->list);
-}
-
-static inline void http_res_keywords_register(struct action_kw_list *kw_list)
-{
-	LIST_APPEND(&http_res_keywords.list, &kw_list->list);
-}
-
-static inline void http_after_res_keywords_register(struct action_kw_list *kw_list)
-{
-	LIST_APPEND(&http_after_res_keywords.list, &kw_list->list);
-}
+void http_req_keywords_register(struct action_kw_list *kw_list);
+void http_res_keywords_register(struct action_kw_list *kw_list);
+void http_after_res_keywords_register(struct action_kw_list *kw_list);
 
 struct action_kw *action_http_req_custom(const char *kw);
 struct action_kw *action_http_res_custom(const char *kw);

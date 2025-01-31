@@ -26,13 +26,22 @@
 #include <haproxy/api.h>
 
 extern unsigned int profiling;
-extern unsigned long task_profiling_mask;
 extern struct activity activity[MAX_THREADS];
-extern struct sched_activity sched_activity[256];
+extern struct sched_activity sched_activity[SCHED_ACT_HASH_BUCKETS];
 
 void report_stolen_time(uint64_t stolen);
 void activity_count_runtime(uint32_t run_time);
-struct sched_activity *sched_activity_entry(struct sched_activity *array, const void *func);
+struct sched_activity *sched_activity_entry(struct sched_activity *array, const void *func, const void *caller);
+
+#ifdef USE_MEMORY_PROFILING
+struct memprof_stats *memprof_get_bin(const void *ra, enum memprof_method meth);
+void memprof_remove_stale_info(const void *info);
+#else
+static inline void memprof_remove_stale_info(const void *info)
+{
+	/* nothing to do */
+}
+#endif
 
 #endif /* _HAPROXY_ACTIVITY_H */
 

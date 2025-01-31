@@ -22,6 +22,8 @@
 #ifndef _HAPROXY_DEFAULTS_H
 #define _HAPROXY_DEFAULTS_H
 
+#include <haproxy/compat.h>
+
 /* MAX_THREADS defines the highest limit for the global nbthread value. It
  * defaults to the number of bits in a long integer when threads are enabled
  * but may be lowered to save resources on embedded systems.
@@ -29,24 +31,32 @@
 #ifndef USE_THREAD
 /* threads disabled, 1 thread max, 1 group max (note: group ids start at 1) */
 #define MAX_THREADS 1
-#define MAX_THREADS_MASK 1
 
 #define MAX_TGROUPS 1
 #define MAX_THREADS_PER_GROUP 1
 
 #else
-/* threads enabled, max_threads defaults to long bits */
-#ifndef MAX_THREADS
-#define MAX_THREADS LONGBITS
-#endif
-#define MAX_THREADS_MASK (~0UL >> (LONGBITS - MAX_THREADS))
 
-/* still limited to 1 group for now by default (note: group ids start at 1) */
+/* theoretical limit is 64, though we'd rather not push it too far for now
+ * as some structures might be enlarged to be indexed per group. Let's start
+ * with 16 groups max, allowing to experiment with dual-socket machines
+ * suffering from up to 8 loosely coupled L3 caches. It's a good start and
+ * doesn't engage us too far.
+ */
 #ifndef MAX_TGROUPS
-#define MAX_TGROUPS 1
+#define MAX_TGROUPS 16
 #endif
-#define MAX_THREADS_PER_GROUP LONGBITS
+
+#define MAX_THREADS_PER_GROUP __WORDSIZE
+
+/* threads enabled, max_threads defaults to long bits for 1 tgroup or 4 times
+ * long bits if more tgroups are enabled.
+ */
+#ifndef MAX_THREADS
+#define MAX_THREADS ((((MAX_TGROUPS) > 1) ? 4 : 1) * (MAX_THREADS_PER_GROUP))
 #endif
+
+#endif // USE_THREAD
 
 /*
  * BUFSIZE defines the size of a read and write buffer. It is the maximum
@@ -61,18 +71,13 @@
 #define BUFSIZE	        16384
 #endif
 
-/* certain buffers may only be allocated for responses in order to avoid
- * deadlocks caused by request queuing. 2 buffers is the absolute minimum
- * acceptable to ensure that a request gaining access to a server can get
- * a response buffer even if it doesn't completely flush the request buffer.
- * The worst case is an applet making use of a request buffer that cannot
- * completely be sent while the server starts to respond, and all unreserved
- * buffers are allocated by request buffers from pending connections in the
- * queue waiting for this one to flush. Both buffers reserved buffers may
- * thus be used at the same time.
- */
+#ifndef BUFSIZE_SMALL
+#define BUFSIZE_SMALL   1024
+#endif
+
+// number of per-thread emergency buffers for low-memory conditions
 #ifndef RESERVED_BUFS
-#define RESERVED_BUFS   2
+#define RESERVED_BUFS   4
 #endif
 
 // reserved buffer space for header rewriting
@@ -92,7 +97,10 @@
 #define MAX_SYSLOG_LEN          1024
 #endif
 
-/* 64kB to archive startup-logs seems way more than enough */
+/* 64kB to archive startup-logs seems way more than enough
+ * /!\ Careful when changing this size, it is used in a shm when exec() from
+ * mworker to wait mode.
+ */
 #ifndef STARTUP_LOG_SIZE
 #define STARTUP_LOG_SIZE        65536
 #endif
@@ -101,6 +109,11 @@
 #ifndef LINESIZE
 #define LINESIZE	2048
 #endif
+
+// maximum size of a configuration file that could be loaded in memory via
+// /dev/sdtin. This is needed to prevent from loading extremely large files
+// via standard input.
+#define MAX_CFG_SIZE	10485760
 
 // max # args on a configuration line
 #define MAX_LINE_ARGS   64
@@ -132,6 +145,11 @@
 // max # of headers in history when looking for header #-X
 #ifndef MAX_HDR_HISTORY
 #define MAX_HDR_HISTORY 10
+#endif
+
+// max length of a TRACE_PRINTF() output buffer (one less char for the message)
+#ifndef TRACE_MAX_MSG
+#define TRACE_MAX_MSG 1024
 #endif
 
 // max # of stick counters per session (at least 3 for sc0..sc2)
@@ -186,6 +204,10 @@
 #define TV_ETERNITY_MS  (-1)
 #endif
 
+/* delay between boot and first time wrap, in seconds */
+#ifndef BOOT_TIME_WRAP_SEC
+#define BOOT_TIME_WRAP_SEC 20
+#endif
 /* we want to be able to detect time jumps. Fix the maximum wait time to a low
  * value so that we know the time has changed if we wait longer.
  */
@@ -230,6 +252,12 @@
 #define COOKIE_DELIM_DATE       '|'
 #endif
 
+// Max number of acl() sample fetch recursive evaluations, to avoid deep tree
+// loops.
+#ifndef ACL_MAX_RECURSE
+#define ACL_MAX_RECURSE 1000
+#endif
+
 #define CONN_RETRIES    3
 
 #define	CHK_CONNTIME    2000
@@ -251,6 +279,13 @@
 // X-Original-To header default
 #define DEF_XORIGINALTO_HDR	"X-Original-To"
 
+/* Max number of events that may be processed at once by
+ * an event_hdl API consumer to prevent thread contention.
+ */
+#ifndef EVENT_HDL_MAX_AT_ONCE
+#define EVENT_HDL_MAX_AT_ONCE 100
+#endif
+
 /* Default connections limit.
  *
  * A system limit can be enforced at build time in order to avoid using haproxy
@@ -267,6 +302,32 @@
 #define DEFAULT_MAXCONN SYSTEM_MAXCONN
 #elif !defined(DEFAULT_MAXCONN)
 #define DEFAULT_MAXCONN 100
+#endif
+
+/* Default file descriptor limit.
+ *
+ * DEFAULT_MAXFD explicitly reduces the hard RLIMIT_NOFILE, which is used by the
+ * process as the base value to calculate the default global.maxsock, if
+ * global.maxconn, global.rlimit_memmax are not defined. This is useful in the
+ * case, when hard nofile limit has been bumped to fs.nr_open (kernel max),
+ * which is extremely large on many modern distros. So, we will also finish with
+ * an extremely large default global.maxsock. The only way to override
+ * DEFAULT_MAXFD, if defined, is to set fd_hard_limit in the config global
+ * section. If DEFAULT_MAXFD is not set, a reasonable maximum of 1048576 will be
+ * used as the default value, which almost guarantees that a process will
+ * correctly start in any situation and will be not killed then by watchdog,
+ * when it will loop over the allocated fdtab.
+*/
+#ifndef DEFAULT_MAXFD
+#define DEFAULT_MAXFD 1048576
+#endif
+
+/* Define a maxconn which will be used in the master process and won't change
+ * when SYSTEM_MAXCONN is set. 100 must be enough for the master since it only
+ * does communication between the master and the workers, and the master CLI.
+ */
+#ifndef MASTER_MAXCONN
+#define MASTER_MAXCONN 100
 #endif
 
 /* Minimum check interval for spread health checks. Servers with intervals
@@ -385,11 +446,18 @@
 #define MEM_USABLE_RATIO 0.97
 #endif
 
-/* Pools are always enabled unless explicitly disabled. When disabled, the
- * calls are directly passed to the underlying OS functions.
+/* if not 0, maximum allocatable memory per process in MB */
+#ifndef HAPROXY_MEMMAX
+#define HAPROXY_MEMMAX 0
+#endif
+
+/* For USE_ZLIB, DEFAULT_MAXZLIBMEM may be set to a hard-coded value that will
+ * preset a maxzlibmem value. Just leave it to zero for other configurations.
+ * Note that it's expressed in megabytes.
  */
-#if !defined(DEBUG_NO_POOLS) && !defined(DEBUG_UAF) && !defined(DEBUG_FAIL_ALLOC)
-#define CONFIG_HAP_POOLS
+#if !defined(DEFAULT_MAXZLIBMEM) || !defined(USE_ZLIB)
+#undef DEFAULT_MAXZLIBMEM
+#define DEFAULT_MAXZLIBMEM 0
 #endif
 
 /* On modern architectures with many threads, a fast memory allocator, and
@@ -404,7 +472,32 @@
 
 /* default per-thread pool cache size when enabled */
 #ifndef CONFIG_HAP_POOL_CACHE_SIZE
-#define CONFIG_HAP_POOL_CACHE_SIZE 1048576
+#define CONFIG_HAP_POOL_CACHE_SIZE 524288
+#endif
+
+#ifndef CONFIG_HAP_POOL_CLUSTER_SIZE
+#define CONFIG_HAP_POOL_CLUSTER_SIZE 8
+#endif
+
+/* number of bits to encode the per-pool buckets for large setups */
+#ifndef CONFIG_HAP_POOL_BUCKETS_BITS
+# if defined(USE_THREAD) && MAX_THREADS >= 512
+#  define CONFIG_HAP_POOL_BUCKETS_BITS 6
+# elif defined(USE_THREAD) && MAX_THREADS >= 128
+#  define CONFIG_HAP_POOL_BUCKETS_BITS 5
+# elif defined(USE_THREAD) && MAX_THREADS >= 16
+#  define CONFIG_HAP_POOL_BUCKETS_BITS 4
+# elif defined(USE_THREAD)
+#  define CONFIG_HAP_POOL_BUCKETS_BITS 3
+# else
+#  define CONFIG_HAP_POOL_BUCKETS_BITS 0
+# endif
+#endif
+
+#define CONFIG_HAP_POOL_BUCKETS (1UL << (CONFIG_HAP_POOL_BUCKETS_BITS))
+
+#ifndef CONFIG_HAP_TBL_BUCKETS
+# define CONFIG_HAP_TBL_BUCKETS CONFIG_HAP_POOL_BUCKETS
 #endif
 
 /* Number of samples used to compute the times reported in stats. A power of
@@ -449,5 +542,55 @@
 
 /* system sysfs directory */
 #define NUMA_DETECT_SYSTEM_SYSFS_PATH "/sys/devices/system"
+
+/* Number of cache trees */
+#ifndef CACHE_TREE_NUM
+# if defined(USE_THREAD)
+#  define CACHE_TREE_NUM 8
+# else
+#  define CACHE_TREE_NUM 1
+# endif
+#endif
+
+/* number of ring wait queues depending on the number
+ * of threads.
+ */
+#ifndef RING_WAIT_QUEUES
+# if defined(USE_THREAD) && MAX_THREADS >= 32
+#  define RING_WAIT_QUEUES   16
+# elif defined(USE_THREAD)
+#  define RING_WAIT_QUEUES ((MAX_THREADS + 1) / 2)
+# else
+#  define RING_WAIT_QUEUES 1
+# endif
+#endif
+
+/* it has been found that 6 queues was optimal on various archs at various
+ * thread counts, so let's use that by default.
+ */
+#ifndef RING_DFLT_QUEUES
+# define RING_DFLT_QUEUES   6
+#endif
+
+/* Elements used by memory profiling. This determines the number of buckets to
+ * store stats.
+ */
+#ifndef MEMPROF_HASH_BITS
+# define MEMPROF_HASH_BITS 10
+#endif
+#define MEMPROF_HASH_BUCKETS (1U << MEMPROF_HASH_BITS)
+
+/* Let's make DEBUG_STRICT default to 1 to get rid of it in the makefile */
+#ifndef DEBUG_STRICT
+# define DEBUG_STRICT 1
+#endif
+
+#if !defined(DEBUG_MEMORY_POOLS)
+# define DEBUG_MEMORY_POOLS 1
+#endif
+
+#ifndef MAX_SELF_USE_QUEUE
+#define MAX_SELF_USE_QUEUE 9
+#endif
 
 #endif /* _HAPROXY_DEFAULTS_H */

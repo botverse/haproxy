@@ -22,7 +22,6 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,8 +37,10 @@
 #include <haproxy/listener.h>
 #include <haproxy/openssl-compat.h>
 #include <haproxy/ssl_sock.h>
+#include <haproxy/ssl_utils.h>
 #include <haproxy/tools.h>
 #include <haproxy/ssl_ckch.h>
+#include <haproxy/ssl_ocsp.h>
 
 
 /****************** Global Section Parsing ********************************************/
@@ -137,7 +138,7 @@ static int ssl_parse_global_ssl_async(char **args, int section_type, struct prox
 #endif
 }
 
-#ifndef OPENSSL_NO_ENGINE
+#if defined(USE_ENGINE) && !defined(OPENSSL_NO_ENGINE)
 /* parse the "ssl-engine" keyword in global section.
  * Returns <0 on alert, >0 on warning, 0 on success.
  */
@@ -181,6 +182,65 @@ add_engine:
 }
 #endif
 
+#ifdef HAVE_SSL_PROVIDERS
+/* parse the "ssl-propquery" keyword in global section.
+ * Returns <0 on alert, >0 on warning, 0 on success.
+ */
+static int ssl_parse_global_ssl_propquery(char **args, int section_type, struct proxy *curpx,
+					  const struct proxy *defpx, const char *file, int line,
+					  char **err)
+{
+	int ret = -1;
+
+	if (*(args[1]) == 0) {
+		memprintf(err, "global statement '%s' expects a property string as an argument.", args[0]);
+		return ret;
+	}
+
+	if (EVP_set_default_properties(NULL, args[1]))
+		ret = 0;
+
+	return ret;
+}
+
+/* parse the "ssl-provider" keyword in global section.
+ * Returns <0 on alert, >0 on warning, 0 on success.
+ */
+static int ssl_parse_global_ssl_provider(char **args, int section_type, struct proxy *curpx,
+					 const struct proxy *defpx, const char *file, int line,
+					 char **err)
+{
+	int ret = -1;
+
+	if (*(args[1]) == 0) {
+		memprintf(err, "global statement '%s' expects a valid engine provider name as an argument.", args[0]);
+		return ret;
+	}
+
+	if (ssl_init_provider(args[1]) == 0)
+		ret = 0;
+
+	return ret;
+}
+
+/* parse the "ssl-provider-path" keyword in global section.
+ * Returns <0 on alert, >0 on warning, 0 on success.
+ */
+static int ssl_parse_global_ssl_provider_path(char **args, int section_type, struct proxy *curpx,
+					      const struct proxy *defpx, const char *file, int line,
+					      char **err)
+{
+	if (*(args[1]) == 0) {
+		memprintf(err, "global statement '%s' expects a directory path as an argument.", args[0]);
+		return -1;
+	}
+
+	OSSL_PROVIDER_set_default_search_path(NULL, args[1]);
+
+	return 0;
+}
+#endif
+
 /* parse the "ssl-default-bind-ciphers" / "ssl-default-server-ciphers" keywords
  * in global section. Returns <0 on alert, >0 on warning, 0 on success.
  */
@@ -205,7 +265,6 @@ static int ssl_parse_global_ciphers(char **args, int section_type, struct proxy 
 	return 0;
 }
 
-#ifdef HAVE_SSL_CTX_SET_CIPHERSUITES
 /* parse the "ssl-default-bind-ciphersuites" / "ssl-default-server-ciphersuites" keywords
  * in global section. Returns <0 on alert, >0 on warning, 0 on success.
  */
@@ -213,6 +272,7 @@ static int ssl_parse_global_ciphersuites(char **args, int section_type, struct p
                                     const struct proxy *defpx, const char *file, int line,
                                     char **err)
 {
+#ifdef HAVE_SSL_CTX_SET_CIPHERSUITES
 	char **target;
 
 	target = (args[0][12] == 'b') ? &global_ssl.listen_default_ciphersuites : &global_ssl.connect_default_ciphersuites;
@@ -228,8 +288,12 @@ static int ssl_parse_global_ciphersuites(char **args, int section_type, struct p
 	free(*target);
 	*target = strdup(args[1]);
 	return 0;
-}
+#else /* ! HAVE_SSL_CTX_SET_CIPHERSUITES */
+	memprintf(err, "'%s' not supported for your SSL library (%s).", args[0], OPENSSL_VERSION_TEXT);
+	return -1;
+
 #endif
+}
 
 #if defined(SSL_CTX_set1_curves_list)
 /*
@@ -241,7 +305,7 @@ static int ssl_parse_global_curves(char **args, int section_type, struct proxy *
 				   char **err)
 {
 	char **target;
-	target = &global_ssl.listen_default_curves;
+	target = (args[0][12] == 'b') ? &global_ssl.listen_default_curves : &global_ssl.connect_default_curves;
 
 	if (too_many_args(1, args, err, NULL))
 		return -1;
@@ -256,6 +320,61 @@ static int ssl_parse_global_curves(char **args, int section_type, struct proxy *
 	return 0;
 }
 #endif
+
+#if defined(SSL_CTX_set1_sigalgs_list)
+/*
+ * parse the "ssl-default-bind-sigalgs" and "ssl-default-server-sigalgs" keyword in a global section.
+ * Returns <0 on alert, >0 on warning, 0 on success.
+ */
+static int ssl_parse_global_sigalgs(char **args, int section_type, struct proxy *curpx,
+                                   const struct proxy *defpx, const char *file, int line,
+				   char **err)
+{
+	char **target;
+
+	target = (args[0][12] == 'b') ? &global_ssl.listen_default_sigalgs : &global_ssl.connect_default_sigalgs;
+
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (*(args[1]) == 0) {
+		memprintf(err, "global statement '%s' expects a curves suite as an arguments.", args[0]);
+		return -1;
+	}
+
+	free(*target);
+	*target = strdup(args[1]);
+	return 0;
+}
+#endif
+
+#if defined(SSL_CTX_set1_client_sigalgs_list)
+/*
+ * parse the "ssl-default-bind-client-sigalgs" keyword in a global section.
+ * Returns <0 on alert, >0 on warning, 0 on success.
+ */
+static int ssl_parse_global_client_sigalgs(char **args, int section_type, struct proxy *curpx,
+                                   const struct proxy *defpx, const char *file, int line,
+				   char **err)
+{
+	char **target;
+
+	target = (args[0][12] == 'b') ? &global_ssl.listen_default_client_sigalgs : &global_ssl.connect_default_client_sigalgs;
+
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (*(args[1]) == 0) {
+		memprintf(err, "global statement '%s' expects signature algorithms as an arguments.", args[0]);
+		return -1;
+	}
+
+	free(*target);
+	*target = strdup(args[1]);
+	return 0;
+}
+#endif
+
 /* parse various global tune.ssl settings consisting in positive integers.
  * Returns <0 on alert, >0 on warning, 0 on success.
  */
@@ -269,6 +388,8 @@ static int ssl_parse_global_int(char **args, int section_type, struct proxy *cur
 		target = &global.tune.sslcachesize;
 	else if (strcmp(args[0], "tune.ssl.maxrecord") == 0)
 		target = (int *)&global_ssl.max_record;
+	else if (strcmp(args[0], "tune.ssl.hard-maxrecord") == 0)
+		target = (int *)&global_ssl.hard_max_record;
 	else if (strcmp(args[0], "tune.ssl.ssl-ctx-cache-size") == 0)
 		target = &global_ssl.ctx_cache;
 	else if (strcmp(args[0], "maxsslconn") == 0)
@@ -442,6 +563,8 @@ static int ssl_parse_global_dh_param_file(char **args, int section_type, struct 
 	return 0;
 }
 
+#endif
+
 /* parse "ssl.default-dh-param".
  * Returns <0 on alert, >0 on warning, 0 on success.
  */
@@ -449,6 +572,8 @@ static int ssl_parse_global_default_dh(char **args, int section_type, struct pro
                                        const struct proxy *defpx, const char *file, int line,
                                        char **err)
 {
+#ifndef OPENSSL_NO_DH
+
 	if (too_many_args(1, args, err, NULL))
 		return -1;
 
@@ -463,8 +588,12 @@ static int ssl_parse_global_default_dh(char **args, int section_type, struct pro
 		return -1;
 	}
 	return 0;
-}
+#else
+	memprintf(err, "'%s' is not supported by %s, keyword ignored", args[0], OpenSSL_version(OPENSSL_VERSION));
+	return ERR_WARN;
 #endif
+
+}
 
 
 /*
@@ -542,6 +671,7 @@ static int ssl_parse_global_extra_noext(char **args, int section_type, struct pr
 	return 0;
 }
 
+
 /***************************** Bind keyword Parsing ********************************************/
 
 /* for ca-file and ca-verify-file */
@@ -552,7 +682,7 @@ static int ssl_bind_parse_ca_file_common(char **args, int cur_arg, char **ca_fil
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if ((*args[cur_arg + 1] != '/') && global_ssl.ca_base)
+	if ((*args[cur_arg + 1] != '/') && (*args[cur_arg + 1] != '@') && global_ssl.ca_base)
 		memprintf(ca_file_p, "%s/%s", global_ssl.ca_base, args[cur_arg + 1]);
 	else
 		memprintf(ca_file_p, "%s", args[cur_arg + 1]);
@@ -592,7 +722,7 @@ static int bind_parse_ca_sign_file(char **args, int cur_arg, struct proxy *px, s
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if ((*args[cur_arg + 1] != '/') && global_ssl.ca_base)
+	if ((*args[cur_arg + 1] != '/') && (*args[cur_arg + 1] != '@') && global_ssl.ca_base)
 		memprintf(&conf->ca_sign_file, "%s/%s", global_ssl.ca_base, args[cur_arg + 1]);
 	else
 		memprintf(&conf->ca_sign_file, "%s", args[cur_arg + 1]);
@@ -628,10 +758,10 @@ static int bind_parse_ciphers(char **args, int cur_arg, struct proxy *px, struct
 	return ssl_bind_parse_ciphers(args, cur_arg, px, &conf->ssl_conf, 0, err);
 }
 
-#ifdef HAVE_SSL_CTX_SET_CIPHERSUITES
 /* parse the "ciphersuites" bind keyword */
 static int ssl_bind_parse_ciphersuites(char **args, int cur_arg, struct proxy *px, struct ssl_bind_conf *conf, int from_cli, char **err)
 {
+#ifdef HAVE_SSL_CTX_SET_CIPHERSUITES
 	if (!*args[cur_arg + 1]) {
 		memprintf(err, "'%s' : missing cipher suite", args[cur_arg]);
 		return ERR_ALERT | ERR_FATAL;
@@ -640,33 +770,38 @@ static int ssl_bind_parse_ciphersuites(char **args, int cur_arg, struct proxy *p
 	free(conf->ciphersuites);
 	conf->ciphersuites = strdup(args[cur_arg + 1]);
 	return 0;
+#else
+	memprintf(err, "'%s' keyword not supported for this SSL library version (%s).", args[cur_arg], OPENSSL_VERSION_TEXT);
+	return ERR_ALERT | ERR_FATAL;
+#endif
 }
+
 static int bind_parse_ciphersuites(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	return ssl_bind_parse_ciphersuites(args, cur_arg, px, &conf->ssl_conf, 0, err);
 }
-#endif
 
 /* parse the "crt" bind keyword. Returns a set of ERR_* flags possibly with an error in <err>. */
 static int bind_parse_crt(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	char path[MAXPATHLEN];
+	int default_crt = *args[cur_arg] == 'd' ? 1 : 0;
 
 	if (!*args[cur_arg + 1]) {
 		memprintf(err, "'%s' : missing certificate location", args[cur_arg]);
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if ((*args[cur_arg + 1] != '/' ) && global_ssl.crt_base) {
-		if ((strlen(global_ssl.crt_base) + 1 + strlen(args[cur_arg + 1]) + 1) > MAXPATHLEN) {
+	if ((*args[cur_arg + 1] != '@') && (*args[cur_arg + 1] != '/' ) && global_ssl.crt_base) {
+		if ((strlen(global_ssl.crt_base) + 1 + strlen(args[cur_arg + 1]) + 1) > sizeof(path) ||
+		    snprintf(path, sizeof(path), "%s/%s",  global_ssl.crt_base, args[cur_arg + 1]) > sizeof(path)) {
 			memprintf(err, "'%s' : path too long", args[cur_arg]);
 			return ERR_ALERT | ERR_FATAL;
 		}
-		snprintf(path, sizeof(path), "%s/%s",  global_ssl.crt_base, args[cur_arg + 1]);
-		return ssl_sock_load_cert(path, conf, err);
+		return ssl_sock_load_cert(path, conf, default_crt, err);
 	}
 
-	return ssl_sock_load_cert(args[cur_arg + 1], conf, err);
+	return ssl_sock_load_cert(args[cur_arg + 1], conf, default_crt, err);
 }
 
 /* parse the "crt-list" bind keyword. Returns a set of ERR_* flags possibly with an error in <err>. */
@@ -698,7 +833,7 @@ static int ssl_bind_parse_crl_file(char **args, int cur_arg, struct proxy *px, s
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if ((*args[cur_arg + 1] != '/') && global_ssl.ca_base)
+	if ((*args[cur_arg + 1] != '/') && (*args[cur_arg + 1] != '@') && global_ssl.ca_base)
 		memprintf(&conf->crl_file, "%s/%s", global_ssl.ca_base, args[cur_arg + 1]);
 	else
 		memprintf(&conf->crl_file, "%s", args[cur_arg + 1]);
@@ -735,6 +870,47 @@ static int bind_parse_curves(char **args, int cur_arg, struct proxy *px, struct 
 	return ssl_bind_parse_curves(args, cur_arg, px, &conf->ssl_conf, 0, err);
 }
 
+/* parse the "sigalgs" bind keyword */
+static int ssl_bind_parse_sigalgs(char **args, int cur_arg, struct proxy *px, struct ssl_bind_conf *conf, int from_cli, char **err)
+{
+#if defined(SSL_CTX_set1_sigalgs_list)
+	if (!*args[cur_arg + 1]) {
+		memprintf(err, "'%s' : missing signature algorithm list", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	conf->sigalgs = strdup(args[cur_arg + 1]);
+	return 0;
+#else
+	memprintf(err, "'%s' : library does not support setting signature algorithms", args[cur_arg]);
+	return ERR_ALERT | ERR_FATAL;
+#endif
+}
+static int bind_parse_sigalgs(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	return ssl_bind_parse_sigalgs(args, cur_arg, px, &conf->ssl_conf, 0, err);
+}
+
+/* parse the "client-sigalgs" bind keyword */
+static int ssl_bind_parse_client_sigalgs(char **args, int cur_arg, struct proxy *px, struct ssl_bind_conf *conf, int from_cli, char **err)
+{
+#if defined(SSL_CTX_set1_client_sigalgs_list)
+	if (!*args[cur_arg + 1]) {
+		memprintf(err, "'%s' : missing signature algorithm list", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	conf->client_sigalgs = strdup(args[cur_arg + 1]);
+	return 0;
+#else
+	memprintf(err, "'%s' : library does not support setting signature algorithms", args[cur_arg]);
+	return ERR_ALERT | ERR_FATAL;
+#endif
+}
+static int bind_parse_client_sigalgs(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	return ssl_bind_parse_client_sigalgs(args, cur_arg, px, &conf->ssl_conf, 0, err);
+}
+
+
 /* parse the "ecdhe" bind keyword keyword */
 static int ssl_bind_parse_ecdhe(char **args, int cur_arg, struct proxy *px, struct ssl_bind_conf *conf, int from_cli, char **err)
 {
@@ -764,8 +940,11 @@ static int bind_parse_ecdhe(char **args, int cur_arg, struct proxy *px, struct b
 static int bind_parse_ignore_err(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	int code;
+	char *s1 = NULL, *s2 = NULL;
+	char *token = NULL;
 	char *p = args[cur_arg + 1];
-	unsigned long long *ignerr = &conf->crt_ignerr;
+	char *str;
+	unsigned long long *ignerr = conf->crt_ignerr_bitfield;
 
 	if (!*p) {
 		memprintf(err, "'%s' : missing error IDs list", args[cur_arg]);
@@ -773,26 +952,45 @@ static int bind_parse_ignore_err(char **args, int cur_arg, struct proxy *px, str
 	}
 
 	if (strcmp(args[cur_arg], "ca-ignore-err") == 0)
-		ignerr = &conf->ca_ignerr;
+		ignerr = conf->ca_ignerr_bitfield;
 
 	if (strcmp(p, "all") == 0) {
-		*ignerr = ~0ULL;
+		cert_ignerr_bitfield_set_all(ignerr);
 		return 0;
 	}
 
-	while (p) {
-		code = atoi(p);
-		if ((code <= 0) || (code > 63)) {
-			memprintf(err, "'%s' : ID '%d' out of range (1..63) in error IDs list '%s'",
-			          args[cur_arg], code, args[cur_arg + 1]);
-			return ERR_ALERT | ERR_FATAL;
-		}
-		*ignerr |= 1ULL << code;
-		p = strchr(p, ',');
-		if (p)
-			p++;
+	/* copy the string to be able to dump the complete one in case of
+	 * error, because strtok_r is writing \0 inside. */
+	str = strdup(p);
+	if (!str) {
+		memprintf(err, "'%s' : Could not allocate memory", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
 	}
 
+	s1 = str;
+	while ((token = strtok_r(s1, ",", &s2))) {
+		s1 = NULL;
+		if (isdigit((int)*token)) {
+			code = atoi(token);
+			if ((code <= 0) || (code > SSL_MAX_VFY_ERROR_CODE)) {
+				memprintf(err, "'%s' : ID '%d' out of range (1..%d) in error IDs list '%s'",
+				          args[cur_arg], code, SSL_MAX_VFY_ERROR_CODE, args[cur_arg + 1]);
+				free(str);
+				return ERR_ALERT | ERR_FATAL;
+			}
+		} else {
+			code = x509_v_err_str_to_int(token);
+			if (code < 0) {
+				memprintf(err, "'%s' : error constant '%s' unknown in error IDs list '%s'",
+					  args[cur_arg], token, args[cur_arg + 1]);
+				free(str);
+				return ERR_ALERT | ERR_FATAL;
+			}
+		}
+		cert_ignerr_bitfield_set(ignerr, code);
+	}
+
+	free(str);
 	return 0;
 }
 
@@ -931,6 +1129,11 @@ static int ssl_bind_parse_npn(char **args, int cur_arg, struct proxy *px, struct
 	 */
 	conf->npn_len = strlen(args[cur_arg + 1]) + 1;
 	conf->npn_str = calloc(1, conf->npn_len + 1);
+	if (!conf->npn_str) {
+		memprintf(err, "out of memory");
+		return ERR_ALERT | ERR_FATAL;
+	}
+
 	memcpy(conf->npn_str + 1, args[cur_arg + 1], conf->npn_len);
 
 	/* replace commas with the name length */
@@ -1055,16 +1258,17 @@ static int bind_parse_alpn(char **args, int cur_arg, struct proxy *px, struct bi
 /* parse the "ssl" bind keyword */
 static int bind_parse_ssl(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	/* Do not change the xprt for QUIC. */
-	if (conf->xprt != xprt_get(XPRT_QUIC))
-		conf->xprt = &ssl_sock;
-	conf->is_ssl = 1;
+	conf->options |= BC_O_USE_SSL;
 
 	if (global_ssl.listen_default_ciphers && !conf->ssl_conf.ciphers)
 		conf->ssl_conf.ciphers = strdup(global_ssl.listen_default_ciphers);
 #if defined(SSL_CTX_set1_curves_list)
 	if (global_ssl.listen_default_curves && !conf->ssl_conf.curves)
 		conf->ssl_conf.curves = strdup(global_ssl.listen_default_curves);
+#endif
+#if defined(SSL_CTX_set1_sigalgs_list)
+	if (global_ssl.listen_default_sigalgs && !conf->ssl_conf.sigalgs)
+		conf->ssl_conf.sigalgs = strdup(global_ssl.listen_default_sigalgs);
 #endif
 #ifdef HAVE_SSL_CTX_SET_CIPHERSUITES
 	if (global_ssl.listen_default_ciphersuites && !conf->ssl_conf.ciphersuites)
@@ -1091,7 +1295,7 @@ static int bind_parse_pcc(char **args, int cur_arg, struct proxy *px, struct bin
 static int bind_parse_generate_certs(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 #if (defined SSL_CTRL_SET_TLSEXT_HOSTNAME && !defined SSL_NO_GENERATE_CERTIFICATES)
-	conf->generate_certs = 1;
+	conf->options |= BC_O_GENERATE_CERTS;
 #else
 	memprintf(err, "%sthis version of openssl cannot generate SSL certificates.\n",
 		  err && *err ? *err : "");
@@ -1244,12 +1448,34 @@ static int bind_parse_verify(char **args, int cur_arg, struct proxy *px, struct 
 	return ssl_bind_parse_verify(args, cur_arg, px, &conf->ssl_conf, 0, err);
 }
 
+/* parse the "no-alpn" ssl-bind keyword, storing an empty ALPN string */
+static int ssl_bind_parse_no_alpn(char **args, int cur_arg, struct proxy *px, struct ssl_bind_conf *conf, int from_cli, char **err)
+{
+	free(conf->alpn_str);
+	conf->alpn_len = 0;
+	conf->alpn_str = strdup("");
+
+	if (!conf->alpn_str) {
+		memprintf(err, "'%s' : out of memory", *args);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	return 0;
+}
+
+/* parse the "no-alpn" bind keyword, storing an empty ALPN string */
+static int bind_parse_no_alpn(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	return ssl_bind_parse_no_alpn(args, cur_arg, px, &conf->ssl_conf, 0, err);
+}
+
+
 /* parse the "no-ca-names" bind keyword */
 static int ssl_bind_parse_no_ca_names(char **args, int cur_arg, struct proxy *px, struct ssl_bind_conf *conf, int from_cli, char **err)
 {
 	conf->no_ca_names = 1;
 	return 0;
 }
+
 static int bind_parse_no_ca_names(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	return ssl_bind_parse_no_ca_names(args, cur_arg, px, &conf->ssl_conf, 0, err);
@@ -1364,7 +1590,7 @@ static int srv_parse_ca_file(char **args, int *cur_arg, struct proxy *px, struct
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if ((*args[*cur_arg + 1] != '/') && global_ssl.ca_base)
+	if ((*args[*cur_arg + 1] != '/') && (*args[*cur_arg + 1] != '@') && global_ssl.ca_base)
 		memprintf(&newsrv->ssl_ctx.ca_file, "%s/%s", global_ssl.ca_base, args[*cur_arg + 1]);
 	else
 		memprintf(&newsrv->ssl_ctx.ca_file, "%s", args[*cur_arg + 1]);
@@ -1415,6 +1641,30 @@ static int ssl_sock_init_srv(struct server *s)
 	if (!s->ssl_ctx.methods.max)
 		s->ssl_ctx.methods.max = global_ssl.connect_default_sslmethods.max;
 
+#if defined(SSL_CTX_set1_sigalgs_list)
+	if (global_ssl.connect_default_sigalgs && !s->ssl_ctx.sigalgs) {
+		s->ssl_ctx.sigalgs = strdup(global_ssl.connect_default_sigalgs);
+		if (!s->ssl_ctx.sigalgs)
+			return 1;
+	}
+#endif
+
+#if defined(SSL_CTX_set1_client_sigalgs_list)
+	if (global_ssl.connect_default_client_sigalgs && !s->ssl_ctx.client_sigalgs) {
+		s->ssl_ctx.client_sigalgs = strdup(global_ssl.connect_default_client_sigalgs);
+		if (!s->ssl_ctx.client_sigalgs)
+			return 1;
+	}
+#endif
+
+#if defined(SSL_CTX_set1_curves_list)
+	if (global_ssl.connect_default_curves && !s->ssl_ctx.curves) {
+		s->ssl_ctx.curves = strdup(global_ssl.connect_default_curves);
+		if (!s->ssl_ctx.curves)
+			return 1;
+	}
+#endif
+
 	return 0;
 }
 
@@ -1449,10 +1699,10 @@ static int srv_parse_ciphers(char **args, int *cur_arg, struct proxy *px, struct
 	return 0;
 }
 
-#ifdef HAVE_SSL_CTX_SET_CIPHERSUITES
 /* parse the "ciphersuites" server keyword */
 static int srv_parse_ciphersuites(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
 {
+#ifdef HAVE_SSL_CTX_SET_CIPHERSUITES
 	if (!*args[*cur_arg + 1]) {
 		memprintf(err, "'%s' : missing cipher suite", args[*cur_arg]);
 		return ERR_ALERT | ERR_FATAL;
@@ -1467,8 +1717,36 @@ static int srv_parse_ciphersuites(char **args, int *cur_arg, struct proxy *px, s
 	}
 
 	return 0;
-}
+#else /* ! HAVE_SSL_CTX_SET_CIPHERSUITES */
+	memprintf(err, "'%s' not supported for your SSL library (%s).", args[*cur_arg], OPENSSL_VERSION_TEXT);
+	return ERR_ALERT | ERR_FATAL;
+
 #endif
+}
+
+/* parse the "client-sigalgs" server keyword */
+static int srv_parse_client_sigalgs(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+#ifndef SSL_CTX_set1_client_sigalgs_list
+	memprintf(err, "'%s' : library does not support setting signature algorithms", args[*cur_arg]);
+	return ERR_ALERT | ERR_FATAL;
+#else
+	char *arg;
+
+	arg = args[*cur_arg + 1];
+	if (!*arg) {
+		memprintf(err, "'%s' : missing signature algorithm list", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	newsrv->ssl_ctx.client_sigalgs = strdup(arg);
+	if (!newsrv->ssl_ctx.client_sigalgs) {
+		memprintf(err, "out of memory");
+		return ERR_ALERT | ERR_FATAL;
+	}
+	return 0;
+#endif
+}
+
 
 /* parse the "crl-file" server keyword */
 static int srv_parse_crl_file(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
@@ -1484,7 +1762,7 @@ static int srv_parse_crl_file(char **args, int *cur_arg, struct proxy *px, struc
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if ((*args[*cur_arg + 1] != '/') && global_ssl.ca_base)
+	if ((*args[*cur_arg + 1] != '/') && (*args[*cur_arg + 1] != '@') && global_ssl.ca_base)
 		memprintf(&newsrv->ssl_ctx.crl_file, "%s/%s", global_ssl.ca_base, args[*cur_arg + 1]);
 	else
 		memprintf(&newsrv->ssl_ctx.crl_file, "%s", args[*cur_arg + 1]);
@@ -1497,29 +1775,44 @@ static int srv_parse_crl_file(char **args, int *cur_arg, struct proxy *px, struc
 #endif
 }
 
+/* parse the "curves" server keyword */
+static int srv_parse_curves(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+#ifndef SSL_CTX_set1_curves_list
+	memprintf(err, "'%s' : library does not support setting curves list", args[*cur_arg]);
+	return ERR_ALERT | ERR_FATAL;
+#else
+	char *arg;
+
+	arg = args[*cur_arg + 1];
+	if (!*arg) {
+		memprintf(err, "'%s' : missing curves list", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	newsrv->ssl_ctx.curves = strdup(arg);
+	if (!newsrv->ssl_ctx.curves) {
+		memprintf(err, "out of memory");
+		return ERR_ALERT | ERR_FATAL;
+	}
+	return 0;
+#endif
+}
+
 /* parse the "crt" server keyword */
 static int srv_parse_crt(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
 {
-	const int create_if_none = newsrv->flags & SRV_F_DYNAMIC ? 0 : 1;
-	int retval = -1;
-	char *path = NULL;
 
 	if (!*args[*cur_arg + 1]) {
 		memprintf(err, "'%s' : missing certificate file path", args[*cur_arg]);
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if ((*args[*cur_arg + 1] != '/') && global_ssl.crt_base)
-		memprintf(&path, "%s/%s", global_ssl.crt_base, args[*cur_arg + 1]);
+	if ((*args[*cur_arg + 1] != '@') && (*args[*cur_arg + 1] != '/') && global_ssl.crt_base)
+		memprintf(&newsrv->ssl_ctx.client_crt, "%s/%s", global_ssl.crt_base, args[*cur_arg + 1]);
 	else
-		memprintf(&path, "%s", args[*cur_arg + 1]);
+		memprintf(&newsrv->ssl_ctx.client_crt, "%s", args[*cur_arg + 1]);
 
-	if (path) {
-		retval = ssl_sock_load_srv_cert(path, newsrv, create_if_none, err);
-		free(path);
-	}
-
-	return retval;
+	return 0;
 }
 
 /* parse the "no-check-ssl" server keyword */
@@ -1600,6 +1893,29 @@ static int srv_parse_send_proxy_cn(char **args, int *cur_arg, struct proxy *px, 
 	newsrv->pp_opts |= SRV_PP_V2_SSL;
 	newsrv->pp_opts |= SRV_PP_V2_SSL_CN;
 	return 0;
+}
+
+/* parse the "sigalgs" server keyword */
+static int srv_parse_sigalgs(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+#ifndef SSL_CTX_set1_sigalgs_list
+	memprintf(err, "'%s' : library does not support setting signature algorithms", args[*cur_arg]);
+	return ERR_ALERT | ERR_FATAL;
+#else
+	char *arg;
+
+	arg = args[*cur_arg + 1];
+	if (!*arg) {
+		memprintf(err, "'%s' : missing signature algorithm list", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	newsrv->ssl_ctx.sigalgs = strdup(arg);
+	if (!newsrv->ssl_ctx.sigalgs) {
+		memprintf(err, "out of memory");
+		return ERR_ALERT | ERR_FATAL;
+	}
+	return 0;
+#endif
 }
 
 /* parse the "sni" server keyword */
@@ -1756,16 +2072,23 @@ static int ssl_parse_default_server_options(char **args, int section_type, struc
 	return 0;
 }
 
-/* parse the "ca-base" / "crt-base" keywords in global section.
+/* parse the "ca-base" / "crt-base" / "key-base" keywords in global section.
  * Returns <0 on alert, >0 on warning, 0 on success.
  */
-static int ssl_parse_global_ca_crt_base(char **args, int section_type, struct proxy *curpx,
+static int ssl_parse_global_path_base(char **args, int section_type, struct proxy *curpx,
                                         const struct proxy *defpx, const char *file, int line,
                                         char **err)
 {
 	char **target;
 
-	target = (args[0][1] == 'a') ? &global_ssl.ca_base : &global_ssl.crt_base;
+	if (args[0][1] == 'a')
+		target = &global_ssl.ca_base;
+	else if (args[0][1] == 'r')
+		target = &global_ssl.crt_base;
+	else if (args[0][1] == 'e')
+		target = &global_ssl.key_base;
+	else
+		return -1;
 
 	if (too_many_args(1, args, err, NULL))
 		return -1;
@@ -1780,6 +2103,39 @@ static int ssl_parse_global_ca_crt_base(char **args, int section_type, struct pr
 		return -1;
 	}
 	*target = strdup(args[1]);
+	return 0;
+}
+
+/* parse the "ssl-security-level" keyword in global section.  */
+static int ssl_parse_security_level(char **args, int section_type, struct proxy *curpx,
+					 const struct proxy *defpx, const char *file, int linenum,
+					 char **err)
+{
+#ifndef HAVE_SSL_SET_SECURITY_LEVEL
+	memprintf(err, "global statement '%s' requires at least OpenSSL 1.1.1.", args[0]);
+	return -1;
+#else
+	char *endptr;
+
+	if (!*args[1]) {
+		ha_alert("parsing [%s:%d] : '%s' : missing value\n", file, linenum, args[0]);
+		return -1;
+	}
+
+	global_ssl.security_level = strtol(args[1], &endptr, 10);
+	if (*endptr != '\0') {
+		ha_alert("parsing [%s:%d] : '%s' : expects an integer argument, found '%s'\n",
+			 file, linenum, args[0], args[1]);
+		return -1;
+	}
+
+	if (global_ssl.security_level < 0 || global_ssl.security_level > 5) {
+		ha_alert("parsing [%s:%d] : '%s' : expects a value between 0 and 5\n",
+			 file, linenum, args[0]);
+		return -1;
+	}
+#endif
+
 	return 0;
 }
 
@@ -1800,7 +2156,6 @@ static int ssl_parse_skip_self_issued_ca(char **args, int section_type, struct p
 
 
 
-
 /* Note: must not be declared <const> as its list will be overwritten.
  * Please take care of keeping this list alphabetically sorted, doing so helps
  * all code contributors.
@@ -1809,22 +2164,28 @@ static int ssl_parse_skip_self_issued_ca(char **args, int section_type, struct p
  * not enabled.
  */
 
-/* the <ssl_bind_kws> keywords are used for crt-list parsing, they *MUST* be safe
- * with their proxy argument NULL and must only fill the ssl_bind_conf */
-struct ssl_bind_kw ssl_bind_kws[] = {
+/* the <ssl_crtlist_kws> keywords are used for crt-list parsing, they *MUST* be safe
+ * with their proxy argument NULL and must only fill the ssl_bind_conf
+ *
+ * /!\ Please update configuration.txt at the crt-list option of the Bind options
+ * section when adding a keyword in ssl_crtlist_kws. /!\
+ *
+ */
+struct ssl_crtlist_kw ssl_crtlist_kws[] = {
 	{ "allow-0rtt",            ssl_bind_parse_allow_0rtt,       0 }, /* allow 0-RTT */
 	{ "alpn",                  ssl_bind_parse_alpn,             1 }, /* set ALPN supported protocols */
 	{ "ca-file",               ssl_bind_parse_ca_file,          1 }, /* set CAfile to process ca-names and verify on client cert */
 	{ "ca-verify-file",        ssl_bind_parse_ca_verify_file,   1 }, /* set CAverify file to process verify on client cert */
 	{ "ciphers",               ssl_bind_parse_ciphers,          1 }, /* set SSL cipher suite */
-#ifdef HAVE_SSL_CTX_SET_CIPHERSUITES
 	{ "ciphersuites",          ssl_bind_parse_ciphersuites,     1 }, /* set TLS 1.3 cipher suite */
-#endif
+	{ "client-sigalgs",        ssl_bind_parse_client_sigalgs,     1 }, /* set SSL client signature algorithms */
 	{ "crl-file",              ssl_bind_parse_crl_file,         1 }, /* set certificate revocation list file use on client cert verify */
 	{ "curves",                ssl_bind_parse_curves,           1 }, /* set SSL curve suite */
 	{ "ecdhe",                 ssl_bind_parse_ecdhe,            1 }, /* defines named curve for elliptic curve Diffie-Hellman */
+	{ "no-alpn",               ssl_bind_parse_no_alpn,          0 }, /* disable sending ALPN */
 	{ "no-ca-names",           ssl_bind_parse_no_ca_names,      0 }, /* do not send ca names to clients (ca_file related) */
 	{ "npn",                   ssl_bind_parse_npn,              1 }, /* set NPN supported protocols */
+	{ "sigalgs",               ssl_bind_parse_sigalgs,          1 }, /* set SSL signature algorithms */
 	{ "ssl-min-ver",           ssl_bind_parse_tls_method_minmax,1 }, /* minimum version */
 	{ "ssl-max-ver",           ssl_bind_parse_tls_method_minmax,1 }, /* maximum version */
 	{ "verify",                ssl_bind_parse_verify,           1 }, /* set SSL verify method */
@@ -1842,14 +2203,14 @@ static struct bind_kw_list bind_kws = { "SSL", { }, {
 	{ "ca-sign-file",          bind_parse_ca_sign_file,       1 }, /* set CAFile used to generate and sign server certs */
 	{ "ca-sign-pass",          bind_parse_ca_sign_pass,       1 }, /* set CAKey passphrase */
 	{ "ciphers",               bind_parse_ciphers,            1 }, /* set SSL cipher suite */
-#ifdef HAVE_SSL_CTX_SET_CIPHERSUITES
 	{ "ciphersuites",          bind_parse_ciphersuites,       1 }, /* set TLS 1.3 cipher suite */
-#endif
+	{ "client-sigalgs",        bind_parse_client_sigalgs,     1 }, /* set SSL client signature algorithms */
 	{ "crl-file",              bind_parse_crl_file,           1 }, /* set certificate revocation list file use on client cert verify */
 	{ "crt",                   bind_parse_crt,                1 }, /* load SSL certificates from this location */
 	{ "crt-ignore-err",        bind_parse_ignore_err,         1 }, /* set error IDs to ignore on verify depth == 0 */
 	{ "crt-list",              bind_parse_crt_list,           1 }, /* load a list of crt from this location */
 	{ "curves",                bind_parse_curves,             1 }, /* set SSL curve suite */
+	{ "default-crt",           bind_parse_crt,                1 }, /* load SSL certificates from this location */
 	{ "ecdhe",                 bind_parse_ecdhe,              1 }, /* defines named curve for elliptic curve Diffie-Hellman */
 	{ "force-sslv3",           bind_parse_tls_method_options, 0 }, /* force SSLv3 */
 	{ "force-tlsv10",          bind_parse_tls_method_options, 0 }, /* force TLSv10 */
@@ -1857,6 +2218,7 @@ static struct bind_kw_list bind_kws = { "SSL", { }, {
 	{ "force-tlsv12",          bind_parse_tls_method_options, 0 }, /* force TLSv12 */
 	{ "force-tlsv13",          bind_parse_tls_method_options, 0 }, /* force TLSv13 */
 	{ "generate-certificates", bind_parse_generate_certs,     0 }, /* enable the server certificates generation */
+	{ "no-alpn",               bind_parse_no_alpn,            0 }, /* disable sending ALPN */
 	{ "no-ca-names",           bind_parse_no_ca_names,        0 }, /* do not send ca names to clients (ca_file related) */
 	{ "no-sslv3",              bind_parse_tls_method_options, 0 }, /* disable SSLv3 */
 	{ "no-tlsv10",             bind_parse_tls_method_options, 0 }, /* disable TLSv10 */
@@ -1864,6 +2226,7 @@ static struct bind_kw_list bind_kws = { "SSL", { }, {
 	{ "no-tlsv12",             bind_parse_tls_method_options, 0 }, /* disable TLSv12 */
 	{ "no-tlsv13",             bind_parse_tls_method_options, 0 }, /* disable TLSv13 */
 	{ "no-tls-tickets",        bind_parse_no_tls_tickets,     0 }, /* disable session resumption tickets */
+	{ "sigalgs",               bind_parse_sigalgs,            1 }, /* set SSL signature algorithms */
 	{ "ssl",                   bind_parse_ssl,                0 }, /* enable SSL processing */
 	{ "ssl-min-ver",           bind_parse_tls_method_minmax,  1 }, /* minimum version */
 	{ "ssl-max-ver",           bind_parse_tls_method_minmax,  1 }, /* maximum version */
@@ -1892,10 +2255,10 @@ static struct srv_kw_list srv_kws = { "SSL", { }, {
 	{ "check-sni",               srv_parse_check_sni,          1, 1, 1 }, /* set SNI */
 	{ "check-ssl",               srv_parse_check_ssl,          0, 1, 1 }, /* enable SSL for health checks */
 	{ "ciphers",                 srv_parse_ciphers,            1, 1, 1 }, /* select the cipher suite */
-#ifdef HAVE_SSL_CTX_SET_CIPHERSUITES
 	{ "ciphersuites",            srv_parse_ciphersuites,       1, 1, 1 }, /* select the cipher suite */
-#endif
+	{ "client-sigalgs",          srv_parse_client_sigalgs,     1, 1, 1 }, /* signature algorithms */
 	{ "crl-file",                srv_parse_crl_file,           1, 1, 1 }, /* set certificate revocation list file use on server cert verify */
+	{ "curves",                  srv_parse_curves,             1, 1, 1 }, /* set TLS curves list */
 	{ "crt",                     srv_parse_crt,                1, 1, 1 }, /* set client certificate */
 	{ "force-sslv3",             srv_parse_tls_method_options, 0, 1, 1 }, /* force SSLv3 */
 	{ "force-tlsv10",            srv_parse_tls_method_options, 0, 1, 1 }, /* force TLSv10 */
@@ -1916,6 +2279,7 @@ static struct srv_kw_list srv_kws = { "SSL", { }, {
 	{ "npn",                     srv_parse_npn,                1, 1, 1 }, /* Set NPN supported protocols */
 	{ "send-proxy-v2-ssl",       srv_parse_send_proxy_ssl,     0, 1, 1 }, /* send PROXY protocol header v2 with SSL info */
 	{ "send-proxy-v2-ssl-cn",    srv_parse_send_proxy_cn,      0, 1, 1 }, /* send PROXY protocol header v2 with CN */
+	{ "sigalgs",                 srv_parse_sigalgs,            1, 1, 1 }, /* signature algorithms */
 	{ "sni",                     srv_parse_sni,                1, 1, 1 }, /* send SNI extension */
 	{ "ssl",                     srv_parse_ssl,                0, 1, 1 }, /* enable SSL processing */
 	{ "ssl-min-ver",             srv_parse_tls_method_minmax,  1, 1, 1 }, /* minimum version */
@@ -1930,8 +2294,9 @@ static struct srv_kw_list srv_kws = { "SSL", { }, {
 INITCALL1(STG_REGISTER, srv_register_keywords, &srv_kws);
 
 static struct cfg_kw_list cfg_kws = {ILH, {
-	{ CFG_GLOBAL, "ca-base",  ssl_parse_global_ca_crt_base },
-	{ CFG_GLOBAL, "crt-base", ssl_parse_global_ca_crt_base },
+	{ CFG_GLOBAL, "ca-base",  ssl_parse_global_path_base },
+	{ CFG_GLOBAL, "crt-base", ssl_parse_global_path_base },
+	{ CFG_GLOBAL, "key-base", ssl_parse_global_path_base },
 	{ CFG_GLOBAL, "issuers-chain-path", ssl_load_global_issuers_from_path },
 	{ CFG_GLOBAL, "maxsslconn", ssl_parse_global_int },
 	{ CFG_GLOBAL, "ssl-default-bind-options", ssl_parse_default_bind_options },
@@ -1940,17 +2305,22 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "ssl-dh-param-file", ssl_parse_global_dh_param_file },
 #endif
 	{ CFG_GLOBAL, "ssl-mode-async",  ssl_parse_global_ssl_async },
-#ifndef OPENSSL_NO_ENGINE
+#if defined(USE_ENGINE) && !defined(OPENSSL_NO_ENGINE)
 	{ CFG_GLOBAL, "ssl-engine",  ssl_parse_global_ssl_engine },
 #endif
+#ifdef HAVE_SSL_PROVIDERS
+	{ CFG_GLOBAL, "ssl-propquery",  ssl_parse_global_ssl_propquery },
+	{ CFG_GLOBAL, "ssl-provider",  ssl_parse_global_ssl_provider },
+	{ CFG_GLOBAL, "ssl-provider-path",  ssl_parse_global_ssl_provider_path },
+#endif
+	{ CFG_GLOBAL, "ssl-security-level", ssl_parse_security_level },
 	{ CFG_GLOBAL, "ssl-skip-self-issued-ca", ssl_parse_skip_self_issued_ca },
 	{ CFG_GLOBAL, "tune.ssl.cachesize", ssl_parse_global_int },
-#ifndef OPENSSL_NO_DH
 	{ CFG_GLOBAL, "tune.ssl.default-dh-param", ssl_parse_global_default_dh },
-#endif
 	{ CFG_GLOBAL, "tune.ssl.force-private-cache",  ssl_parse_global_private_cache },
 	{ CFG_GLOBAL, "tune.ssl.lifetime", ssl_parse_global_lifetime },
 	{ CFG_GLOBAL, "tune.ssl.maxrecord", ssl_parse_global_int },
+	{ CFG_GLOBAL, "tune.ssl.hard-maxrecord", ssl_parse_global_int },
 	{ CFG_GLOBAL, "tune.ssl.ssl-ctx-cache-size", ssl_parse_global_int },
 	{ CFG_GLOBAL, "tune.ssl.capture-cipherlist-size", ssl_parse_global_capture_buffer },
 	{ CFG_GLOBAL, "tune.ssl.capture-buffer-size", ssl_parse_global_capture_buffer },
@@ -1959,11 +2329,18 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "ssl-default-server-ciphers", ssl_parse_global_ciphers },
 #if defined(SSL_CTX_set1_curves_list)
 	{ CFG_GLOBAL, "ssl-default-bind-curves", ssl_parse_global_curves },
+	{ CFG_GLOBAL, "ssl-default-server-curves", ssl_parse_global_curves },
 #endif
-#ifdef HAVE_SSL_CTX_SET_CIPHERSUITES
+#if defined(SSL_CTX_set1_sigalgs_list)
+	{ CFG_GLOBAL, "ssl-default-bind-sigalgs", ssl_parse_global_sigalgs },
+	{ CFG_GLOBAL, "ssl-default-server-sigalgs", ssl_parse_global_sigalgs },
+#endif
+#if defined(SSL_CTX_set1_client_sigalgs_list)
+	{ CFG_GLOBAL, "ssl-default-bind-client-sigalgs", ssl_parse_global_client_sigalgs },
+	{ CFG_GLOBAL, "ssl-default-server-client-sigalgs", ssl_parse_global_client_sigalgs },
+#endif
 	{ CFG_GLOBAL, "ssl-default-bind-ciphersuites", ssl_parse_global_ciphersuites },
 	{ CFG_GLOBAL, "ssl-default-server-ciphersuites", ssl_parse_global_ciphersuites },
-#endif
 	{ CFG_GLOBAL, "ssl-load-extra-files", ssl_parse_global_extra_files },
 	{ CFG_GLOBAL, "ssl-load-extra-del-ext", ssl_parse_global_extra_noext },
 	{ 0, NULL, NULL },

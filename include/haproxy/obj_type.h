@@ -30,9 +30,9 @@
 #include <haproxy/obj_type-t.h>
 #include <haproxy/pool.h>
 #include <haproxy/proxy-t.h>
+#include <haproxy/quic_sock-t.h>
 #include <haproxy/server-t.h>
 #include <haproxy/stream-t.h>
-#include <haproxy/stream_interface-t.h>
 
 static inline enum obj_type obj_type(const enum obj_type *t)
 {
@@ -52,9 +52,12 @@ static inline const char *obj_type_name(const enum obj_type *t)
 	case OBJ_TYPE_APPCTX:   return "APPCTX";
 	case OBJ_TYPE_CONN:     return "CONN";
 	case OBJ_TYPE_SRVRQ:    return "SRVRQ";
-	case OBJ_TYPE_CS:       return "CS";
+	case OBJ_TYPE_SC:       return "SC";
 	case OBJ_TYPE_STREAM:   return "STREAM";
 	case OBJ_TYPE_CHECK:    return "CHECK";
+#ifdef USE_QUIC
+	case OBJ_TYPE_DGRAM:    return "DGRAM";
+#endif
 	default:                return "!INVAL!";
 	}
 }
@@ -126,16 +129,16 @@ static inline struct appctx *objt_appctx(enum obj_type *t)
 	return __objt_appctx(t);
 }
 
-static inline struct conn_stream *__objt_cs(enum obj_type *t)
+static inline struct stconn *__objt_sc(enum obj_type *t)
 {
-	return (container_of(t, struct conn_stream, obj_type));
+	return (container_of(t, struct stconn, obj_type));
 }
 
-static inline struct conn_stream *objt_cs(enum obj_type *t)
+static inline struct stconn *objt_sc(enum obj_type *t)
 {
-	if (!t || *t != OBJ_TYPE_CS)
+	if (!t || *t != OBJ_TYPE_SC)
 		return NULL;
-	return __objt_cs(t);
+	return __objt_sc(t);
 }
 
 static inline struct connection *__objt_conn(enum obj_type *t)
@@ -186,6 +189,20 @@ static inline struct check *objt_check(enum obj_type *t)
 	return __objt_check(t);
 }
 
+#ifdef USE_QUIC
+static inline struct quic_dgram *__objt_dgram(enum obj_type *t)
+{
+	return container_of(t, struct quic_dgram, obj_type);
+}
+
+static inline struct quic_dgram *objt_dgram(enum obj_type *t)
+{
+	if (!t || *t != OBJ_TYPE_DGRAM)
+		return NULL;
+	return __objt_dgram(t);
+}
+#endif
+
 static inline void *obj_base_ptr(enum obj_type *t)
 {
 	switch (obj_type(t)) {
@@ -197,9 +214,12 @@ static inline void *obj_base_ptr(enum obj_type *t)
 	case OBJ_TYPE_APPCTX:   return __objt_appctx(t);
 	case OBJ_TYPE_CONN:     return __objt_conn(t);
 	case OBJ_TYPE_SRVRQ:    return __objt_resolv_srvrq(t);
-	case OBJ_TYPE_CS:       return __objt_cs(t);
+	case OBJ_TYPE_SC:       return __objt_sc(t);
 	case OBJ_TYPE_STREAM:   return __objt_stream(t);
 	case OBJ_TYPE_CHECK:    return __objt_check(t);
+#ifdef USE_QUIC
+	case OBJ_TYPE_DGRAM:    return __objt_dgram(t);
+#endif
 	default:                return t; // exact pointer for invalid case
 	}
 }

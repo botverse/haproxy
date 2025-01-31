@@ -48,7 +48,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <haproxy/api.h>
-#include <haproxy/time.h>
+#include <haproxy/clock.h>
 #include <haproxy/tools.h>
 
 static FILE *log;
@@ -76,7 +76,7 @@ static int open_trace()
 	if (!log)
 		log = stderr;
 
-	now_ptr = &now;
+	now_ptr = &date;
 	if (getenv("HAPROXY_TRACE_FAST") != NULL) {
 		fast_time = 1;
 		now_ptr = &trace_now;

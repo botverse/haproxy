@@ -12,8 +12,20 @@
 
 #include <haproxy/chunk.h>
 #include <haproxy/htx.h>
+#include <haproxy/net_helper.h>
 
 struct htx htx_empty = { .size = 0, .data = 0, .head  = -1, .tail = -1, .first = -1 };
+
+/* tests show that 63% of these calls are for 64-bit chunks, so better avoid calling
+ * memcpy() for that!
+ */
+static inline __attribute__((always_inline)) void htx_memcpy(void *dst, void *src, size_t len)
+{
+	if (likely(len == 8))
+		write_u64(dst, read_u64(src));
+	else
+		memcpy(dst, src, len);
+}
 
 /* Defragments an HTX message. It removes unused blocks and unwraps the payloads
  * part. A temporary buffer is used to do so. This function never fails. Most of
@@ -50,7 +62,7 @@ struct htx_blk *htx_defrag(struct htx *htx, struct htx_blk *blk, uint32_t blkinf
 			continue;
 
 		blksz = htx_get_blksz(oldblk);
-		memcpy((void *)tmp->blocks + addr, htx_get_blk_ptr(htx, oldblk), blksz);
+		htx_memcpy((void *)tmp->blocks + addr, htx_get_blk_ptr(htx, oldblk), blksz);
 
 		/* update the start-line position */
 		if (htx->first == old)
@@ -80,7 +92,7 @@ struct htx_blk *htx_defrag(struct htx *htx, struct htx_blk *blk, uint32_t blkinf
 	htx->head_addr = htx->end_addr = 0;
 	htx->tail_addr = addr;
 	htx->flags &= ~HTX_FL_FRAGMENTED;
-	memcpy((void *)htx->blocks, (void *)tmp->blocks, htx->size);
+	htx_memcpy((void *)htx->blocks, (void *)tmp->blocks, htx->size);
 
 	return ((blkpos == -1) ? NULL : htx_get_blk(htx, blkpos));
 }
@@ -217,7 +229,7 @@ static struct htx_blk *htx_reserve_nxblk(struct htx *htx, uint32_t blksz)
  *
  *  1: the expansion must be performed in place, there is enough space after
  *      the block's payload to handle it. This is especially true if it is a
- *      compression and not an expension.
+ *      compression and not an expansion.
  *
  *  2: the block's payload must be moved at the new block address before doing
  *     the expansion.
@@ -336,7 +348,7 @@ struct htx_blk *htx_remove_blk(struct htx *htx, struct htx_blk *blk)
 	enum htx_blk_type type;
 	uint32_t pos, addr, sz;
 
-	BUG_ON(htx->head == -1);
+	BUG_ON(!blk || htx->head == -1);
 
 	/* This is the last block in use */
 	if (htx->head == htx->tail) {
@@ -553,7 +565,7 @@ struct htx_blk *htx_add_data_atonce(struct htx *htx, struct ist data)
   append_data:
 	/* Append data and update the block itself */
 	ptr = htx_get_blk_ptr(htx, tailblk);
-	memcpy(ptr+sz, data.ptr, len);
+	htx_memcpy(ptr+sz, data.ptr, len);
 	htx_change_blk_value_len(htx, tailblk, sz+len);
 
 	if (data.len == len) {
@@ -568,7 +580,7 @@ struct htx_blk *htx_add_data_atonce(struct htx *htx, struct ist data)
 		return NULL;
 
 	blk->info += data.len;
-	memcpy(htx_get_blk_ptr(htx, blk), data.ptr, data.len);
+	htx_memcpy(htx_get_blk_ptr(htx, blk), data.ptr, data.len);
 
   end:
 	BUG_ON((int32_t)htx->tail_addr < 0);
@@ -600,7 +612,7 @@ struct htx_blk *htx_replace_blk_value(struct htx *htx, struct htx_blk *blk,
 	if (ret == 1) { /* Replace in place */
 		if (delta <= 0) {
 			/* compression: copy new data first then move the end */
-			memcpy(old.ptr, new.ptr, new.len);
+			htx_memcpy(old.ptr, new.ptr, new.len);
 			memmove(old.ptr + new.len, istend(old),
 				istend(v) - istend(old));
 		}
@@ -608,7 +620,7 @@ struct htx_blk *htx_replace_blk_value(struct htx *htx, struct htx_blk *blk,
 			/* expansion: move the end first then copy new data */
 			memmove(old.ptr + new.len, istend(old),
 				istend(v) - istend(old));
-			memcpy(old.ptr, new.ptr, new.len);
+			htx_memcpy(old.ptr, new.ptr, new.len);
 		}
 
 		/* set the new block size and update HTX message */
@@ -619,19 +631,19 @@ struct htx_blk *htx_replace_blk_value(struct htx *htx, struct htx_blk *blk,
 		void *ptr = htx_get_blk_ptr(htx, blk);
 
 		/* Copy the name, if any */
-		memcpy(ptr, n.ptr, n.len);
+		htx_memcpy(ptr, n.ptr, n.len);
 		ptr += n.len;
 
 		/* Copy value before old part, if any */
-		memcpy(ptr, v.ptr, old.ptr - v.ptr);
+		htx_memcpy(ptr, v.ptr, old.ptr - v.ptr);
 		ptr += old.ptr - v.ptr;
 
 		/* Copy new value */
-		memcpy(ptr, new.ptr, new.len);
+		htx_memcpy(ptr, new.ptr, new.len);
 		ptr += new.len;
 
 		/* Copy value after old part, if any */
-		memcpy(ptr, istend(old), istend(v) - istend(old));
+		htx_memcpy(ptr, istend(old), istend(v) - istend(old));
 
 		/* set the new block size and update HTX message */
 		htx_set_blk_value_len(blk, v.len + delta);
@@ -658,15 +670,15 @@ struct htx_blk *htx_replace_blk_value(struct htx *htx, struct htx_blk *blk,
 		 */
 		memmove(old.ptr + offset + new.len, old.ptr + offset + old.len,
 			istend(v) - istend(old));
-		memcpy(old.ptr + offset, new.ptr, new.len);
+		htx_memcpy(old.ptr + offset, new.ptr, new.len);
 	}
 	return blk;
 }
 
-/* Transfer HTX blocks from <src> to <dst>, stopping on the first block of the
- * type <mark> (typically EOH or EOT) or when <count> bytes were moved
- * (including payload and meta-data). It returns the number of bytes moved and
- * the last HTX block inserted in <dst>.
+/* Transfer HTX blocks from <src> to <dst>, stopping once the first block of the
+ * type <mark> is transferred (typically EOH or EOT) or when <count> bytes were
+ * moved (including payload and meta-data). It returns the number of bytes moved
+ * and the last HTX block inserted in <dst>.
  */
 struct htx_ret htx_xfer_blks(struct htx *dst, struct htx *src, uint32_t count,
 			     enum htx_blk_type mark)
@@ -708,19 +720,13 @@ struct htx_ret htx_xfer_blks(struct htx *dst, struct htx *src, uint32_t count,
 		if (!dstblk)
 			break;
 		dstblk->info = info;
-		memcpy(htx_get_blk_ptr(dst, dstblk), htx_get_blk_ptr(src, blk), sz);
+		htx_memcpy(htx_get_blk_ptr(dst, dstblk), htx_get_blk_ptr(src, blk), sz);
 
-		count -= sizeof(dstblk) + sz;
+		count -= sizeof(*dstblk) + sz;
 		if (blk->info != info) {
 			/* Partial xfer: don't remove <blk> from <src> but
 			 * resize its content */
 			htx_cut_data_blk(src, blk, sz);
-			break;
-		}
-
-		if (type == mark) {
-			blk = htx_get_next_blk(src, blk);
-			srcref = dstref = NULL;
 			break;
 		}
 
@@ -736,15 +742,23 @@ struct htx_ret htx_xfer_blks(struct htx *dst, struct htx *src, uint32_t count,
 		}
 		else if (type == HTX_BLK_EOH || type == HTX_BLK_EOT)
 			srcref = dstref = NULL;
+
+		/* <mark> allows a copy of the block which matched, then stop */
+		if (type == mark) {
+			blk = htx_get_next_blk(src, blk);
+			break;
+		}
 	}
 
 	if (unlikely(dstref)) {
-		/* Headers or trailers part was partially xferred, so rollback the copy
-		 * by removing all block between <dstref> and <dstblk>, both included.
+		/* Headers or trailers part was partially xferred, so rollback
+		 * the copy by removing all block between <dstref> and <dstblk>,
+		 * both included. <dstblk> may be NULL.
 		 */
 		while (dstref && dstref != dstblk)
 			dstref = htx_remove_blk(dst, dstref);
-		htx_remove_blk(dst, dstblk);
+		if (dstblk)
+			htx_remove_blk(dst, dstblk);
 
 		/* <dst> HTX message is empty, it means the headers or trailers
 		 * part is too big to be copied at once.
@@ -805,7 +819,7 @@ struct htx_blk *htx_replace_header(struct htx *htx, struct htx_blk *blk,
 	/* Finally, copy data. */
 	ptr = htx_get_blk_ptr(htx, blk);
 	ist2bin_lc(ptr, name);
-	memcpy(ptr + name.len, value.ptr, value.len);
+	htx_memcpy(ptr + name.len, value.ptr, value.len);
 	return blk;
 }
 
@@ -858,9 +872,9 @@ struct htx_sl *htx_replace_stline(struct htx *htx, struct htx_blk *blk, const st
 	HTX_SL_P2_LEN(sl) = p2.len;
 	HTX_SL_P3_LEN(sl) = p3.len;
 
-	memcpy(HTX_SL_P1_PTR(sl), p1.ptr, p1.len);
-	memcpy(HTX_SL_P2_PTR(sl), p2.ptr, p2.len);
-	memcpy(HTX_SL_P3_PTR(sl), p3.ptr, p3.len);
+	htx_memcpy(HTX_SL_P1_PTR(sl), p1.ptr, p1.len);
+	htx_memcpy(HTX_SL_P2_PTR(sl), p2.ptr, p2.len);
+	htx_memcpy(HTX_SL_P3_PTR(sl), p3.ptr, p3.len);
 
 	return sl;
 }
@@ -873,59 +887,59 @@ struct htx_sl *htx_replace_stline(struct htx *htx, struct htx_blk *blk, const st
  */
 struct htx_ret htx_reserve_max_data(struct htx *htx)
 {
-       struct htx_blk *blk, *tailblk;
-       uint32_t sz, room;
-       int32_t len = htx_free_data_space(htx);
+	struct htx_blk *blk, *tailblk;
+	uint32_t sz, room;
+	int32_t len = htx_free_data_space(htx);
 
-       if (htx->head == -1)
-               goto rsv_new_block;
+	if (htx->head == -1)
+		goto rsv_new_block;
 
-       if (!len)
-               return (struct htx_ret){.ret = 0, .blk = NULL};
+	if (!len)
+		return (struct htx_ret){.ret = 0, .blk = NULL};
 
-       /* get the tail and head block */
-       tailblk = htx_get_tail_blk(htx);
-       if (tailblk == NULL)
-               goto rsv_new_block;
-       sz = htx_get_blksz(tailblk);
+	/* get the tail and head block */
+	tailblk = htx_get_tail_blk(htx);
+	if (tailblk == NULL)
+		goto rsv_new_block;
+	sz = htx_get_blksz(tailblk);
 
-       /* Don't try to append data if the last inserted block is not of the
-        * same type */
-       if (htx_get_blk_type(tailblk) != HTX_BLK_DATA)
-               goto rsv_new_block;
+	/* Don't try to append data if the last inserted block is not of the
+	 * same type */
+	if (htx_get_blk_type(tailblk) != HTX_BLK_DATA)
+		goto rsv_new_block;
 
-       /*
-        * Same type and enough space: append data
-        */
-       if (!htx->head_addr) {
-               if (tailblk->addr+sz != htx->tail_addr)
-                       goto rsv_new_block;
-               room = (htx_pos_to_addr(htx, htx->tail) - htx->tail_addr);
-       }
-       else {
-               if (tailblk->addr+sz != htx->head_addr)
-                       goto rsv_new_block;
-               room = (htx->end_addr - htx->head_addr);
-       }
-       BUG_ON((int32_t)room < 0);
-       if (room < len)
-               len = room;
+	/*
+	 * Same type and enough space: append data
+	 */
+	if (!htx->head_addr) {
+		if (tailblk->addr+sz != htx->tail_addr)
+			goto rsv_new_block;
+		room = (htx_pos_to_addr(htx, htx->tail) - htx->tail_addr);
+	}
+	else {
+		if (tailblk->addr+sz != htx->head_addr)
+			goto rsv_new_block;
+		room = (htx->end_addr - htx->head_addr);
+	}
+	BUG_ON((int32_t)room < 0);
+	if (room < len)
+		len = room;
 
-  append_data:
-       htx_change_blk_value_len(htx, tailblk, sz+len);
+append_data:
+	htx_change_blk_value_len(htx, tailblk, sz+len);
 
-       BUG_ON((int32_t)htx->tail_addr < 0);
-       BUG_ON((int32_t)htx->head_addr < 0);
-       BUG_ON(htx->end_addr > htx->tail_addr);
-       BUG_ON(htx->head_addr > htx->end_addr);
-       return (struct htx_ret){.ret = sz, .blk = tailblk};
+	BUG_ON((int32_t)htx->tail_addr < 0);
+	BUG_ON((int32_t)htx->head_addr < 0);
+	BUG_ON(htx->end_addr > htx->tail_addr);
+	BUG_ON(htx->head_addr > htx->end_addr);
+	return (struct htx_ret){.ret = sz, .blk = tailblk};
 
-  rsv_new_block:
-       blk = htx_add_blk(htx, HTX_BLK_DATA, len);
-       if (!blk)
-               return (struct htx_ret){.ret = 0, .blk = NULL};
-       blk->info += len;
-       return (struct htx_ret){.ret = 0, .blk = blk};
+rsv_new_block:
+	blk = htx_add_blk(htx, HTX_BLK_DATA, len);
+	if (!blk)
+		return (struct htx_ret){.ret = 0, .blk = NULL};
+	blk->info += len;
+	return (struct htx_ret){.ret = 0, .blk = blk};
 }
 
 /* Adds an HTX block of type DATA in <htx>. It first tries to append data if
@@ -939,15 +953,15 @@ size_t htx_add_data(struct htx *htx, const struct ist data)
 	uint32_t sz, room;
 	int32_t len = data.len;
 
-	if (htx->head == -1)
-		goto add_new_block;
-
 	/* Not enough space to store data */
 	if (len > htx_free_data_space(htx))
 		len = htx_free_data_space(htx);
 
 	if (!len)
 		return 0;
+
+	if (htx->head == -1)
+		goto add_new_block;
 
 	/* get the tail and head block */
 	tailblk = htx_get_tail_blk(htx);
@@ -980,7 +994,7 @@ size_t htx_add_data(struct htx *htx, const struct ist data)
   append_data:
 	/* Append data and update the block itself */
 	ptr = htx_get_blk_ptr(htx, tailblk);
-	memcpy(ptr + sz, data.ptr, len);
+	htx_memcpy(ptr + sz, data.ptr, len);
 	htx_change_blk_value_len(htx, tailblk, sz+len);
 
 	BUG_ON((int32_t)htx->tail_addr < 0);
@@ -995,7 +1009,7 @@ size_t htx_add_data(struct htx *htx, const struct ist data)
 		return 0;
 
 	blk->info += len;
-	memcpy(htx_get_blk_ptr(htx, blk), data.ptr, len);
+	htx_memcpy(htx_get_blk_ptr(htx, blk), data.ptr, len);
 	return len;
 }
 
@@ -1074,7 +1088,7 @@ int htx_append_msg(struct htx *dst, const struct htx *src)
 		if (!newblk)
 			goto error;
 		newblk->info = blk->info;
-		memcpy(htx_get_blk_ptr(dst, newblk), htx_get_blk_ptr(src, blk), blksz);
+		htx_memcpy(htx_get_blk_ptr(dst, newblk), htx_get_blk_ptr(src, blk), blksz);
 	}
 
 	return 1;

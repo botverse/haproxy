@@ -20,7 +20,7 @@ is the **initialisation mode**, and the second is the **runtime mode**.
   the Lua code seems to be run in blocking, but it is not the case.
 
 The Lua code is loaded in one or more files. These files contains main code and
-functions. Lua have 7 execution context.
+functions. Lua has 8 execution contexts.
 
 1. The Lua file **body context**. It is executed during the load of the Lua file
    in the HAProxy `[global]` section with the directive `lua-load`. It is
@@ -72,12 +72,8 @@ functions. Lua have 7 execution context.
    `core.register_filter()`. Each declared filter is prefixed by the string
    "lua.".
 
-   .. warning::
-      The Lua filter support is highly experimental. The API is still unstable
-      and may change without notice. No backward compatibility should be
-      expected for now. Use it with an extreme caution and report any issue or
-      comment about it. The feature was unveiled to improve it and to adapt it
-      to real usages.
+8. The **event context**: Inside a function that handles events subscribed
+   through `core.event_sub()` or `Server.event_sub()`.
 
 
 HAProxy Lua Hello world
@@ -116,14 +112,46 @@ On other terminal, you can test with telnet:
     #:~ telnet 127.0.0.1 10001
     hello world
 
+Usage of load parameters
+------------------------
+
+HAProxy lua-load(-per-thread) directives allow a list of parameters after
+the lua file name. These parameters are accessible through an array of args
+using this code `local args = table.pack(...)` in the body of loaded file.
+
+Below, a new version of the hello world using load parameters
+
+HAProxy configuration file (`hello_world.conf`):
+
+::
+
+    global
+       lua-load hello_world.lua "this is not an hello world"
+
+    listen proxy
+       bind 127.0.0.1:10001
+       tcp-request inspect-delay 1s
+       tcp-request content use-service lua.hello_world
+
+HAProxy Lua file (`hello_world.lua`):
+
+.. code-block:: lua
+
+    local args = table.pack(...)
+
+    core.register_service("hello_world", "tcp", function(applet)
+       applet:send(args[1] .. "\n")
+    end)
+
+
 Core class
 ==========
 
 .. js:class:: core
 
    The "core" class contains all the HAProxy core functions. These function are
-   useful for the controlling the execution flow, registering hooks, manipulating
-   global maps or ACL, ...
+   useful for the controlling of the execution flow, registering hooks,
+   manipulating global maps or ACL, ...
 
    "core" class is basically provided with HAProxy. No `require` line is
    required to uses these function.
@@ -131,72 +159,87 @@ Core class
    The "core" class is static, it is not possible to create a new object of this
    type.
 
+.. js:attribute:: core.silent
+
+  :returns: integer
+
+  This attribute is an integer, it contains the value -1. It is a special value
+  used to disable logging.
+
 .. js:attribute:: core.emerg
 
   :returns: integer
 
-  This attribute is an integer, it contains the value of the loglevel "emergency" (0).
+  This attribute is an integer, it contains the value of the loglevel
+  "emergency" (0).
 
 .. js:attribute:: core.alert
 
   :returns: integer
 
-  This attribute is an integer, it contains the value of the loglevel "alert" (1).
+  This attribute is an integer, it contains the value of the loglevel
+  "alert" (1).
 
 .. js:attribute:: core.crit
 
   :returns: integer
 
-  This attribute is an integer, it contains the value of the loglevel "critical" (2).
+  This attribute is an integer, it contains the value of the loglevel
+  "critical" (2).
 
 .. js:attribute:: core.err
 
   :returns: integer
 
-  This attribute is an integer, it contains the value of the loglevel "error" (3).
+  This attribute is an integer, it contains the value of the loglevel
+  "error" (3).
 
 .. js:attribute:: core.warning
 
   :returns: integer
 
-  This attribute is an integer, it contains the value of the loglevel "warning" (4).
+  This attribute is an integer, it contains the value of the loglevel
+  "warning" (4).
 
 .. js:attribute:: core.notice
 
   :returns: integer
 
-  This attribute is an integer, it contains the value of the loglevel "notice" (5).
+  This attribute is an integer, it contains the value of the loglevel
+  "notice" (5).
 
 .. js:attribute:: core.info
 
   :returns: integer
 
-  This attribute is an integer, it contains the value of the loglevel "info" (6).
+  This attribute is an integer, it contains the value of the loglevel
+  "info" (6).
 
 .. js:attribute:: core.debug
 
   :returns: integer
 
-  This attribute is an integer, it contains the value of the loglevel "debug" (7).
+  This attribute is an integer, it contains the value of the loglevel
+  "debug" (7).
 
 .. js:attribute:: core.proxies
 
-  **context**: task, action, sample-fetch, converter
+  **context**: init, task, action, sample-fetch, converter
 
   This attribute is a table of declared proxies (frontend and backends). Each
   proxy give an access to his list of listeners and servers. The table is
   indexed by proxy name, and each entry is of type :ref:`proxy_class`.
 
   .. Warning::
-     if you are declared frontend and backend with the same name, only one of
-     these are listed.
+     if you declared a frontend and backend with the same name, only one of
+     them will be listed.
 
   :see: :js:attr:`core.backends`
   :see: :js:attr:`core.frontends`
 
 .. js:attribute:: core.backends
 
-  **context**: task, action, sample-fetch, converter
+  **context**: init, task, action, sample-fetch, converter
 
   This attribute is a table of declared proxies with backend capability. Each
   proxy give an access to his list of listeners and servers. The table is
@@ -207,7 +250,7 @@ Core class
 
 .. js:attribute:: core.frontends
 
-  **context**: task, action, sample-fetch, converter
+  **context**: init, task, action, sample-fetch, converter
 
   This attribute is a table of declared proxies with frontend capability. Each
   proxy give an access to his list of listeners and servers. The table is
@@ -231,11 +274,13 @@ Core class
   **context**: body, init, task, action, sample-fetch, converter
 
   This function sends a log. The log is sent, according with the HAProxy
-  configuration file, on the default syslog server if it is configured and on
-  the stderr if it is allowed.
+  configuration file, to the loggers relevant to the current context and/or
+  to stderr if it is allowed.
+
+  The exact behaviour depends on tune.lua.log.loggers and tune.lua.log.stderr.
 
   :param integer loglevel: Is the log level associated with the message. It is a
-    number between 0 and 7.
+   number between 0 and 7.
   :param string msg: The log content.
   :see: :js:attr:`core.emerg`, :js:attr:`core.alert`, :js:attr:`core.crit`,
     :js:attr:`core.err`, :js:attr:`core.warning`, :js:attr:`core.notice`,
@@ -303,47 +348,85 @@ Core class
   end
 ..
 
-.. js:function:: core.add_acl(filename, key)
+.. js:function:: core.get_patref(name)
 
   **context**: init, task, action, sample-fetch, converter
 
-  Add the ACL *key* in the ACLs list referenced by the file *filename*.
+  Find the pattern object *name* used by HAProxy. It corresponds to the
+  generic pattern reference used to handle both ACL ands Maps.
 
-  :param string filename: the filename that reference the ACL entries.
+  :param string name: reference name
+  :returns: A :ref:`patref_class` object.
+
+.. js:function:: core.add_acl(name, key)
+
+  **LEGACY**
+
+  **context**: init, task, action, sample-fetch, converter
+
+  Add the ACL *key* in the ACLs list referenced by *name*.
+
+  :param string name: the name that reference the ACL entries.
   :param string key: the key which will be added.
 
-.. js:function:: core.del_acl(filename, key)
+  .. Note::
+     This function is not optimal due to systematic Map reference lookup.
+     It is recommended to use :js:func:`Patref.add()` instead.
+
+.. js:function:: core.del_acl(name, key)
+
+  **LEGACY**
 
   **context**: init, task, action, sample-fetch, converter
 
   Delete the ACL entry referenced by the key *key* in the list of ACLs
-  referenced by *filename*.
+  referenced by *name*.
 
-  :param string filename: the filename that reference the ACL entries.
+  :param string name: the name that reference the ACL entries.
   :param string key: the key which will be deleted.
 
-.. js:function:: core.del_map(filename, key)
+  .. Note::
+     This function is not optimal due to systematic Map reference lookup.
+     It is recommended to use :js:func:`Patref.del()` instead.
+
+.. js:function:: core.del_map(name, key)
+
+  **LEGACY**
 
   **context**: init, task, action, sample-fetch, converter
 
   Delete the map entry indexed with the specified key in the list of maps
-  referenced by his filename.
+  referenced by his name.
 
-  :param string filename: the filename that reference the map entries.
+  :param string name: the name that reference the map entries.
   :param string key: the key which will be deleted.
+
+  .. Note::
+     This function is not optimal due to systematic Map reference lookup.
+     It is recommended to use :js:func:`Patref.del()` instead.
 
 .. js:function:: core.get_info()
 
   **context**: body, init, task, action, sample-fetch, converter
 
-  Returns HAProxy core information. We can found information like the uptime,
+  Returns HAProxy core information. We can find information like the uptime,
   the pid, memory pool usage, tasks number, ...
 
-  These information are also returned by the management socket via the command
+  This information is also returned by the management socket via the command
   "show info". See the management socket documentation for more information
   about the content of these variables.
 
   :returns: an array of values.
+
+.. js:function:: core.get_var()
+
+  **context**: body, init, task, action, sample-fetch, converter
+
+  Returns data stored in the variable <var> converter in Lua type.
+  This is limited to "proc." scoped variables.
+
+  :param string var: The variable name in "proc." scope according with the
+   HAProxy variable syntax.
 
 .. js:function:: core.now()
 
@@ -356,8 +439,8 @@ Core class
   probably returns the same result.
 
   :returns: a table which contains two entries "sec" and "usec". "sec"
-    contains the current at the epoch format, and "usec" contains the
-    current microseconds.
+   contains the current at the epoch format, and "usec" contains the
+   current microseconds.
 
 .. js:function:: core.http_date(date)
 
@@ -428,43 +511,13 @@ Core class
 	Sun Nov  6 08:49:37 1994
 ..
 
-.. js:function:: core.rfc850_date(date)
-
-  **context**: body, init, task, action
-
-  This function take a string representing http date, and returns an integer
-  containing the corresponding date with a epoch format.
-
-  :param string date: a date http-date formatted
-
-.. js:function:: core.asctime_date(date)
-
-  **context**: body, init, task, action
-
-  This function take a string representing http date, and returns an integer
-  containing the corresponding date with a epoch format.
-
-  :param string date: a date http-date formatted
-
 .. js:function:: core.msleep(milliseconds)
 
-  **context**: body, init, task, action
+  **context**: task, action
 
   The `core.msleep()` stops the Lua execution between specified milliseconds.
 
   :param integer milliseconds: the required milliseconds.
-
-.. js:attribute:: core.proxies
-
-  **context**: body, init, task, action, sample-fetch, converter
-
-  Proxies is a table containing the list of all proxies declared in the
-  configuration file. The table is indexed by the proxy name, and each entry
-  of the proxies table is an object of type :ref:`proxy_class`.
-
-  .. warning::
-     if you have declared a frontend and backend with the same name, only one of
-     these are listed.
 
 .. js:function:: core.register_action(name, actions, func [, nb_args])
 
@@ -474,13 +527,13 @@ Core class
   used in HAProxy with the prefix "lua.". An action gets a TXN object class as
   input.
 
-  :param string name: is the name of the converter.
-  :param table actions: is a table of string describing the HAProxy actions who
-                        want to register to. The expected actions are 'tcp-req',
-                        'tcp-res', 'http-req' or 'http-res'.
+  :param string name: is the name of the action.
+  :param table actions: is a table of string describing the HAProxy actions
+   facilities where to expose the new action. Expected facilities  are:
+   'tcp-req', 'tcp-res', 'http-req', 'http-res', 'http-after-res'.
+  :param function func: is the Lua function called to work as an action.
   :param integer nb_args: is the expected number of argument for the action.
-                          By default the value is 0.
-  :param function func: is the Lua function called to work as converter.
+   By default the value is 0.
 
   The prototype of the Lua function used as argument is:
 
@@ -515,6 +568,7 @@ Core class
   frontend http_frt
     mode http
     http-request lua.hello-world
+
 ..
 
   A second example using arguments
@@ -525,6 +579,7 @@ Core class
      txn:Info("Hello world for " .. arg)
   end
   core.register_action("hello-world", { "tcp-req", "http-req" }, hello_world, 2)
+
 ..
 
   This example code is used in HAProxy configuration like this:
@@ -534,15 +589,17 @@ Core class
   frontend tcp_frt
     mode tcp
     tcp-request content lua.hello-world everybody
+
 ..
+
 .. js:function:: core.register_converters(name, func)
 
   **context**: body
 
   Register a Lua function executed as converter. All the registered converters
-  can be used in HAProxy with the prefix "lua.". An converter get a string as
-  input and return a string as output. The registered function can take up to 9
-  values as parameter. All the value are strings.
+  can be used in HAProxy with the prefix "lua.". A converter gets a string as
+  input and returns a string as output. The registered function can take up to 9
+  values as parameter. All the values are strings.
 
   :param string name: is the name of the converter.
   :param function func: is the Lua function called to work as converter.
@@ -558,7 +615,7 @@ Core class
     string.
   * **p1** .. **p5** (*string*): this is a list of string arguments declared in
     the HAProxy configuration file. The number of arguments doesn't exceed 5.
-    The order and the nature of these is conventionally choose by the
+    The order and the nature of these is conventionally chosen by the
     developer.
 
 .. js:function:: core.register_fetches(name, func)
@@ -567,10 +624,10 @@ Core class
 
   Register a Lua function executed as sample fetch. All the registered sample
   fetch can be used in HAProxy with the prefix "lua.". A Lua sample fetch
-  return a string as output. The registered function can take up to 9 values as
-  parameter. All the value are strings.
+  returns a string as output. The registered function can take up to 9 values as
+  parameter. All the values are strings.
 
-  :param string name: is the name of the converter.
+  :param string name: is the name of the sample fetch.
   :param function func: is the Lua function called to work as sample fetch.
 
   The prototype of the Lua function used as argument is:
@@ -580,11 +637,11 @@ Core class
     string function(txn, [p1 [, p2 [, ... [, p5]]]])
 ..
 
-  * **txn** (:ref:`txn_class`): this is the txn object associated with the current
-    request.
+  * **txn** (:ref:`txn_class`): this is the txn object associated with the
+    current request.
   * **p1** .. **p5** (*string*): this is a list of string arguments declared in
     the HAProxy configuration file. The number of arguments doesn't exceed 5.
-    The order and the nature of these is conventionally choose by the
+    The order and the nature of these is conventionally chosen by the
     developer.
   * **Returns**: A string containing some data, or nil if the value cannot be
     returned now.
@@ -614,7 +671,7 @@ Core class
 
   :param string name: is the name of the filter.
   :param table Flt: is a Lua class containing the filter definition (id, flags,
-                       callbacks).
+   callbacks).
   :param function func: is the Lua function called to create the Lua filter.
 
   The prototype of the Lua function used as argument is:
@@ -625,10 +682,10 @@ Core class
 ..
 
   * **flt** : Is a filter object based on the class provided in
-              :js:func:`core.register_filter()` function.
+    :js:func:`core.register_filter()` function.
 
   * **args**: Is a table of strings containing all arguments provided through
-              the HAProxy configuration file, on the filter line.
+    the HAProxy configuration file, on the filter line.
 
   It must return the filter to use or nil to ignore it. Here, an example of
   filter registration.
@@ -648,6 +705,7 @@ Core class
   frontend http
     mode http
     filter lua.my-filter arg1 arg2 arg3
+
 ..
 
   :see: :js:class:`Filter`
@@ -656,14 +714,14 @@ Core class
 
   **context**: body
 
-  Register a Lua function executed as a service. All the registered service can
-  be used in HAProxy with the prefix "lua.". A service gets an object class as
-  input according with the required mode.
+  Register a Lua function executed as a service. All the registered services
+  can be used in HAProxy with the prefix "lua.". A service gets an object class
+  as input according with the required mode.
 
-  :param string name: is the name of the converter.
+  :param string name: is the name of the service.
   :param string mode: is string describing the required mode. Only 'tcp' or
-                      'http' are allowed.
-  :param function func: is the Lua function called to work as converter.
+   'http' are allowed.
+  :param function func: is the Lua function called to work as service.
 
   The prototype of the Lua function used as argument is:
 
@@ -681,11 +739,11 @@ Core class
   .. warning::
      Applets of type 'http' cannot be called from 'tcp-*' rulesets. Only the
      'http-*' rulesets are authorized, this means that is not possible to call
-     an HTTP applet from a proxy in tcp mode. Applets of type 'tcp' can be
+     a HTTP applet from a proxy in tcp mode. Applets of type 'tcp' can be
      called from anywhere.
 
-  Here, an example of service registration. The service just send an 'Hello world'
-  as an http response.
+  Here, an example of service registration. The service just send an
+  'Hello world' as an http response.
 
 .. code-block:: lua
 
@@ -724,35 +782,40 @@ Core class
 
   It takes no input, and no output is expected.
 
-.. js:function:: core.register_task(func)
+.. js:function:: core.register_task(func[, arg1[, arg2[, ...[, arg4]]]])
 
-  **context**: body, init, task, action, sample-fetch, converter
+  **context**: body, init, task, action, sample-fetch, converter, event
 
   Register and start independent task. The task is started when the HAProxy
   main scheduler starts. For example this type of tasks can be executed to
   perform complex health checks.
 
-  :param function func: is the Lua function called to work as initializer.
+  :param function func: is the Lua function called to work as an async task.
+
+  Up to 4 optional arguments (all types supported) may be passed to the
+  function. (They will be passed as-is to the task function)
 
   The prototype of the Lua function used as argument is:
 
 .. code-block:: lua
 
-    function()
+    function([arg1[, arg2[, ...[, arg4]]]])
 ..
 
-  It takes no input, and no output is expected.
+  It takes up to 4 optional arguments (provided when registering), and no
+  output is expected.
+
+  See also :js:func:`core.queue` to dynamically pass data between main context
+  and tasks or even between tasks.
 
 .. js:function:: core.register_cli([path], usage, func)
 
   **context**: body
 
-  Register and start independent task. The task is started when the HAProxy
-  main scheduler starts. For example this type of tasks can be executed to
-  perform complex health checks.
+  Register a custom cli that will be available from haproxy stats socket.
 
   :param array path: is the sequence of word for which the cli execute the Lua
-    binding.
+   binding.
   :param string usage: is the usage message displayed in the help.
   :param function func: is the Lua function called to handle the CLI commands.
 
@@ -781,7 +844,8 @@ Core class
     > show ssl stats all
 ..
 
-  Then, arg1, arg2 and arg3 will contains respectively "show", "ssl" and "stats".
+  Then, arg1, arg2 and arg3 will contains respectively "show", "ssl" and
+  "stats".
   arg4 will contain "all". arg5 contains nil.
 
 .. js:function:: core.set_nice(nice)
@@ -792,20 +856,26 @@ Core class
 
   :param integer nice: the nice value, it must be between -1024 and 1024.
 
-.. js:function:: core.set_map(filename, key, value)
+.. js:function:: core.set_map(name, key, value)
+
+  **LEGACY**
 
   **context**: init, task, action, sample-fetch, converter
 
   Set the value *value* associated to the key *key* in the map referenced by
-  *filename*.
+  *name*.
 
-  :param string filename: the Map reference
+  :param string name: the Map reference
   :param string key: the key to set or replace
   :param string value: the associated value
 
+  .. Note::
+     This function is not optimal due to systematic Map reference lookup.
+     It is recommended to use :js:func:`Patref.set()` instead.
+
 .. js:function:: core.sleep(int seconds)
 
-  **context**: body, init, task, action
+  **context**: task, action
 
   The `core.sleep()` functions stop the Lua execution between specified seconds.
 
@@ -835,12 +905,20 @@ Core class
 
   :returns: A :ref:`concat_class` object.
 
+.. js:function:: core.queue()
+
+  **context**: body, init, task, event, action, sample-fetch, converter
+
+  This function returns a new queue object.
+
+  :returns: A :ref:`queue_class` object.
+
 .. js:function:: core.done(data)
 
   **context**: body, init, task, action, sample-fetch, converter
 
   :param any data: Return some data for the caller. It is useful with
-    sample-fetches and sample-converters.
+   sample-fetches and sample-converters.
 
   Immediately stops the current Lua execution and returns to the caller which
   may be a sample fetch, a converter or an action and returns the specified
@@ -850,7 +928,7 @@ Core class
 
 .. js:function:: core.yield()
 
-  **context**: task, action, sample-fetch, converter
+  **context**: task, action
 
   Give back the hand at the HAProxy scheduler. It is used when the LUA
   processing consumes a lot of processing time.
@@ -860,7 +938,7 @@ Core class
   **context**: body, init, task, action, sample-fetch, converter
 
   :param network: is a string describing an ipv4 or ipv6 address and optionally
-    its network length, like this: "127.0.0.1/8" or "aaaa::1234/32".
+   its network length, like this: "127.0.0.1/8" or "aaaa::1234/32".
   :returns: a userdata containing network or nil if an error occurs.
 
   Parse ipv4 or ipv6 addresses and its facultative associated network.
@@ -872,10 +950,10 @@ Core class
   :param addr1: is an address created with "core.parse_addr".
   :param addr2: is an address created with "core.parse_addr".
   :returns: boolean, true if the network of the addresses match, else returns
-    false.
+   false.
 
-  Match two networks. For example "127.0.0.1/32" matches "127.0.0.0/8". The order
-  of network is not important.
+  Match two networks. For example "127.0.0.1/32" matches "127.0.0.0/8". The
+  order of network is not important.
 
 .. js:function:: core.tokenize(str, separators [, noblank])
 
@@ -911,6 +989,104 @@ Core class
 	]
 ..
 
+.. js:function:: core.event_sub(event_types, func)
+
+  **context**: body, init, task, action, sample-fetch, converter
+
+  Register a function that will be called on specific system events.
+
+  :param array event_types: array of string containing the event types you want
+   to subscribe to
+  :param function func: is the Lua function called when one of the subscribed
+   events occur.
+  :returns: A :ref:`event_sub_class` object.
+  :see: :js:func:`Server.event_sub()`.
+
+  List of available event types :
+
+   **SERVER** Family:
+
+    * **SERVER_ADD**: when a server is added
+    * **SERVER_DEL**: when a server is removed
+    * **SERVER_DOWN**: when a server state goes from UP to DOWN
+    * **SERVER_UP**: when a server state goes from DOWN to UP
+    * **SERVER_STATE**: when a server state changes
+    * **SERVER_ADMIN**: when a server administrative state changes
+    * **SERVER_CHECK**: when a server's check status change is reported.
+      Be careful when subscribing to this type since many events might be
+      generated.
+
+   .. Note::
+     Use **SERVER** in **event_types** to subscribe to all server events types
+     at once. Note that this should only be used for testing purposes since a
+     single event source could result in multiple events types being generated.
+     (e.g.: SERVER_STATE will always be generated for each SERVER_DOWN or
+     SERVER_UP)
+
+  The prototype of the Lua function used as argument is:
+
+.. code-block:: lua
+
+    function(event, event_data, sub, when)
+..
+
+  * **event** (*string*): the event type (one of the **event_types** specified
+    when subscribing)
+  * **event_data**: specific to each event family (For **SERVER** family,
+    a :ref:`server_event_class` object)
+  * **sub**: class to manage the subscription from within the event
+    (a :ref:`event_sub_class` object)
+  * **when**: timestamp corresponding to the date when the event was generated.
+    It is an integer representing the number of seconds elapsed since Epoch.
+    It may be provided as optional argument to `os.date()` lua function to
+    convert it to a string according to a given format string.
+
+  .. Warning::
+    The callback function will only be scheduled on the very same thread that
+    performed the subscription.
+
+    Moreover, each thread treats events sequentially. It means that if you
+    have, let's say SERVER_UP followed by a SERVER_DOWN in a short timelapse,
+    then the cb function will first be called with SERVER_UP, and once it's
+    done handling the event, the cb function will be called again with
+    SERVER_DOWN.
+
+    This is to ensure event consistency when it comes to logging / triggering
+    logic from lua.
+
+    Your lua cb function may yield if needed, but you're pleased to process the
+    event as fast as possible to prevent the event queue from growing up,
+    depending on the event flow that is expected for the given subscription.
+
+    To prevent abuses, if the event queue for the current subscription goes
+    over a certain amount of unconsumed events, the subscription will pause
+    itself automatically for as long as it takes for your handler to catch up.
+    This would lead to events being missed, so an error will be reported in the
+    logs to warn you about that.
+    This is not something you want to let happen too often, it may indicate
+    that you subscribed to an event that is occurring too frequently or/and
+    that your callback function is too slow to keep up the pace and you should
+    review it.
+
+    If you want to do some parallel processing because your callback functions
+    are slow: you might want to create subtasks from lua using
+    :js:func:`core.register_task()` from within your callback function to
+    perform the heavy job in a dedicated task and allow remaining events to be
+    processed more quickly.
+
+.. js:function:: core.disable_legacy_mailers()
+
+  **LEGACY**
+
+  **context**: body, init
+
+  Disable the sending of email alerts through the legacy email sending
+  function when mailers are used in the configuration.
+
+  Use this when sending email alerts directly from lua.
+
+  :see: :js:func:`Proxy.get_mailers()`
+
 .. _proxy_class:
 
 Proxy class
@@ -925,9 +1101,25 @@ Proxy class
 
   Contain the name of the proxy.
 
+  .. warning::
+     This attribute is now deprecated and will eventually be removed.
+     Please use :js:func:`Proxy.get_name()` function instead.
+
+.. js:function:: Proxy.get_name()
+
+  Returns the name of the proxy.
+
 .. js:attribute:: Proxy.uuid
 
   Contain the unique identifier of the proxy.
+
+  .. warning::
+     This attribute is now deprecated and will eventually be removed.
+     Please use :js:func:`Proxy.get_uuid()` function instead.
+
+.. js:function:: Proxy.get_uuid()
+
+  Returns the unique identifier of the proxy.
 
 .. js:attribute:: Proxy.servers
 
@@ -936,7 +1128,8 @@ Proxy class
 
 .. js:attribute:: Proxy.stktable
 
-  Contains a stick table object attached to the proxy.
+  Contains a stick table object of type :ref:`sticktable_class` attached to the
+  proxy.
 
 .. js:attribute:: Proxy.listeners
 
@@ -949,7 +1142,7 @@ Proxy class
   Pause the proxy. See the management socket documentation for more information.
 
   :param class_proxy px: A :ref:`proxy_class` which indicates the manipulated
-    proxy.
+   proxy.
 
 .. js:function:: Proxy.resume(px)
 
@@ -957,14 +1150,14 @@ Proxy class
   information.
 
   :param class_proxy px: A :ref:`proxy_class` which indicates the manipulated
-    proxy.
+   proxy.
 
 .. js:function:: Proxy.stop(px)
 
   Stop the proxy. See the management socket documentation for more information.
 
   :param class_proxy px: A :ref:`proxy_class` which indicates the manipulated
-    proxy.
+   proxy.
 
 .. js:function:: Proxy.shut_bcksess(px)
 
@@ -972,14 +1165,14 @@ Proxy class
   documentation for more information.
 
   :param class_proxy px: A :ref:`proxy_class` which indicates the manipulated
-    proxy.
+   proxy.
 
 .. js:function:: Proxy.get_cap(px)
 
   Returns a string describing the capabilities of the proxy.
 
   :param class_proxy px: A :ref:`proxy_class` which indicates the manipulated
-    proxy.
+   proxy.
   :returns: a string "frontend", "backend", "proxy" or "ruleset".
 
 .. js:function:: Proxy.get_mode(px)
@@ -987,8 +1180,26 @@ Proxy class
   Returns a string describing the mode of the current proxy.
 
   :param class_proxy px: A :ref:`proxy_class` which indicates the manipulated
-    proxy.
-  :returns: a string "tcp", "http", "health" or "unknown"
+   proxy.
+  :returns: a string "tcp", "http", "syslog" or "unknown"
+
+.. js:function:: Proxy.get_srv_act(px)
+
+  Returns the number of current active servers for the current proxy that are
+  eligible for LB.
+
+  :param class_proxy px: A :ref:`proxy_class` which indicates the manipulated
+   proxy.
+  :returns: an integer
+
+.. js:function:: Proxy.get_srv_bck(px)
+
+  Returns the number backup servers for the current proxy that are eligible
+  for LB.
+
+  :param class_proxy px: A :ref:`proxy_class` which indicates the manipulated
+   proxy.
+  :returns: an integer
 
 .. js:function:: Proxy.get_stats(px)
 
@@ -996,8 +1207,71 @@ Proxy class
   not the same if the proxy is frontend or a backend.
 
   :param class_proxy px: A :ref:`proxy_class` which indicates the manipulated
-    proxy.
+   proxy.
   :returns: a key/value table containing stats
+
+.. js:function:: Proxy.get_mailers(px)
+
+  **LEGACY**
+
+  Returns a table containing mailers config for the current proxy or nil
+  if mailers are not available for the proxy.
+
+  :param class_proxy px: A :ref:`proxy_class` which indicates the manipulated
+   proxy.
+  :returns: a :ref:`proxy_mailers_class` containing proxy mailers config
+
+.. _proxy_mailers_class:
+
+ProxyMailers class
+==================
+
+**LEGACY**
+
+.. js:class:: ProxyMailers
+
+  This class provides mailers config for a given proxy.
+
+  If sending emails directly from lua, please consider
+  :js:func:`core.disable_legacy_mailers()` to disable the email sending from
+  haproxy. (Or email alerts will be sent twice...)
+
+.. js:attribute:: ProxyMailers.track_server_health
+
+  Boolean set to true if the option "log-health-checks" is configured on
+  the proxy, meaning that all server checks event should trigger email alerts.
+
+.. js:attribute:: ProxyMailers.log_level
+
+  An integer, the maximum log level that triggers email alerts. It is a number
+  between 0 and 7 as defined by option "email-alert level".
+
+.. js:attribute:: ProxyMailers.mailservers
+
+  An array containing the list of mail servers that should receive email alerts.
+  Each array entry is a name:desc pair where desc represents the full server
+  address (including port) as described in haproxy's configuration file.
+
+.. js:attribute:: ProxyMailers.mailservers_timeout
+
+  An integer representing the maximum time in milliseconds to wait for the
+  email to be sent. See "timeout mail" directive from "mailers" section in
+  haproxy configuration file.
+
+.. js:attribute:: ProxyMailers.smtp_hostname
+
+  A string containing the hostname to use for the SMTP transaction.
+  (option "email-alert myhostname")
+
+.. js:attribute:: ProxyMailers.smtp_from
+
+  A string containing the "MAIL FROM" address to use for the SMTP transaction.
+  (option "email-alert from")
+
+.. js:attribute:: ProxyMailers.smtp_to
+
+  A string containing the "RCPT TO" address to use for the SMTP transaction.
+  (option "email-alert to")
 
 .. _server_class:
 
@@ -1012,17 +1286,76 @@ Server class
 
   Contain the name of the server.
 
+  .. warning::
+     This attribute is now deprecated and will eventually be removed.
+     Please use :js:func:`Server.get_name()` function instead.
+
+.. js:function:: Server.get_name(sv)
+
+  Returns the name of the server.
+
 .. js:attribute:: Server.puid
 
   Contain the proxy unique identifier of the server.
+
+  .. warning::
+     This attribute is now deprecated and will eventually be removed.
+     Please use :js:func:`Server.get_puid()` function instead.
+
+.. js:function:: Server.get_puid(sv)
+
+  Returns the proxy unique identifier of the server.
+
+.. js:function:: Server.get_rid(sv)
+
+  Returns the rid (revision ID) of the server.
+  It is an unsigned integer that is set upon server creation. Value is derived
+  from a global counter that starts at 0 and is incremented each time one or
+  multiple server deletions are followed by a server addition (meaning that
+  old name/id reuse could occur).
+
+  Combining server name/id with server rid yields a process-wide unique
+  identifier.
 
 .. js:function:: Server.is_draining(sv)
 
   Return true if the server is currently draining sticky connections.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
   :returns: a boolean
+
+.. js:function:: Server.is_backup(sv)
+
+  Return true if the server is a backup server
+
+  :param class_server sv: A :ref:`server_class` which indicates the manipulated
+   server.
+  :returns: a boolean
+
+.. js:function:: Server.is_dynamic(sv)
+
+  Return true if the server was instantiated at runtime (e.g.: from the cli)
+
+  :param class_server sv: A :ref:`server_class` which indicates the manipulated
+   server.
+  :returns: a boolean
+
+.. js:function:: Server.get_cur_sess(sv)
+
+  Return the number of currently active sessions on the server
+
+  :param class_server sv: A :ref:`server_class` which indicates the manipulated
+   server.
+  :returns: an integer
+
+.. js:function:: Server.get_pend_conn(sv)
+
+  Return the number of pending connections to the server
+
+  :param class_server sv: A :ref:`server_class` which indicates the manipulated
+   server.
+  :returns: an integer
 
 .. js:function:: Server.set_maxconn(sv, weight)
 
@@ -1030,7 +1363,7 @@ Server class
   socket documentation for more information about the format of the string.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
   :param string maxconn: A string describing the server maximum connections.
 
 .. js:function:: Server.get_maxconn(sv, weight)
@@ -1038,7 +1371,7 @@ Server class
   This function returns an integer representing the server maximum connections.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
   :returns: an integer.
 
 .. js:function:: Server.set_weight(sv, weight)
@@ -1047,7 +1380,7 @@ Server class
   documentation for more information about the format of the string.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
   :param string weight: A string describing the server weight.
 
 .. js:function:: Server.get_weight(sv)
@@ -1055,7 +1388,7 @@ Server class
   This function returns an integer representing the server weight.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
   :returns: an integer.
 
 .. js:function:: Server.set_addr(sv, addr[, port])
@@ -1064,7 +1397,7 @@ Server class
   documentation for more information about the format of the string.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
   :param string addr: A string describing the server address.
 
 .. js:function:: Server.get_addr(sv)
@@ -1072,7 +1405,7 @@ Server class
   Returns a string describing the address of the server.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
   :returns: A string
 
 .. js:function:: Server.get_stats(sv)
@@ -1080,8 +1413,16 @@ Server class
   Returns server statistics.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
   :returns: a key/value table containing stats
+
+.. js:function:: Server.get_proxy(sv)
+
+  Returns the parent proxy to which the server belongs.
+
+  :param class_server sv: A :ref:`server_class` which indicates the manipulated
+   server.
+  :returns: a :ref:`proxy_class` or nil if not available
 
 .. js:function:: Server.shut_sess(sv)
 
@@ -1089,7 +1430,7 @@ Server class
   documentation for more information about this function.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
 
 .. js:function:: Server.set_drain(sv)
 
@@ -1097,7 +1438,7 @@ Server class
   information about this function.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
 
 .. js:function:: Server.set_maint(sv)
 
@@ -1105,7 +1446,7 @@ Server class
   information about this function.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
 
 .. js:function:: Server.set_ready(sv)
 
@@ -1113,7 +1454,7 @@ Server class
   about this function.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
 
 .. js:function:: Server.check_enable(sv)
 
@@ -1121,7 +1462,7 @@ Server class
   information about this function.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
 
 .. js:function:: Server.check_disable(sv)
 
@@ -1129,7 +1470,7 @@ Server class
   information about this function.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
 
 .. js:function:: Server.check_force_up(sv)
 
@@ -1137,7 +1478,7 @@ Server class
   information about this function.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
 
 .. js:function:: Server.check_force_nolb(sv)
 
@@ -1145,7 +1486,7 @@ Server class
   information about this function.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
 
 .. js:function:: Server.check_force_down(sv)
 
@@ -1153,7 +1494,7 @@ Server class
   information about this function.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
 
 .. js:function:: Server.agent_enable(sv)
 
@@ -1161,7 +1502,7 @@ Server class
   information about this function.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
 
 .. js:function:: Server.agent_disable(sv)
 
@@ -1169,7 +1510,7 @@ Server class
   information about this function.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
 
 .. js:function:: Server.agent_force_up(sv)
 
@@ -1177,7 +1518,7 @@ Server class
   information about this function.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
 
 .. js:function:: Server.agent_force_down(sv)
 
@@ -1185,7 +1526,88 @@ Server class
   information about this function.
 
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
-    server.
+   server.
+
+.. js:function:: Server.tracking(sv)
+
+  Check if the current server is tracking another server.
+
+  :param class_server sv: A :ref:`server_class` which indicates the manipulated
+   server.
+  :returns: A :ref:`server_class` which indicates the tracked server or nil if
+   the server doesn't track another one.
+
+.. js:function:: Server.get_trackers(sv)
+
+  Check if the current server is being tracked by other servers.
+
+  :param class_server sv: A :ref:`server_class` which indicates the manipulated
+   server.
+  :returns: An array of :ref:`server_class` which indicates the tracking
+   servers (might be empty)
+
+.. js:function:: Server.event_sub(sv, event_types, func)
+
+  Register a function that will be called on specific server events.
+  It works exactly like :js:func:`core.event_sub()` except that the subscription
+  will be performed within the server dedicated subscription list instead of the
+  global one.
+  (Your callback function will only be called for server events affecting sv)
+
+  See :js:func:`core.event_sub()` for function usage.
+
+  A key advantage to using :js:func:`Server.event_sub()` over
+  :js:func:`core.event_sub()` for servers is that :js:func:`Server.event_sub()`
+  allows you to be notified for servers events of a single server only.
+  It removes the needs for extra filtering in your callback function if you only
+  care about a single server, and also prevents useless wakeups.
+
+  For instance, if you want to be notified for UP/DOWN events on a given set of
+  servers, it is recommended to perform multiple per-server subscriptions since
+  it will be more efficient that doing a single global subscription that will
+  filter the received events.
+  Unless you really want to be notified for servers events of ALL servers of
+  course, which could make sense given you setup but should be avoided if you
+  have an important number of servers as it will add a significant load on your
+  haproxy process in case of multiple servers state change in a short amount of
+  time.
+
+  .. Note::
+     You may also combine :js:func:`core.event_sub()` with
+     :js:func:`Server.event_sub()`.
+
+     Also, don't forget that you can use :js:func:`core.register_task()` from
+     your callback function if needed. (ie: parallel work)
+
+  Here is a working example combining :js:func:`core.event_sub()` with
+  :js:func:`Server.event_sub()` and :js:func:`core.register_task()`
+  (This only serves as a demo, this is not necessarily useful to do so)
+
+.. code-block:: lua
+
+  core.event_sub({"SERVER_ADD"}, function(event, data, sub)
+    -- in the global event handler
+    if data["reference"] ~= nil then
+      print("Tracking new server: ", data["name"])
+      data["reference"]:event_sub({"SERVER_UP", "SERVER_DOWN"}, function(event, data, sub)
+        -- in the per-server event handler
+	if data["reference"] ~= nil then
+          core.register_task(function(server)
+            -- subtask to perform some async work (e.g.: HTTP API calls, sending emails...)
+            print("ASYNC: SERVER ", server:get_name(), " is ", event == "SERVER_UP" and "UP" or "DOWN")
+          end, data["reference"])
+        end
+      end)
+    end
+  end)
+
+..
+
+  In this example, we will first track global server addition events.
+  For each newly added server ("add server" on the cli), we will register a
+  UP/DOWN server subscription.
+  Then, the callback function will schedule the event handling in an async
+  subtask which will receive the server reference as an argument.
 
 .. _listener_class:
 
@@ -1197,8 +1619,292 @@ Listener class
   Returns server statistics.
 
   :param class_listener ls: A :ref:`listener_class` which indicates the
-    manipulated listener.
+   manipulated listener.
   :returns: a key/value table containing stats
+
+.. _event_sub_class:
+
+EventSub class
+==============
+
+.. js:function:: EventSub.unsub()
+
+  End the subscription, the callback function will not be called again.
+
+.. _server_event_class:
+
+ServerEvent class
+=================
+
+.. js:class:: ServerEvent
+
+This class is provided with every **SERVER** events.
+
+See :js:func:`core.event_sub()` for more info.
+
+.. js:attribute:: ServerEvent.name
+
+  Contains the name of the server.
+
+.. js:attribute:: ServerEvent.puid
+
+  Contains the proxy-unique uid of the server
+
+.. js:attribute:: ServerEvent.rid
+
+  Contains the revision ID of the server
+
+.. js:attribute:: ServerEvent.proxy_name
+
+  Contains the name of the proxy to which the server belongs
+
+.. js:attribute:: ServerEvent.proxy_uuid
+
+  Contains the uuid of the proxy to which the server belongs
+
+.. js:attribute:: ServerEvent.reference
+
+  Reference to the live server (A :ref:`server_class`).
+
+  .. Warning::
+     Not available if the server was removed in the meantime.
+     (Will never be set for SERVER_DEL event since the server does not exist
+     anymore)
+
+.. js:attribute:: ServerEvent.state
+
+  A :ref:`server_event_state_class`
+
+  .. Note::
+     Only available for SERVER_STATE event
+
+.. js:attribute:: ServerEvent.admin
+
+  A :ref:`server_event_admin_class`
+
+  .. Note::
+     Only available for SERVER_ADMIN event
+
+.. js:attribute:: ServerEvent.check
+
+  A :ref:`server_event_checkres_class`
+
+  .. Note::
+     Only available for SERVER_CHECK event
+
+.. _server_event_checkres_class:
+
+ServerEventCheckRes class
+=========================
+
+.. js:class:: ServerEventCheckRes
+
+This class describes the result of a server's check.
+
+.. js:attribute:: ServerEventCheckRes.result
+
+  Effective check result.
+
+  Check result is a string and will be set to one of the following values:
+    - "FAILED": the check failed
+    - "PASSED": the check succeeded
+    - "CONDPASS": the check conditionally passed
+
+.. js:attribute:: ServerEventCheckRes.agent
+
+  Boolean set to true if the check is an agent check.
+  Else it is a health check.
+
+.. js:attribute:: ServerEventCheckRes.duration
+
+  Check's duration in milliseconds
+
+.. js:attribute:: ServerEventCheckRes.reason
+
+  Check's status. An array containing three fields:
+    - **short**: a string representing check status short name
+    - **desc**: a string representing check status description
+    - **code**: an integer, this extra information is provided for checks
+      that went through the data analysis stage (>= layer 5)
+
+.. js:attribute:: ServerEventCheckRes.health
+
+  An array containing values about check's health (integers):
+    - **cur**: current health counter:
+       - 0 to (**rise** - 1) = BAD
+       - **rise** to (**rise** + **fall** - 1) = GOOD
+    - **rise**: server will be considered as operational after **rise**
+      consecutive successful checks
+    - **fall**: server will be considered as dead after **fall** consecutive
+      unsuccessful checks
+
+.. _server_event_state_class:
+
+ServerEventState class
+======================
+
+.. js:class:: ServerEventState
+
+This class contains additional info related to **SERVER_STATE** event.
+
+.. js:attribute:: ServerEventState.admin
+
+  Boolean set to true if the server state change is due to an administrative
+  change. Else it is an operational change.
+
+.. js:attribute:: ServerEventState.check
+
+  A :ref:`server_event_checkres_class`, provided if the state change is
+  due to a server check (must be an operational change).
+
+.. js:attribute:: ServerEventState.cause
+
+  Printable state change cause. Might be empty.
+
+.. js:attribute:: ServerEventState.new_state
+
+  New server state due to operational or admin change.
+
+  It is a string that can be any of the following values:
+    - "STOPPED": The server is down
+    - "STOPPING": The server is up but soft-stopping
+    - "STARTING": The server is warming up
+    - "RUNNING": The server is fully up
+
+.. js:attribute:: ServerEventState.old_state
+
+  Previous server state prior to the operational or admin change.
+
+  Can be any value described in **new_state**, but they should differ.
+
+.. js:attribute:: ServerEventState.requeued
+
+  Number of connections that were requeued due to the server state change.
+
+  For a server going DOWN: it is the number of pending server connections
+  that are requeued to the backend (such connections will be redispatched
+  to any server that is suitable according to the configured load balancing
+  algorithm).
+
+  For a server doing UP: it is the number of pending connections on the
+  backend that may be redispatched to the server according to the load
+  balancing algorithm that is in use.
+
+.. _server_event_admin_class:
+
+ServerEventAdmin class
+======================
+
+.. js:class:: ServerEventAdmin
+
+This class contains additional info related to **SERVER_ADMIN** event.
+
+.. js:attribute:: ServerEventAdmin.cause
+
+  Printable admin state change cause. Might be empty.
+
+.. js:attribute:: ServerEventAdmin.new_admin
+
+  New server admin state due to the admin change.
+
+  It is an array of string containing a composition of following values:
+    - "**MAINT**": server is in maintenance mode
+    - "FMAINT": server is in forced maintenance mode (MAINT is also set)
+    - "IMAINT": server is in inherited maintenance mode (MAINT is also set)
+    - "RMAINT": server is in resolve maintenance mode (MAINT is also set)
+    - "CMAINT": server is in config maintenance mode (MAINT is also set)
+    - "**DRAIN**": server is in drain mode
+    - "FDRAIN": server is in forced drain mode (DRAIN is also set)
+    - "IDRAIN": server is in inherited drain mode (DRAIN is also set)
+
+.. js:attribute:: ServerEventAdmin.old_admin
+
+  Previous server admin state prior to the admin change.
+
+  Values are presented as in **new_admin**, but they should differ.
+  (Comparing old and new helps to find out the change(s))
+
+.. js:attribute:: ServerEventAdmin.requeued
+
+  Same as :js:attr:`ServerEventState.requeued` but when the requeue is due to
+  the server administrative state change.
+
+.. _queue_class:
+
+Queue class
+===========
+
+.. js:class:: Queue
+
+  This class provides a generic FIFO storage mechanism that may be shared
+  between multiple lua contexts to easily pass data between them, as stock
+  Lua doesn't provide easy methods for passing data between multiple coroutines.
+
+  inter-task example:
+
+.. code-block:: lua
+
+  -- script wide shared queue
+  local queue = core.queue()
+
+  -- master task
+  core.register_task(function()
+    -- send the date every second
+    while true do
+      queue:push(os.date("%c", core.now().sec))
+      core.sleep(1)
+    end
+  end)
+
+  -- worker task
+  core.register_task(function()
+    while true do
+      -- print the date sent by master
+      print(queue:pop_wait())
+    end
+  end)
+..
+
+  Of course, queue may also be used as a local storage mechanism.
+
+  Use :js:func:`core.queue` to get a new Queue object.
+
+.. js:function:: Queue.size(queue)
+
+  This function returns the number of items within the Queue.
+
+  :param class_queue queue: A :ref:`queue_class` to the current queue
+
+.. js:function:: Queue.push(queue, item)
+
+  This function pushes the item (may be of any type) to the queue.
+  Pushed item cannot be nil or invalid, or an error will be thrown.
+
+  :param class_queue queue: A :ref:`queue_class` to the current queue
+  :returns: boolean true for success and false for error
+
+.. js:function:: Queue.pop(queue)
+
+  This function immediately tries to pop an item from the queue.
+  It returns nil of no item is available at the time of the call.
+
+  :param class_queue queue: A :ref:`queue_class` to the current queue
+  :returns: the item at the top of the stack (any type) or nil if no items
+
+.. js:function:: Queue.pop_wait(queue)
+
+  **context**: task
+
+  This is an alternative to pop() that may be used within task contexts.
+
+  The call waits for data if no item is currently available. This may be
+  useful when used in a while loop to prevent cpu waste.
+
+  Note that this requires yielding, thus it is only available within contexts
+  that support yielding (mainly task context).
+
+  :param class_queue queue: A :ref:`queue_class` to the current queue
+  :returns: the item at the top of the stack (any type) or nil in case of error
 
 .. _concat_class:
 
@@ -1218,14 +1924,15 @@ Concat class
 ..
 
   For each concatenation, Lua:
-  * allocate memory for the result,
-  * catenate the two string copying the strings in the new memory block,
-  * free the old memory block containing the string which is no longer used.
+  - allocates memory for the result,
+  - catenates the two string copying the strings in the new memory block,
+  - frees the old memory block containing the string which is no longer used.
+
   This process does many memory move, allocation and free. In addition, the
-  memory is not really freed, it is just mark mark as unused and wait for the
+  memory is not really freed, it is just marked as unused and waits for the
   garbage collector.
 
-  The Concat class provide an alternative way to concatenate strings. It uses
+  The Concat class provides an alternative way to concatenate strings. It uses
   the internal Lua mechanism (it does not allocate memory), but it doesn't copy
   the data more than once.
 
@@ -1258,16 +1965,16 @@ Concat class
   This function adds a string to the current concatenated string.
 
   :param class_concat concat: A :ref:`concat_class` which contains the currently
-    built string.
+   built string.
   :param string string: A new string to concatenate to the current built
-    string.
+   string.
 
 .. js:function:: Concat.dump(concat)
 
   This function returns the concatenated string.
 
   :param class_concat concat: A :ref:`concat_class` which contains the currently
-    built string.
+   built string.
   :returns: the concatenated string
 
 .. _fetches_class:
@@ -1278,8 +1985,8 @@ Fetches class
 .. js:class:: Fetches
 
   This class contains a lot of internal HAProxy sample fetches. See the
-  HAProxy "configuration.txt" documentation for more information about her
-  usage. They are the chapters 7.3.2 to 7.3.6.
+  HAProxy "configuration.txt" documentation for more information.
+  (chapters 7.3.2 to 7.3.6)
 
   .. warning::
      some sample fetches are not available in some context. These limitations
@@ -1288,17 +1995,17 @@ Fetches class
   :see: :js:attr:`TXN.f`
   :see: :js:attr:`TXN.sf`
 
-  Fetches are useful for:
+  Fetches are useful to:
 
   * get system time,
   * get environment variable,
   * get random numbers,
-  * known backend status like the number of users in queue or the number of
+  * know backend status like the number of users in queue or the number of
     connections established,
-  * client information like ip source or destination,
+  * get client information like ip source or destination,
   * deal with stick tables,
-  * Established SSL information,
-  * HTTP information like headers or method.
+  * fetch established SSL information,
+  * fetch HTTP information like headers or method.
 
 .. code-block:: lua
 
@@ -1322,13 +2029,13 @@ Converters class
   :see: :js:attr:`TXN.c`
   :see: :js:attr:`TXN.sc`
 
-  Converters provides statefull transformation. They are useful for:
+  Converters provides stateful transformation. They are useful to:
 
-  * converting input to base64,
-  * applying hash on input string (djb2, crc32, sdbm, wt6),
+  * convert input to base64,
+  * apply hash on input string (djb2, crc32, sdbm, wt6),
   * format date,
   * json escape,
-  * extracting preferred language comparing two lists,
+  * extract preferred language comparing two lists,
   * turn to lower or upper chars,
   * deal with stick tables.
 
@@ -1357,18 +2064,18 @@ Channel class
 
   .. warning::
     It is not possible to read from the response in request action, and it is
-    not possible to read for the request channel in response action.
+    not possible to read from the request channel in response action.
 
   .. warning::
     It is forbidden to alter the Channels buffer from HTTP contexts.  So only
     :js:func:`Channel.input`, :js:func:`Channel.output`,
     :js:func:`Channel.may_recv`, :js:func:`Channel.is_full` and
-    :js:func:`Channel.is_resp` can be called from an HTTP conetext.
+    :js:func:`Channel.is_resp` can be called from a HTTP context.
 
   All the functions provided by this class are available in the
   **sample-fetches**, **actions** and **filters** contexts. For **filters**,
   incoming data (offset and length) are relative to the filter. Some functions
-  may yield, by only for **actions**. Yield is not possible for
+  may yield, but only for **actions**. Yield is not possible for
   **sample-fetches**, **converters** and **filters**.
 
 .. js:function:: Channel.append(channel, string)
@@ -1380,7 +2087,7 @@ Channel class
   Same that :js:func:`Channel.insert(channel, string, channel:input())`.
 
   :param class_channel channel: The manipulated Channel.
-  :param string string: The data to copied into incoming data.
+  :param string string: The data to copy at the end of incoming data.
   :returns: an integer containing the amount of bytes copied or -1.
 
 .. js:function:: Channel.data(channel [, offset [, length]])
@@ -1393,20 +2100,19 @@ Channel class
   given offset, are returned. If **length** is set to -1, the function tries to
   retrieve a maximum of data and, if called by an action, it yields if
   necessary. It also waits for more data if the requested length exceeds the
-  available amount of incoming data. Do not providing an offset is the same that
+  available amount of incoming data. Not providing an offset is the same as
   setting it to 0. A positive offset is relative to the beginning of incoming
-  data of the channel buffer while negative offset is relative to their end.
+  data of the channel buffer while negative offset is relative to the end.
 
   If there is no incoming data and the channel can't receive more data, a 'nil'
   value is returned.
 
   :param class_channel channel: The manipulated Channel.
   :param integer offset: *optional* The offset in incoming data to start to get
-                         data. 0 by default. May be negative to be relative to
-                         the end of incoming data.
+   data. 0 by default. May be negative to be relative to the end of incoming
+   data.
   :param integer length: *optional* The expected length of data to retrieve. All
-                         incoming data by default. May be set to -1 to get a
-                         maximum of data.
+   incoming data by default. May be set to -1 to get a maximum of data.
   :returns: a string containing the data found or nil.
 
 .. js:function:: Channel.forward(channel, length)
@@ -1438,10 +2144,10 @@ Channel class
   of the channel buffer while negative offset is relative to their end.
 
   :param class_channel channel: The manipulated Channel.
-  :param string string: The data to copied into incoming data.
-  :param integer offset: *optional* The offset in incomding data where to copied
-                         data. 0 by default. May be negative to be relative to
-                         the end of incoming data.
+  :param string string: The data to copy into incoming data.
+  :param integer offset: *optional* The offset in incoming data where to copy
+   data. 0 by default. May be negative to be relative to the end of incoming
+   data.
   :returns: an integer containing the amount of bytes copied or -1.
 
 .. js:function:: Channel.is_full(channel)
@@ -1462,27 +2168,26 @@ Channel class
 
   This function parses **length** bytes of incoming data of the channel buffer,
   starting at offset **offset**, and returns the first line found, including the
-  '\\n'.  The data are not removed from the buffer. If no line is found, all data
-  are returned.
+  '\\n'.  The data are not removed from the buffer. If no line is found, all
+  data are returned.
 
   By default, if no length is provided, all incoming data, starting at the given
   offset, are evaluated. If **length** is set to -1, the function tries to
   retrieve a maximum of data and, if called by an action, yields if
   necessary. It also waits for more data if the requested length exceeds the
-  available amount of incoming data. Do not providing an offset is the same that
+  available amount of incoming data. Not providing an offset is the same as
   setting it to 0. A positive offset is relative to the beginning of incoming
-  data of the channel buffer while negative offset is relative to their end.
+  data of the channel buffer while negative offset is relative to the end.
 
   If there is no incoming data and the channel can't receive more data, a 'nil'
   value is returned.
 
   :param class_channel channel: The manipulated Channel.
-  :param integer offset: *optional* The offset in incomding data to start to
-                         parse data. 0 by default. May be negative to be
-                         relative to the end of incoming data.
+  :param integer offset: *optional* The offset in incoming data to start to
+   parse data. 0 by default. May be negative to be relative to the end of
+   incoming data.
   :param integer length: *optional* The length of data to parse. All incoming
-                         data by default. May be set to -1 to get a maximum of
-                         data.
+   data by default. May be set to -1 to get a maximum of data.
   :returns: a string containing the line found or nil.
 
 .. js:function:: Channel.may_recv(channel)
@@ -1509,7 +2214,7 @@ Channel class
   Same that :js:func:`Channel.insert(channel, string, 0)`.
 
   :param class_channel channel: The manipulated Channel.
-  :param string string: The data to copied into incoming data.
+  :param string string: The data to copy in front of incoming data.
   :returns: an integer containing the amount of bytes copied or -1.
 
 .. js:function:: Channel.remove(channel [, offset [, length]])
@@ -1519,16 +2224,16 @@ Channel class
   on success.
 
   By default, if no length is provided, all incoming data, starting at the given
-  offset, are removed. Do not providing an offset is the same that setting it
+  offset, are removed. Not providing an offset is the same as setting it
   to 0. A positive offset is relative to the beginning of incoming data of the
-  channel buffer while negative offset is relative to their end.
+  channel buffer while negative offset is relative to the end.
 
   :param class_channel channel: The manipulated Channel.
-  :param integer offset: *optional* The offset in incomding data where to start
-                         to remove data. 0 by default. May be negative to
-                         be relative to the end of incoming data.
+  :param integer offset: *optional* The offset in incoming data where to start
+   to remove data. 0 by default. May be negative to be relative to the end of
+   incoming data.
   :param integer length: *optional* The length of data to remove. All incoming
-                         data by default.
+   data by default.
   :returns: an integer containing the amount of bytes removed.
 
 .. js:function:: Channel.send(channel, string)
@@ -1536,7 +2241,7 @@ Channel class
   This function requires immediate send of the string **string**. It means the
   string is copied at the beginning of incoming data of the channel buffer and
   immediately forwarded. Unless if the connection is close, and if called by an
-  action, this function yields to copied and forward all the string.
+  action, this function yields to copy and forward all the string.
 
   :param class_channel channel: The manipulated Channel.
   :param string string: The data to send.
@@ -1544,22 +2249,22 @@ Channel class
 
 .. js:function:: Channel.set(channel, string [, offset [, length]])
 
-  This function replace **length** bytes of incoming data of the channel buffer,
-  starting at offset **offset**, by the string **string**. The function returns
-  the copied length on success or -1 if data cannot be copied.
+  This function replaces **length** bytes of incoming data of the channel
+  buffer, starting at offset **offset**, by the string **string**. The function
+  returns the copied length on success or -1 if data cannot be copied.
 
   By default, if no length is provided, all incoming data, starting at the given
-  offset, are replaced. Do not providing an offset is the same that setting it
+  offset, are replaced. Not providing an offset is the same as setting it
   to 0. A positive offset is relative to the beginning of incoming data of the
-  channel buffer while negative offset is relative to their end.
+  channel buffer while negative offset is relative to the end.
 
   :param class_channel channel: The manipulated Channel.
-  :param string string: The data to copied into incoming data.
-  :param integer offset: *optional* The offset in incomding data where to start
-                         the data replacement. 0 by default. May be negative to
-                         be relative to the end of incoming data.
+  :param string string: The data to copy into incoming data.
+  :param integer offset: *optional* The offset in incoming data where to start
+   the data replacement. 0 by default. May be negative to be relative to the
+   end of incoming data.
   :param integer length: *optional* The length of data to replace. All incoming
-                         data by default.
+   data by default.
   :returns: an integer containing the amount of bytes copied or -1.
 
 .. js:function:: Channel.dup(channel)
@@ -1567,7 +2272,7 @@ Channel class
   **DEPRECATED**
 
   This function returns all incoming data found in the channel buffer. The data
-  are not remove from the buffer and can be reprocessed later.
+  are not removed from the buffer and can be reprocessed later.
 
   If there is no incoming data and the channel can't receive more data, a 'nil'
   value is returned.
@@ -1621,7 +2326,7 @@ Channel class
   :returns: a string containing the line found or nil.
 
   .. warning::
-     This function is depdrecated. :js:func:`Channel.line()` must be used to
+     This function is deprecated. :js:func:`Channel.line()` must be used to
      retrieve a line followed by a call to :js:func:`Channel:remove()` to remove
      data.
 
@@ -1634,7 +2339,7 @@ Channel class
 
 .. js:function:: Channel.get_in_len(channel)
 
-  **DEPDRECATED**
+  **DEPRECATED**
 
   This function returns the length of the input part of the buffer. When called
   by a filter, this value is relative to the filter.
@@ -1648,7 +2353,7 @@ Channel class
 
 .. js:function:: Channel.get_out_len(channel)
 
-  **DEPDRECATED**
+  **DEPRECATED**
 
   This function returns the length of the output part of the buffer. When called
   by a filter, this value is relative to the filter.
@@ -1713,7 +2418,7 @@ HTTP class
 
 .. js:function:: HTTP.req_add_header(http, name, value)
 
-  Appends an HTTP header field in the request whose name is
+  Appends a HTTP header field in the request whose name is
   specified in "name" and whose value is defined in "value".
 
   :param class_http http: The related http object.
@@ -1723,7 +2428,7 @@ HTTP class
 
 .. js:function:: HTTP.res_add_header(http, name, value)
 
-  Appends an HTTP header field in the response whose name is
+  Appends a HTTP header field in the response whose name is
   specified in "name" and whose value is defined in "value".
 
   :param class_http http: The related http object.
@@ -1771,7 +2476,7 @@ HTTP class
 
 .. js:function:: HTTP.res_set_header(http, name, value)
 
-  This variable replace all occurrence of all header "name", by only
+  This function replaces all occurrence of all header "name", by only
   one containing the "value".
 
   :param class_http http: The related http object.
@@ -1860,22 +2565,35 @@ HTTPClient class
 .. js:function:: HTTPClient.post(httpclient, request)
 .. js:function:: HTTPClient.delete(httpclient, request)
 
-  Send an HTTP request and wait for a response. GET, HEAD PUT, POST and DELETE methods can be used.
-  The HTTPClient will send asynchronously the data and is able to send and receive more than an HAProxy bufsize.
+  Send a HTTP request and wait for a response. GET, HEAD PUT, POST and DELETE
+  methods can be used.
+  The HTTPClient will send asynchronously the data and is able to send and
+  receive more than HAProxy bufsize.
 
+  The HTTPClient interface is not able to decompress responses, it is not
+  recommended to send an Accept-Encoding in the request so the response is
+  received uncompressed.
 
   :param class httpclient: Is the manipulated HTTPClient.
-  :param table request: Is a table containing the parameters of the request that will be send.
-  :param string request.url: Is a mandatory parameter for the request that contains the URL.
-  :param string request.body: Is an optional parameter for the request that contains the body to send.
-  :param table request.headers: Is an optional parameter for the request that contains the headers to send.
+  :param table request: Is a table containing the parameters of the request
+   that will be send.
+  :param string request.url: Is a mandatory parameter for the request that
+   contains the URL.
+  :param string request.body: Is an optional parameter for the request that
+   contains the body to send.
+  :param table request.headers: Is an optional parameter for the request that
+   contains the headers to send.
+  :param string request.dst: Is an optional parameter for the destination in
+   haproxy address format.
+  :param integer request.timeout: Optional timeout parameter, set a
+   "timeout server" on the connections.
   :returns: Lua table containing the response
 
 
 .. code-block:: lua
 
   local httpclient = core.httpclient()
-  local response = httpclient:post{url="http://127.0.0.1", body=body}
+  local response = httpclient:post{url="http://127.0.0.1", body=body, dst="unix@/var/run/http.sock"}
 
 ..
 
@@ -1888,7 +2606,7 @@ HTTPClient class
         ["content-type"]  = { "text/html" },
         ["cache-control"] = { "no-cache", "no-store" },
     },
-    body = "<html><body><h1>invalid request<h1></body></html>"
+    body = "<html><body><h1>invalid request<h1></body></html>",
   }
 ..
 
@@ -1902,7 +2620,7 @@ TXN class
 
   The txn class contain all the functions relative to the http or tcp
   transaction (Note than a tcp stream is the same than a tcp transaction, but
-  an HTTP transaction is not the same than a tcp stream).
+  a HTTP transaction is not the same than a tcp stream).
 
   The usage of this class permits to retrieve data from the requests, alter it
   and forward it.
@@ -1952,7 +2670,7 @@ TXN class
 
   :returns: An :ref:`http_class`.
 
-  This attribute contains an HTTP class object. It is available only if the
+  This attribute contains a HTTP class object. It is available only if the
   proxy has the "mode http" enabled.
 
 .. js:attribute:: TXN.http_req
@@ -1974,12 +2692,14 @@ TXN class
 .. js:function:: TXN.log(TXN, loglevel, msg)
 
   This function sends a log. The log is sent, according with the HAProxy
-  configuration file, on the default syslog server if it is configured and on
-  the stderr if it is allowed.
+  configuration file, to the loggers relevant to the current context and/or
+  to stderr if it is allowed.
+
+  The exact behaviour depends on tune.lua.log.loggers and tune.lua.log.stderr.
 
   :param class_txn txn: The class txn object containing the data.
-  :param integer loglevel: Is the log level associated with the message. It is a
-    number between 0 and 7.
+  :param integer loglevel: Is the log level associated with the message. It is
+   a number between 0 and 7.
   :param string msg: The log content.
   :see: :js:attr:`core.emerg`, :js:attr:`core.alert`, :js:attr:`core.crit`,
     :js:attr:`core.err`, :js:attr:`core.warning`, :js:attr:`core.notice`,
@@ -1997,7 +2717,7 @@ TXN class
 
   :param class_txn txn: The class txn object containing the data.
   :param string msg: The log content.
-  :see: :js:func:`TXN.log
+  :see: :js:func:`TXN.log`
 
 .. js:function:: TXN.Debug(txn, msg)
 
@@ -2005,7 +2725,7 @@ TXN class
   :param string msg: The log content.
   :see: :js:func:`TXN.log`
 
-  Does the same job than:
+  Does the same job as:
 
 .. code-block:: lua
 
@@ -2020,9 +2740,11 @@ TXN class
   :param string msg: The log content.
   :see: :js:func:`TXN.log`
 
+  Does the same job as:
+
 .. code-block:: lua
 
-  function Debug(txn, msg)
+  function Info(txn, msg)
     TXN.log(txn, core.info, msg)
   end
 ..
@@ -2033,9 +2755,11 @@ TXN class
   :param string msg: The log content.
   :see: :js:func:`TXN.log`
 
+  Does the same job as:
+
 .. code-block:: lua
 
-  function Debug(txn, msg)
+  function Warning(txn, msg)
     TXN.log(txn, core.warning, msg)
   end
 ..
@@ -2046,9 +2770,11 @@ TXN class
   :param string msg: The log content.
   :see: :js:func:`TXN.log`
 
+  Does the same job as:
+
 .. code-block:: lua
 
-  function Debug(txn, msg)
+  function Alert(txn, msg)
     TXN.log(txn, core.alert, msg)
   end
 ..
@@ -2060,11 +2786,11 @@ TXN class
 
   :param class_txn txn: The class txn object containing the data.
   :returns: the opaque data previously stored, or nil if nothing is
-     available.
+   available.
 
 .. js:function:: TXN.set_priv(txn, data)
 
-  Store any data in the current HAProxy transaction. This action replace the
+  Store any data in the current HAProxy transaction. This action replaces the
   old stored data.
 
   :param class_txn txn: The class txn object containing the data.
@@ -2075,28 +2801,30 @@ TXN class
   Converts a Lua type in a HAProxy type and store it in a variable <var>.
 
   :param class_txn txn: The class txn object containing the data.
-  :param string var: The variable name according with the HAProxy variable syntax.
-  :param type value: The value associated to the variable. The type can be string or
-                     integer.
-  :param boolean ifexist: If this parameter is set to a truthy value the variable
-                          will only be set if it was defined elsewhere (i.e. used
-                          within the configuration). For global variables (using the
-                          "proc" scope), they will only be updated and never created.
-                          It is highly recommended to always set this to true.
+  :param string var: The variable name according with the HAProxy variable
+   syntax.
+  :param type value: The value associated to the variable. The type can be
+   string or integer.
+  :param boolean ifexist: If this parameter is set to true the variable will
+   only be set if it was defined elsewhere (i.e. used within the configuration).
+   For global variables (using the "proc" scope), they will only be updated and
+   never created. It is highly recommended to always set this to true.
 
 .. js:function:: TXN.unset_var(TXN, var)
 
   Unset the variable <var>.
 
   :param class_txn txn: The class txn object containing the data.
-  :param string var: The variable name according with the HAProxy variable syntax.
+  :param string var: The variable name according with the HAProxy variable
+   syntax.
 
 .. js:function:: TXN.get_var(TXN, var)
 
   Returns data stored in the variable <var> converter in Lua type.
 
   :param class_txn txn: The class txn object containing the data.
-  :param string var: The variable name according with the HAProxy variable syntax.
+  :param string var: The variable name according with the HAProxy variable
+   syntax.
 
 .. js:function:: TXN.reply([reply])
 
@@ -2110,7 +2838,7 @@ TXN class
   * status : The reply status code. the code 200 is used by default.
   * reason : The reply reason. The reason corresponding to the status code is
     used by default.
-  * headers : An list of headers, indexed by header name. Empty by default. For
+  * headers : A list of headers, indexed by header name. Empty by default. For
     a given name, multiple values are possible, stored in an ordered list.
   * body : The reply body, empty by default.
 
@@ -2144,7 +2872,7 @@ TXN class
   empty reply object, an empty HTTP 200 response is returned to the client. If
   no reply object is provided, the transaction is terminated without any
   reply. If a reply object is provided, it must not exceed the buffer size once
-  converted into the internal HTTP representing. Because for now there is no
+  converted into the internal HTTP representation. Because for now there is no
   easy way to be sure it fits, it is probably better to keep it reasonably
   small.
 
@@ -2176,25 +2904,14 @@ TXN class
 ..
 
   .. warning::
-    It not make sense to call this function from sample-fetches. In this case
-    the behaviour of this one is the same than core.done(): it quit the Lua
+    It does not make sense to call this function from sample-fetches. In this
+    case the behavior is the same than core.done(): it finishes the Lua
     execution. The transaction is really aborted only from an action registered
     function.
 
   :see: :js:func:`TXN.reply`, :js:class:`Reply`
 
-.. js:function:: TXN.set_loglevel(txn, loglevel)
-
-  Is used to change the log level of the current request. The "loglevel" must
-  be an integer between 0 and 7.
-
-  :param class_txn txn: The class txn object containing the data.
-  :param integer loglevel: The required log level. This variable can be one of
-  :see: :js:attr:`core.emerg`, :js:attr:`core.alert`, :js:attr:`core.crit`,
-    :js:attr:`core.err`, :js:attr:`core.warning`, :js:attr:`core.notice`,
-    :js:attr:`core.info`, :js:attr:`core.debug` (log level definitions)
-
-.. js:function:: TXN.set_tos(txn, tos)
+.. js:function:: TXN.set_fc_tos(txn, tos)
 
   Is used to set the TOS or DSCP field value of packets sent to the client to
   the value passed in "tos" on platforms which support this.
@@ -2202,13 +2919,40 @@ TXN class
   :param class_txn txn: The class txn object containing the data.
   :param integer tos: The new TOS os DSCP.
 
-.. js:function:: TXN.set_mark(txn, mark)
+.. js:function:: TXN.set_fc_mark(txn, mark)
 
   Is used to set the Netfilter MARK on all packets sent to the client to the
   value passed in "mark" on platforms which support it.
 
   :param class_txn txn: The class txn object containing the data.
   :param integer mark: The mark value.
+
+.. js:function:: TXN.set_loglevel(txn, loglevel)
+
+  Is used to change the log level of the current request. The "loglevel" must
+  be an integer between 0 and 7 or the special value -1 to disable logging.
+
+  :param class_txn txn: The class txn object containing the data.
+  :param integer loglevel: The required log level. This variable can be one of
+  :see: :js:attr:`core.silent`, :js:attr:`core.emerg`, :js:attr:`core.alert`,
+    :js:attr:`core.crit`, :js:attr:`core.err`, :js:attr:`core.warning`, :js:attr:`core.notice`,
+    :js:attr:`core.info`, :js:attr:`core.debug` (log level definitions)
+
+.. js:function:: TXN.set_mark(txn, mark)
+
+  Alias for :js:func:`TXN.set_fc_mark()`.
+
+  .. warning::
+     This function is deprecated. :js:func:`TXN.set_fc_mark()` must be used
+     instead.
+
+.. js:function:: TXN.set_tos(txn, tos)
+
+  Alias for :js:func:`TXN.set_fc_tos()`.
+
+  .. warning::
+     This function is deprecated. :js:func:`TXN.set_fc_tos()` must be used
+     instead.
 
 .. js:function:: TXN.set_priority_class(txn, prio)
 
@@ -2237,13 +2981,13 @@ Reply class
 
   **context**: action
 
-  This class represents an HTTP response message. It provides some methods to
+  This class represents a HTTP response message. It provides some methods to
   enrich it. Once converted into the internal HTTP representation, the response
   message must not exceed the buffer size. Because for now there is no
   easy way to be sure it fits, it is probably better to keep it reasonably
   small.
 
-  See tune.bufsize in the configuration manual for dettails.
+  See tune.bufsize in the configuration manual for details.
 
 .. code-block:: lua
 
@@ -2362,7 +3106,7 @@ Socket class
 
   :param class_socket socket: Is the manipulated Socket.
   :param string address: can be an IP address or a host name. See below for more
-                         information.
+   information.
   :param integer port: must be an integer number in the range [1..64K].
   :returns: 1 or nil.
 
@@ -2495,7 +3239,7 @@ Socket class
 
   :param class_socket socket: Is the manipulated Socket.
   :param float value: The timeout value. Use floating point to specify
-    milliseconds.
+   milliseconds.
 
 .. _regex_class:
 
@@ -2540,9 +3284,10 @@ Regex class
   Create and compile a regex.
 
   :param string regex: The regular expression according with the libc or pcre
-    standard
+   standard
   :param boolean case_sensitive: Match is case sensitive or not.
-  :returns: boolean status and :ref:`regex_class` or string containing fail reason.
+  :returns: boolean status and :ref:`regex_class` or string containing fail
+   reason.
 
 .. js:function:: Regex.exec(regex, str)
 
@@ -2559,7 +3304,7 @@ Regex class
   :param class_map map: A :ref:`regex_class` object.
   :param string str: The input string will be compared with the compiled regex.
   :returns: a boolean status according with the match result, and
-    a table containing all the string matched in order of declaration.
+   a table containing all the string matched in order of declaration.
 
 .. _map_class:
 
@@ -2568,7 +3313,7 @@ Map class
 
 .. js:class:: Map
 
-  This class permits to do some lookup in HAProxy maps. The declared maps can
+  This class permits to do some lookups in HAProxy maps. The declared maps can
   be modified during the runtime through the HAProxy management socket.
 
 .. code-block:: lua
@@ -2672,13 +3417,13 @@ Map class
   Note that :js:attr:`Map.reg` is also available for compatibility.
 
 
-.. js:function:: Map.new(file, method)
+.. js:function:: Map.new(name, method)
 
   Creates and load a map.
 
-  :param string file: Is the file containing the map.
+  :param string name: Is the name referencing the map.
   :param integer method: Is the map pattern matching method. See the attributes
-    of the Map class.
+   of the Map class.
   :returns: a class Map object.
   :see: The Map attributes: :js:attr:`Map._int`, :js:attr:`Map._ip`,
     :js:attr:`Map._str`, :js:attr:`Map._beg`, :js:attr:`Map._sub`,
@@ -2700,6 +3445,178 @@ Map class
   :param class_map map: Is the class Map object.
   :param string str: Is the string used as key.
   :returns: a string containing the result or empty string if no match.
+
+.. _patref_class:
+
+Patref class
+=================
+
+.. js:class:: Patref
+
+  Patref object corresponds to the internal HAProxy pat_ref element which
+  is used to store ACL and MAP elements. It is identified by its name
+  (reference) which often is a filename, unless it is prefixed by 'virt@'
+  for virtual references or 'opt@' for references that don't necessarily
+  point to real file. From Lua, :ref:`patref_class` object may be used to
+  directly manipulate existing pattern reference storage. For convenience,
+  Patref objects may be directly accessed and listed as a table thanks to
+  index and pairs metamethods. Note however that for the index metamethod,
+  in case of duplicated entries, only the first matching entry is returned.
+
+  .. Warning::
+     Not meant to be shared bewteen multiple contexts. If multiple contexts
+     need to work on the same pattern reference, each context should have
+     its own patref object.
+
+  Patref object is obtained using the :js:func:`core.get_patref()`
+  function
+
+.. js:function:: Patref.get_name(ref)
+
+  :returns: the name of the pattern reference object.
+
+.. js:function:: Patref.is_map(ref)
+
+  :returns: true if the pattern reference is used to handle maps instead
+   of acl, false otherwise.
+
+.. js:function:: Patref.purge(ref)
+
+  Completely prune all pattern reference entries pointed to by Patref object.
+  This special operation doesn't require committing.
+
+.. js:function:: Patref.prepare(ref)
+
+  Create a new empty version for Patref Object. It can be used to manipulate
+  the Patref object with update methods without applying the updates until the
+  commit() method is called.
+
+.. js:function:: Patref.commit(ref)
+
+  Tries to commit pending Patref object updates, that is updates made to the
+  local object will be committed to the underlying patter reference storage
+  in an atomic manner upon success. Upon failure, local pending updates are
+  lost. Upon success, all other pending updates on the pattern reference
+  (e.g.: "prepare" from the cli or from other Patref Lua objects) started
+  before the new one will be pruned.
+
+  :returns: true on success and nil on failure (followed by an error message).
+
+  See :js:func:`Patref.prepare()` and :js:func:`Patref.giveup()`
+
+.. js:function:: Patref.giveup(ref)
+
+  Drop the pending patref version created using Patref:prepare(): get back to
+  live dataset.
+
+.. js:function:: Patref.add(ref, key[, value])
+
+  Add a new key to the pattern reference, with associated value for maps.
+
+  :param string key: the string used as a key
+  :param string value: the string used as value to be associated with the key
+   (only relevant for maps)
+  :returns: true on success and nil on failure (followed by an error message).
+
+  .. Note::
+     Affects the live pattern reference version, unless :js:func:`Patref.prepare()`
+     was called and is still ongoing (waiting for commit or giveup)
+
+.. js:function:: patref.add_bulk(ref, table)
+
+  Adds multiple entries at once to the Pattern reference. It is recommended
+  to use this one over :js:func:`Patref.prepare()` to add a lot of entries
+  at once because this one is more efficient.
+
+  :param table table: For ACL, a table of keys strings: t[0] = "key1",
+   t[1] = "key2"...
+
+   For Maps, a table of key:value string pairs: t["key"] = "value"
+  :returns: true on success and nil on failure (followed by an error message).
+
+  .. Note::
+     Affects the live pattern reference version, unless :js:func:`Patref.prepare()`
+     was called and is still pending (waiting for commit or giveup)
+
+.. js:function:: Patref.del(ref, key)
+
+  Delete all entries matching the input key in the pattern reference. In
+  case of duplicate keys, all keys are removed.
+
+  :param string key: the string used as a key
+  :returns: true on success and false on failure.
+
+  .. Note::
+     Affects the live pattern reference version, unless :js:func:`Patref.prepare()`
+     was called and is still ongoing (waiting for commit or giveup)
+
+.. js:function:: Patref.set(ref, key, value[, force])
+
+  Only relevant for maps. Set existing entries matching key to the provided
+  value. In case of duplicate keys, all matching keys will be set to the new
+  value.
+
+  :param string key: the string used as a key
+  :param string value: the string used as value
+  :param boolean force: create the entry if it doesn't exist (optional,
+   defaults to false)
+  :returns: true on success and nil on failure (followed by an error message)
+
+  .. Note::
+     Affects the live pattern reference version, unless :js:func:`Patref.prepare()`
+     was called and is still ongoing (waiting for commit or giveup)
+
+.. js:function:: Patref.event_sub(ref, event_types, func)
+
+  Register a function that will be called on specific PAT_REF events.
+  See :js:func:`core.event_sub()` for generalities. Please note however that
+  for performance reasons pattern reference events can only be subscribed
+  per pattern reference (not globally). What this means is that the provided
+  callback function will only be called for events affecting the pattern
+  reference pointed by the Patref object (ref) passed as parameter.
+
+  If you want to be notified for events on a given set of pattern references, it
+  is still possible to perform as many per-patref subscriptions as needed.
+
+  Also, for PAT_REF events, no event data is provided (known as "event_data" in
+  callback function's prototype from :js:func:`core.event_sub()`)
+
+  The list of the available event types for the PAT_REF family are:
+
+    * **PAT_REF_ADD**: element was added to the current version of the pattern
+      reference
+    * **PAT_REF_DEL**: element was deleted from the current version of the
+      pattern reference
+    * **PAT_REF_SET**: element was modified in the current version of the
+      pattern reference
+    * **PAT_REF_CLEAR**: all elements were cleared from the current version of
+      the pattern reference
+    * **PAT_REF_COMMIT**: pending element(s) was/were committed in the current
+      version of the pattern reference
+
+   .. Note::
+     Use **PAT_REF** in **event_types** to subscribe to all pattern reference
+     events types at once.
+
+  Here is a working example showing how to trigger a callback function for the
+  pattern reference associated to file "test.map":
+
+.. code-block:: lua
+
+  core.register_init(function()
+    -- We assume that "test.map" is a map file referenced in haproxy config
+    -- file, thus it is loaded during config parsing and is expected to be
+    -- available at init Lua stage. Indeed, the below code wouldn't work if
+    -- used directly within body context, as at that time the config is not
+    -- fully parsed.
+    local map_patref = core.get_patref("test.map")
+    map_patref:event_sub({"PAT_REF_ADD"}, function(event, data, sub)
+      -- in the patref event handler
+      print("entry added!")
+    end)
+  end)
+
+..
 
 .. _applethttp_class:
 
@@ -2736,7 +3653,7 @@ AppletHTTP class
   :returns: A :ref:`converters_class`
 
   This attribute contains a Converters class object. The
-  functions of this object returns always a string.
+  functions of this object always return a string.
 
 .. js:attribute:: AppletHTTP.f
 
@@ -2752,7 +3669,7 @@ AppletHTTP class
   :returns: A :ref:`fetches_class`
 
   This attribute contains a Fetches class object. The functions of
-  this object returns always a string. Note that the applet
+  this object always return a string. Note that the applet
   execution place cannot access to a valid HAProxy core HTTP
   transaction, so some sample fetches related to the HTTP dependent
   values (hdr, path, ...) are not available.
@@ -2799,7 +3716,7 @@ AppletHTTP class
   The attribute headers returns a table containing the HTTP
   headers. The header names are always in lower case. As the header name can be
   encountered more than once in each request, the value is indexed with 0 as
-  first index value. The table have this form:
+  first index value. The table has this form:
 
 .. code-block:: lua
 
@@ -2822,10 +3739,10 @@ AppletHTTP class
 
 .. js:function:: AppletHTTP.add_header(applet, name, value)
 
-  This function add an header in the response. Duplicated headers are not
+  This function adds a header in the response. Duplicated headers are not
   collapsed. The special header *content-length* is used to determinate the
-  response length. If it not exists, a *transfer-encoding: chunked* is set, and
-  all the write from the function *AppletHTTP:send()* become a chunk.
+  response length. If it does not exist, a *transfer-encoding: chunked* is set,
+  and all the write from the function *AppletHTTP:send()* become a chunk.
 
   :param class_AppletHTTP applet: An :ref:`applethttp_class`
   :param string name: the header name
@@ -2859,7 +3776,7 @@ AppletHTTP class
   :param class_AppletHTTP applet: An :ref:`applethttp_class`
   :param integer size: the required read size.
   :returns: always return a string,the string can be empty is the connection is
-            closed.
+   closed.
 
 .. js:function:: AppletHTTP.send(applet, msg)
 
@@ -2875,12 +3792,12 @@ AppletHTTP class
 
   :param class_AppletHTTP applet: An :ref:`applethttp_class`
   :returns: the opaque data previously stored, or nil if nothing is
-     available.
+   available.
   :see: :js:func:`AppletHTTP.set_priv`
 
 .. js:function:: AppletHTTP.set_priv(applet, data)
 
-  Store any data in the current HAProxy transaction. This action replace the
+  Store any data in the current HAProxy transaction. This action replaces the
   old stored data.
 
   :param class_AppletHTTP applet: An :ref:`applethttp_class`
@@ -2892,15 +3809,15 @@ AppletHTTP class
   Converts a Lua type in a HAProxy type and store it in a variable <var>.
 
   :param class_AppletHTTP applet: An :ref:`applethttp_class`
-  :param string var: The variable name according with the HAProxy variable syntax.
-  :param type value: The value associated to the variable. The type ca be string or
-                     integer.
-  :param boolean ifexist: If this parameter is set to a truthy value the variable
-                          will only be set if it was defined elsewhere (i.e. used
-                          within the configuration). For global variables (using the
-                          "proc" scope), they will only be updated and never created.
-                           It is highly recommended to
-                          always set this to true.
+  :param string var: The variable name according with the HAProxy variable
+   syntax.
+  :param type value: The value associated to the variable. The type ca be string
+   or integer.
+  :param boolean ifexist: If this parameter is set to true the variable will
+   only be set if it was defined elsewhere (i.e. used within the configuration).
+   For global variables (using the "proc" scope), they will only be updated and
+   never created. It is highly recommended to always set this to true.
+
   :see: :js:func:`AppletHTTP.unset_var`
   :see: :js:func:`AppletHTTP.get_var`
 
@@ -2909,7 +3826,8 @@ AppletHTTP class
   Unset the variable <var>.
 
   :param class_AppletHTTP applet: An :ref:`applethttp_class`
-  :param string var: The variable name according with the HAProxy variable syntax.
+  :param string var: The variable name according with the HAProxy variable
+   syntax.
   :see: :js:func:`AppletHTTP.set_var`
   :see: :js:func:`AppletHTTP.get_var`
 
@@ -2918,7 +3836,8 @@ AppletHTTP class
   Returns data stored in the variable <var> converter in Lua type.
 
   :param class_AppletHTTP applet: An :ref:`applethttp_class`
-  :param string var: The variable name according with the HAProxy variable syntax.
+  :param string var: The variable name according with the HAProxy variable
+   syntax.
   :see: :js:func:`AppletHTTP.set_var`
   :see: :js:func:`AppletHTTP.unset_var`
 
@@ -2944,7 +3863,7 @@ AppletTCP class
   :returns: A :ref:`converters_class`
 
   This attribute contains a Converters class object. The
-  functions of this object returns always a string.
+  functions of this object always return a string.
 
 .. js:attribute:: AppletTCP.f
 
@@ -2975,8 +3894,8 @@ AppletTCP class
 
   :param class_AppletTCP applet: An :ref:`applettcp_class`
   :param integer size: the required read size.
-  :returns: always return a string,the string can be empty is the connection is
-            closed.
+  :returns: always return a string, the string can be empty if the connection is
+   closed.
 
 .. js:function:: AppletTCP.send(appletmsg)
 
@@ -2992,12 +3911,12 @@ AppletTCP class
 
   :param class_AppletTCP applet: An :ref:`applettcp_class`
   :returns: the opaque data previously stored, or nil if nothing is
-     available.
+   available.
   :see: :js:func:`AppletTCP.set_priv`
 
 .. js:function:: AppletTCP.set_priv(applet, data)
 
-  Store any data in the current HAProxy transaction. This action replace the
+  Store any data in the current HAProxy transaction. This action replaces the
   old stored data.
 
   :param class_AppletTCP applet: An :ref:`applettcp_class`
@@ -3009,15 +3928,15 @@ AppletTCP class
   Converts a Lua type in a HAProxy type and stores it in a variable <var>.
 
   :param class_AppletTCP applet: An :ref:`applettcp_class`
-  :param string var: The variable name according with the HAProxy variable syntax.
-  :param type value: The value associated to the variable. The type can be string or
-                     integer.
-  :param boolean ifexist: If this parameter is set to a truthy value the variable
-                          will only be set if it was defined elsewhere (i.e. used
-                          within the configuration). For global variables (using the
-                          "proc" scope), they will only be updated and never created.
-                           It is highly recommended to
-                          always set this to true.
+  :param string var: The variable name according with the HAProxy variable
+   syntax.
+  :param type value: The value associated to the variable. The type can be
+   string or integer.
+  :param boolean ifexist: If this parameter is set to true the variable will
+   only be set if it was defined elsewhere (i.e. used within the configuration).
+   For global variables (using the "proc" scope), they will only be updated and
+   never created. It is highly recommended to always set this to true.
+
   :see: :js:func:`AppletTCP.unset_var`
   :see: :js:func:`AppletTCP.get_var`
 
@@ -3026,7 +3945,8 @@ AppletTCP class
   Unsets the variable <var>.
 
   :param class_AppletTCP applet: An :ref:`applettcp_class`
-  :param string var: The variable name according with the HAProxy variable syntax.
+  :param string var: The variable name according with the HAProxy variable
+   syntax.
   :see: :js:func:`AppletTCP.unset_var`
   :see: :js:func:`AppletTCP.set_var`
 
@@ -3035,9 +3955,12 @@ AppletTCP class
   Returns data stored in the variable <var> converter in Lua type.
 
   :param class_AppletTCP applet: An :ref:`applettcp_class`
-  :param string var: The variable name according with the HAProxy variable syntax.
+  :param string var: The variable name according with the HAProxy variable
+   syntax.
   :see: :js:func:`AppletTCP.unset_var`
   :see: :js:func:`AppletTCP.set_var`
+
+.. _sticktable_class:
 
 StickTable class
 ================
@@ -3088,6 +4011,7 @@ StickTable class
    comparison operators as keys followed by data type name and value pairs.
    Check out the HAProxy docs for "show table" for more details. For the
    reference, the supported operators are:
+
      "eq", "ne", "le", "lt", "ge", "gt"
 
    For large tables, execution of this function can take a long time (for
@@ -3126,9 +4050,9 @@ Action class
 ..
 .. js:attribute:: act.CONTINUE
 
-  This attribute is an integer (0). It instructs HAProxy to continue the current
-  ruleset processing on the message. It is the default return code for a lua
-  action.
+  This attribute is an integer (0). It instructs HAProxy to continue the
+  current ruleset processing on the message. It is the default return code
+  for a lua action.
 
   :returns: integer
 
@@ -3163,7 +4087,7 @@ Action class
   This attribute is an integer (5). It denies the current message. The message
   processing is stopped and the transaction is terminated. For HTTP streams, an
   HTTP 403 error is returned to the client if the deny is returned during the
-  request analysis. During the response analysis, an HTTP 502 error is returned
+  request analysis. During the response analysis, a HTTP 502 error is returned
   and the server response is discarded.
 
   :returns: integer
@@ -3183,7 +4107,7 @@ Action class
   This attribute is an integer (7). It triggers an internal errors. The message
   processing is stopped and the transaction is terminated. For HTTP streams, an
   HTTP 400 error is returned to the client if the error is returned during the
-  request analysis. During the response analysis, an HTTP 502 error is returned
+  request analysis. During the response analysis, a HTTP 502 error is returned
   and the server response is discarded.
 
   :returns: integer
@@ -3211,7 +4135,7 @@ Filter class
 
   This class contains return codes some filter callback functions may return. It
   also contains configuration flags and some helper functions. To understand how
-  the filter API works, see `doc/internal/filters.txt` documentation.
+  the filter API works, see `doc/internals/api/filters.txt` documentation.
 
 .. js:attribute:: filter.CONTINUE
 
@@ -3274,7 +4198,8 @@ attributes:
 * id: The filter identifier. It is a string that identifies the filter and is
       optional.
 
-* flags: The filter flags. Only :js:attr:`filter.FLT_CFG_FL_HTX` may be set for now.
+* flags: The filter flags. Only :js:attr:`filter.FLT_CFG_FL_HTX` may be set
+         for now.
 
 Such filter class must also define all required callback functions in the
 following list. Note that :js:func:`Filter.new()` must be defined otherwise the
@@ -3315,7 +4240,7 @@ filter is ignored. Others are optional.
 
   Called during the TCP payload analysis on the channel **chn**.
 
-Here is an full example:
+Here is a full example:
 
 .. code-block:: lua
 
@@ -3391,12 +4316,12 @@ HTTPMessage class
 
   **context**: filter
 
-  This class contains all functions to manipulate an HTTP message. For now, this
+  This class contains all functions to manipulate a HTTP message. For now, this
   class is only available from a filter context.
 
 .. js:function:: HTTPMessage.add_header(http_msg, name, value)
 
-  Appends an HTTP header field in the HTTP message **http_msg** whose name is
+  Appends a HTTP header field in the HTTP message **http_msg** whose name is
   specified in **name** and whose value is defined in **value**.
 
   :param class_httpmessage http_msg: The manipulated HTTP message.
@@ -3412,7 +4337,7 @@ HTTPMessage class
   Same that :js:func:`HTTPMessage.insert(http_msg, string, http_msg:input())`.
 
   :param class_httpmessage http_msg: The manipulated HTTP message.
-  :param string string: The data to copied into incoming data.
+  :param string string: The data to copy at the end of incoming data.
   :returns: an integer containing the amount of bytes copied or -1.
 
 .. js:function:: HTTPMessage.body(http_msgl[, offset[, length]])
@@ -3424,20 +4349,19 @@ HTTPMessage class
   By default, if no length is provided, all incoming data found, starting at the
   given offset, are returned. If **length** is set to -1, the function tries to
   retrieve a maximum of data. Because it is called in the filter context, it
-  never yield. Do not providing an offset is the same that setting it to 0. A
+  never yield. Not providing an offset is the same as setting it to 0. A
   positive offset is relative to the beginning of incoming data of the
   http_message buffer while negative offset is relative to their end.
 
-  If there is no incoming data and the HTTP message can't receive more data, a 'nil'
-  value is returned.
+  If there is no incoming data and the HTTP message can't receive more data,
+  a 'nil' value is returned.
 
   :param class_httpmessage http_msg: The manipulated HTTP message.
   :param integer offset: *optional* The offset in incoming data to start to get
-                         data. 0 by default. May be negative to be relative to
-                         the end of incoming data.
-  :param integer length: *optional* The expected length of data to retrieve. All
-                         incoming data by default. May be set to -1 to get a
-                         maximum of data.
+   data. 0 by default. May be negative to be relative to the end of incoming
+   data.
+  :param integer length: *optional* The expected length of data to retrieve.
+   All incoming data by default. May be set to -1 to get a maximum of data.
   :returns: a string containing the data found or nil.
 
 .. js:function:: HTTPMessage.eom(http_msg)
@@ -3497,7 +4421,7 @@ HTTPMessage class
 .. js:function:: HTTPMessage.forward(http_msg, length)
 
   This function forwards **length** bytes of data from the HTTP message
-  **http_msg**. Because it is called in the filter context, it never yield. Only
+  **http_msg**. Because it is called in the filter context, it never yields. Only
   available incoming data may be forwarded, event if the requested length
   exceeds the available amount of incoming data. It returns the amount of data
   forwarded.
@@ -3508,7 +4432,7 @@ HTTPMessage class
 .. js:function:: HTTPMessage.input(http_msg)
 
   This function returns the length of incoming data in the HTTP message
-  **http_msg** from the calling filter point of view.
+  **http_msg** from the filter point of view.
 
   :param class_httpmessage http_msg: The manipulated HTTP message.
   :returns: an integer containing the amount of available bytes.
@@ -3524,10 +4448,10 @@ HTTPMessage class
   of the HTTP message while negative offset is relative to their end.
 
   :param class_httpmessage http_msg: The manipulated HTTP message.
-  :param string string: The data to copied into incoming data.
-  :param integer offset: *optional* The offset in incomding data where to copied
-                         data. 0 by default. May be negative to be relative to
-                         the end of incoming data.
+  :param string string: The data to copy into incoming data.
+  :param integer offset: *optional* The offset in incoming data where to copy
+   data. 0 by default. May be negative to be relative to the end of incoming
+   data.
   :returns: an integer containing the amount of bytes copied or -1.
 
 .. js:function:: HTTPMessage.is_full(http_msg)
@@ -3570,7 +4494,7 @@ HTTPMessage class
   Same that :js:func:`HTTPMessage.insert(http_msg, string, 0)`.
 
   :param class_httpmessage http_msg: The manipulated HTTP message.
-  :param string string: The data to copied into incoming data.
+  :param string string: The data to copy in front of incoming data.
   :returns: an integer containing the amount of bytes copied or -1.
 
 .. js:function:: HTTPMessage.remove(http_msg[, offset[, length]])
@@ -3580,16 +4504,16 @@ HTTPMessage class
   bytes removed on success.
 
   By default, if no length is provided, all incoming data, starting at the given
-  offset, are removed. Do not providing an offset is the same that setting it
+  offset, are removed. Not providing an offset is the same that setting it
   to 0. A positive offset is relative to the beginning of incoming data of the
-  HTTP message while negative offset is relative to their end.
+  HTTP message while negative offset is relative to the end.
 
   :param class_httpmessage http_msg: The manipulated HTTP message.
-  :param integer offset: *optional* The offset in incomding data where to start
-                         to remove data. 0 by default. May be negative to
-                         be relative to the end of incoming data.
+  :param integer offset: *optional* The offset in incoming data where to start
+   to remove data. 0 by default. May be negative to be relative to the end of
+   incoming data.
   :param integer length: *optional* The length of data to remove. All incoming
-                         data by default.
+   data by default.
   :returns: an integer containing the amount of bytes removed.
 
 .. js:function:: HTTPMessage.rep_header(http_msg, name, regex, replace)
@@ -3619,10 +4543,10 @@ HTTPMessage class
 
 .. js:function:: HTTPMessage.send(http_msg, string)
 
-  This function required immediate send of the string **string**. It means the
+  This function requires immediate send of the string **string**. It means the
   string is copied at the beginning of incoming data of the HTTP message
   **http_msg** and immediately forwarded. Because it is called in the filter
-  context, it never yield.
+  context, it never yields.
 
   :param class_httpmessage http_msg: The manipulated HTTP message.
   :param string string: The data to send.
@@ -3630,22 +4554,22 @@ HTTPMessage class
 
 .. js:function:: HTTPMessage.set(http_msg, string[, offset[, length]])
 
-  This function replace **length** bytes of incoming data of the HTTP message
+  This function replaces **length** bytes of incoming data of the HTTP message
   **http_msg**, starting at offset **offset**, by the string **string**. The
   function returns the copied length on success or -1 if data cannot be copied.
 
   By default, if no length is provided, all incoming data, starting at the given
-  offset, are replaced. Do not providing an offset is the same that setting it
+  offset, are replaced. Not providing an offset is the same as setting it
   to 0. A positive offset is relative to the beginning of incoming data of the
-  HTTP message while negative offset is relative to their end.
+  HTTP message while negative offset is relative to the end.
 
   :param class_httpmessage http_msg: The manipulated HTTP message.
-  :param string string: The data to copied into incoming data.
-  :param integer offset: *optional* The offset in incomding data where to start
-                         the data replacement. 0 by default. May be negative to
-                         be relative to the end of incoming data.
+  :param string string: The data to copy into incoming data.
+  :param integer offset: *optional* The offset in incoming data where to start
+   the data replacement. 0 by default. May be negative to be relative to the
+   end of incoming data.
   :param integer length: *optional* The length of data to replace. All incoming
-                         data by default.
+   data by default.
   :returns: an integer containing the amount of bytes copied or -1.
 
 .. js:function:: HTTPMessage.set_eom(http_msg)
@@ -3720,20 +4644,58 @@ HTTPMessage class
 
   :param class_httpmessage http_msg: The manipulated HTTP message.
 
+.. _CertCache_class:
+
+CertCache class
+================
+
+.. js:class:: CertCache
+
+   This class allows to update an SSL certificate file in the memory of the
+   current HAProxy process. It will do the same as "set ssl cert" + "commit ssl
+   cert" over the HAProxy CLI.
+
+.. js:function:: CertCache.set(certificate)
+
+  This function updates a certificate in memory.
+
+  :param table certificate: A table containing the fields to update.
+  :param string certificate.filename: The mandatory filename of the certificate
+   to update, it must already exist in memory.
+  :param string certificate.crt: A certificate in the PEM format. It can also
+   contain a private key.
+  :param string certificate.key: A private key in the PEM format.
+  :param string certificate.ocsp: An OCSP response in base64. (cf management.txt)
+  :param string certificate.issuer: The certificate of the OCSP issuer.
+  :param string certificate.sctl: An SCTL file.
+
+  .. Note::
+     This function may be slow. As such, it may only be used during startup
+     (main or init context) or from a yield-capable runtime context.
+
+.. code-block:: lua
+
+    CertCache.set{filename="certs/localhost9994.pem.rsa", crt=crt}
+
+
 External Lua libraries
 ======================
 
 A lot of useful lua libraries can be found here:
 
-* `https://lua-toolbox.com/ <https://lua-toolbox.com/>`_
+* Lua toolbox has been superseded by
+  `https://luarocks.org/ <https://luarocks.org/>`_
+
+  The old lua toolbox source code is still available here
+  `https://github.com/catwell/lua-toolbox <https://github.com/catwell/lua-toolbox>`_ (DEPRECATED)
 
 Redis client library:
 
 * `https://github.com/nrk/redis-lua <https://github.com/nrk/redis-lua>`_
 
-This is an example about the usage of the Redis library with HAProxy. Note that
-each call of any function of this library can throw an error if the socket
-connection fails.
+This is an example about the usage of the Redis library within HAProxy.
+Note that each call to any function of this library can throw an error if
+the socket connection fails.
 
 .. code-block:: lua
 

@@ -21,6 +21,7 @@
 #include <haproxy/global.h>
 #include <haproxy/h1.h>
 #include <haproxy/http.h>
+#include <haproxy/http-hdr.h>
 #include <haproxy/http_fetch.h>
 #include <haproxy/http_htx.h>
 #include <haproxy/htx.h>
@@ -139,7 +140,7 @@ static int __http_find_header(const struct htx *htx, const void *pattern, struct
 		if (flags & HTTP_FIND_FL_FULL)
 			goto next_blk;
 		v = htx_get_blk_value(htx, blk);
-		p = ctx->value.ptr + ctx->value.len + ctx->lws_after;
+		p = istend(ctx->value) + ctx->lws_after;
 		v.len -= (p - v.ptr);
 		v.ptr  = p;
 		if (!v.len)
@@ -387,7 +388,10 @@ int http_replace_req_uri(struct htx *htx, const struct ist uri)
 	if (!http_replace_stline(htx, meth, uri, vsn))
 		goto fail;
 
-	sl = http_get_stline(htx);
+	/* the stline exists because http_replace_stline() succeeded */
+	sl = ASSUME_NONNULL(http_get_stline(htx));
+
+	sl->flags &= ~HTX_SL_F_NORMALIZED_URI;
 	if (!http_update_host(htx, sl, uri))
 		goto fail;
 
@@ -533,6 +537,114 @@ int http_replace_res_reason(struct htx *htx, const struct ist reason)
 	return http_replace_stline(htx, vsn, status, reason);
 }
 
+/* Append new value <data> after <ctx> value in header
+ * if header is not empty (at least one value exists):
+ *   - ',' delimiter is added before <data> is appended
+ *   - <ctx> must be valid and must point to an existing value,
+ *     else it is an error and prepend_value should be used instead.
+ *
+ * ctx is updated to point to new value
+ *
+ * Returns 1 on success and 0 on failure.
+ */
+int http_append_header_value(struct htx *htx, struct http_hdr_ctx *ctx, const struct ist data)
+{
+	char *start;
+	struct htx_blk *blk = ctx->blk;
+	struct ist v;
+	uint32_t off = 0;
+
+	if (!blk)
+		goto fail;
+
+	v = htx_get_blk_value(htx, blk);
+
+	if (!istlen(v)) {
+		start = v.ptr;
+		goto empty; /* header is empty, append without ',' */
+	}
+	if (unlikely(!istlen(ctx->value)))
+		goto fail; /* invalid: value is empty, not supported */
+
+	start = istend(ctx->value) + ctx->lws_after;
+	off = start - v.ptr;
+
+	blk = htx_replace_blk_value(htx, blk, ist2(start, 0), ist(","));
+	if (!blk)
+		goto fail;
+	off += 1; /* add 1 for ',' */
+	v = htx_get_blk_value(htx, blk);
+	start = v.ptr + off;
+
+  empty:
+	blk = htx_replace_blk_value(htx, blk, ist2(start, 0), data);
+	if (!blk)
+		goto fail;
+	v = htx_get_blk_value(htx, blk);
+
+	ctx->blk = blk;
+	ctx->value = ist2(v.ptr + off, data.len);
+	ctx->lws_before = ctx->lws_after = 0;
+
+	return 1;
+  fail:
+	return 0;
+}
+
+/* Prepend new value <data> before <ctx> value in header
+ * if <ctx> is not first value (at least one value exists):
+ *   - ',' delimiter is added after <data> is prepended
+ *
+ * ctx is updated to point to new value
+ *
+ * Returns 1 on success and 0 on failure.
+ */
+int http_prepend_header_value(struct htx *htx, struct http_hdr_ctx *ctx, const struct ist data)
+{
+	char *start;
+	struct htx_blk *blk = ctx->blk;
+	struct ist v;
+	uint32_t off = 0;
+	uint8_t first;
+
+	if (!blk)
+		goto fail;
+
+	v = htx_get_blk_value(htx, blk);
+
+	first = !istlen(v);
+	start = first ? v.ptr : istptr(ctx->value) - ctx->lws_before;
+
+	if (unlikely(!istlen(ctx->value)))
+		goto fail; /* invalid: value is empty, not supported */
+
+	off = start - v.ptr;
+
+	blk = htx_replace_blk_value(htx, blk, ist2(start, 0), data);
+	if (!blk)
+		goto fail;
+	v = htx_get_blk_value(htx, blk);
+
+	if (first)
+		goto end; /* header is empty, don't append ',' */
+
+	start = v.ptr + off + data.len;
+
+	blk = htx_replace_blk_value(htx, blk, ist2(start, 0), ist(","));
+	if (!blk)
+		goto fail;
+	v = htx_get_blk_value(htx, blk);
+
+  end:
+	ctx->blk = blk;
+	ctx->value = ist2(v.ptr + off, data.len);
+	ctx->lws_before = ctx->lws_after = 0;
+
+	return 1;
+  fail:
+	return 0;
+}
+
 /* Replaces a part of a header value referenced in the context <ctx> by
  * <data>. It returns 1 on success, otherwise it returns 0. The context is
  * updated if necessary.
@@ -574,8 +686,7 @@ int http_replace_header_value(struct htx *htx, struct http_hdr_ctx *ctx, const s
 	}
 
 	ctx->blk = blk;
-	ctx->value.ptr = v.ptr + off;
-	ctx->value.len = data.len;
+	ctx->value = ist2(v.ptr + off, data.len);
 	ctx->lws_before = ctx->lws_after = 0;
 
 	return 1;
@@ -674,8 +785,7 @@ int http_remove_header(struct htx *htx, struct http_hdr_ctx *ctx)
 	htx_change_blk_value_len(htx, blk, v.len-len);
 
 	/* Finally update the ctx */
-	ctx->value.ptr = start;
-	ctx->value.len = 0;
+	ctx->value = ist2(start, 0);
 	ctx->lws_before = ctx->lws_after = 0;
 
 	return 1;
@@ -922,7 +1032,7 @@ int http_str_to_htx(struct buffer *buf, struct ist raw, char **errmsg)
 	ret = h1_headers_to_hdr_list(raw.ptr, istend(raw),
 				     hdrs, sizeof(hdrs)/sizeof(hdrs[0]), &h1m, &h1sl);
 	if (ret <= 0) {
-		memprintf(errmsg, "unabled to parse headers (error offset: %d)", h1m.err_pos);
+		memprintf(errmsg, "unable to parse headers (error offset: %d)", h1m.err_pos);
 		goto error;
 	}
 
@@ -1007,7 +1117,6 @@ error:
 
 void release_http_reply(struct http_reply *http_reply)
 {
-	struct logformat_node *lf, *lfb;
 	struct http_reply_hdr *hdr, *hdrb;
 
 	if (!http_reply)
@@ -1016,12 +1125,7 @@ void release_http_reply(struct http_reply *http_reply)
 	ha_free(&http_reply->ctype);
 	list_for_each_entry_safe(hdr, hdrb, &http_reply->hdrs, list) {
 		LIST_DELETE(&hdr->list);
-		list_for_each_entry_safe(lf, lfb, &hdr->value, list) {
-			LIST_DELETE(&lf->list);
-			release_sample_expr(lf->expr);
-			free(lf->arg);
-			free(lf);
-		}
+		lf_expr_deinit(&hdr->value);
 		istfree(&hdr->name);
 		free(hdr);
 	}
@@ -1031,14 +1135,8 @@ void release_http_reply(struct http_reply *http_reply)
 	}
 	else if (http_reply->type == HTTP_REPLY_RAW)
 		chunk_destroy(&http_reply->body.obj);
-	else if (http_reply->type == HTTP_REPLY_LOGFMT) {
-		list_for_each_entry_safe(lf, lfb, &http_reply->body.fmt, list) {
-			LIST_DELETE(&lf->list);
-			release_sample_expr(lf->expr);
-			free(lf->arg);
-			free(lf);
-		}
-	}
+	else if (http_reply->type == HTTP_REPLY_LOGFMT)
+		lf_expr_deinit(&http_reply->body.fmt);
 	free(http_reply);
 }
 
@@ -1057,7 +1155,7 @@ static int http_htx_init(void)
 			continue;
 		}
 
-		raw = ist2(http_err_msgs[rc], strlen(http_err_msgs[rc]));
+		raw = ist(http_err_msgs[rc]);
 		if (!http_str_to_htx(&chk, raw, &errmsg)) {
 			ha_alert("Internal error: invalid default message for HTTP return code %d: %s.\n",
 				 http_err_codes[rc], errmsg);
@@ -1114,6 +1212,9 @@ static void http_htx_deinit(void)
 		LIST_DELETE(&http_rep->list);
 		release_http_reply(http_rep);
 	}
+
+	for (rc = 0; rc < HTTP_ERR_SIZE; rc++)
+		chunk_destroy(&http_err_chunks[rc]);
 }
 
 REGISTER_CONFIG_POSTPARSER("http_htx", http_htx_init);
@@ -1384,7 +1485,6 @@ int http_check_http_reply(struct http_reply *reply, struct proxy *px, char **err
 struct http_reply *http_parse_http_reply(const char **args, int *orig_arg, struct proxy *px,
 					 int default_status, char **errmsg)
 {
-	struct logformat_node *lf, *lfb;
 	struct http_reply *reply = NULL;
 	struct http_reply_hdr *hdr, *hdrb;
 	struct stat stat;
@@ -1569,6 +1669,7 @@ struct http_reply *http_parse_http_reply(const char **args, int *orig_arg, struc
 			fd = -1;
 			obj[objlen] = '\0';
 			reply->type = HTTP_REPLY_LOGFMT;
+			lf_expr_init(&reply->body.fmt);
 			cur_arg++;
 		}
 		else if (strcmp(args[cur_arg], "lf-string") == 0) {
@@ -1585,6 +1686,7 @@ struct http_reply *http_parse_http_reply(const char **args, int *orig_arg, struc
 			obj = strdup(args[cur_arg]);
 			objlen = strlen(args[cur_arg]);
 			reply->type = HTTP_REPLY_LOGFMT;
+			lf_expr_init(&reply->body.fmt);
 			cur_arg++;
 		}
 		else if (strcmp(args[cur_arg], "hdr") == 0) {
@@ -1607,7 +1709,7 @@ struct http_reply *http_parse_http_reply(const char **args, int *orig_arg, struc
 				goto error;
 			}
 			LIST_APPEND(&reply->hdrs, &hdr->list);
-			LIST_INIT(&hdr->value);
+			lf_expr_init(&hdr->value);
 			hdr->name = ist(strdup(args[cur_arg]));
 			if (!isttest(hdr->name)) {
 				memprintf(errmsg, "out of memory");
@@ -1616,9 +1718,6 @@ struct http_reply *http_parse_http_reply(const char **args, int *orig_arg, struc
 			if (!parse_logformat_string(args[cur_arg+1], px, &hdr->value, LOG_OPT_HTTP, cap, errmsg))
 				goto error;
 
-			free(px->conf.lfs_file);
-			px->conf.lfs_file = strdup(px->conf.args.file);
-			px->conf.lfs_line = px->conf.args.line;
 			cur_arg += 2;
 		}
 		else
@@ -1663,12 +1762,7 @@ struct http_reply *http_parse_http_reply(const char **args, int *orig_arg, struc
 				   px->conf.args.file, px->conf.args.line);
 			list_for_each_entry_safe(hdr, hdrb, &reply->hdrs, list) {
 				LIST_DELETE(&hdr->list);
-				list_for_each_entry_safe(lf, lfb, &hdr->value, list) {
-					LIST_DELETE(&lf->list);
-					release_sample_expr(lf->expr);
-					free(lf->arg);
-					free(lf);
-				}
+				lf_expr_deinit(&hdr->value);
 				istfree(&hdr->name);
 				free(hdr);
 			}
@@ -1696,7 +1790,7 @@ struct http_reply *http_parse_http_reply(const char **args, int *orig_arg, struc
 		}
 	}
 	else if (reply->type == HTTP_REPLY_LOGFMT) { /* log-format payload using 'lf-file' of 'lf-string' parameter */
-		LIST_INIT(&reply->body.fmt);
+		lf_expr_init(&reply->body.fmt);
 		if ((reply->status == 204 || reply->status == 304)) {
 			memprintf(errmsg, "No body expected for %d responses", reply->status);
 			goto error;
@@ -1705,12 +1799,8 @@ struct http_reply *http_parse_http_reply(const char **args, int *orig_arg, struc
 			memprintf(errmsg, "a content type must be defined with a log-format payload");
 			goto error;
 		}
-		if (!parse_logformat_string(obj, px, &reply->body.fmt, LOG_OPT_HTTP, cap, errmsg))
+		if (!parse_logformat_string(obj, px, &reply->body.fmt, LOG_OPT_NONE, cap, errmsg))
 			goto error;
-
-		free(px->conf.lfs_file);
-		px->conf.lfs_file = strdup(px->conf.args.file);
-		px->conf.lfs_line = px->conf.args.line;
 	}
 
 	free(obj);
@@ -1723,12 +1813,6 @@ struct http_reply *http_parse_http_reply(const char **args, int *orig_arg, struc
 		close(fd);
 	release_http_reply(reply);
 	return NULL;
-}
-
-static int uri_is_default_port(const struct ist scheme, const struct ist port)
-{
-	return (isteq(port, ist("443")) && isteqi(scheme, ist("https://"))) ||
-	        (isteq(port, ist("80")) && isteqi(scheme, ist("http://")));
 }
 
 /* Apply schemed-based normalization as described on rfc3986 on section 6.3.2.
@@ -1744,9 +1828,9 @@ int http_scheme_based_normalize(struct htx *htx)
 {
 	struct http_hdr_ctx ctx;
 	struct htx_sl *sl;
-	struct ist uri, scheme, authority, host, port;
-	char *start, *end, *ptr;
+	struct ist uri, scheme, authority, host, port, path;
 	struct http_uri_parser parser;
+	int normalize = 0;
 
 	sl = http_get_stline(htx);
 
@@ -1761,28 +1845,26 @@ int http_scheme_based_normalize(struct htx *htx)
 	if (!isttest(scheme))
 		return 0;
 
-	/* Extract the port if present in authority. To properly support ipv6
-	 * hostnames, do a reverse search on the last ':' separator as long as
-	 * digits are found.
-	 */
-	authority = http_parse_authority(&parser, 0);
-	start = istptr(authority);
-	end = istend(authority);
-	for (ptr = end; ptr > start && isdigit((unsigned char)*--ptr); )
-		;
+	/* Extract the port if present in authority */
+	authority = http_parse_authority(&parser, 1);
+	path = http_parse_path(&parser);
+	port = http_get_host_port(authority);
+	if (!isttest(port) || !http_is_default_port(scheme, port))
+		host = authority;
+	else {
+		host = isttrim(authority, istlen(authority) - istlen(port) - 1);
+		normalize = 1;
+	}
 
-	/* if no port found, no normalization to proceed */
-	if (likely(*ptr != ':'))
-		return 0;
+	if (!isttest(path)) {
+		path = ist("/");
+		normalize = 1;
+	}
 
-	/* split host/port on the ':' separator found */
-	host = ist2(start, ptr - start);
-	port = istnext(ist2(ptr, end - ptr));
-
-	if (istlen(port) && uri_is_default_port(scheme, port)) {
+	if (normalize) {
 		/* reconstruct the uri with removal of the port */
 		struct buffer *temp = get_trash_chunk();
-		struct ist meth, vsn, path;
+		struct ist meth, vsn;
 
 		/* meth */
 		chunk_memcat(temp, HTX_SL_REQ_MPTR(sl), HTX_SL_REQ_MLEN(sl));
@@ -1793,12 +1875,10 @@ int http_scheme_based_normalize(struct htx *htx)
 		vsn = ist2(temp->area + meth.len, HTX_SL_REQ_VLEN(sl));
 
 		/* reconstruct uri without port */
-		path = http_parse_path(&parser);
-		chunk_istcat(temp, scheme);
+		chunk_memcat(temp, uri.ptr, authority.ptr - uri.ptr);
 		chunk_istcat(temp, host);
 		chunk_istcat(temp, path);
-		uri = ist2(temp->area + meth.len + vsn.len,
-		           scheme.len + host.len + path.len);
+		uri = ist2(temp->area + meth.len + vsn.len, host.len + path.len + authority.ptr - uri.ptr); /* uri */
 
 		http_replace_stline(htx, meth, uri, vsn);
 
@@ -1814,6 +1894,88 @@ int http_scheme_based_normalize(struct htx *htx)
 
  fail:
 	return 1;
+}
+
+/* First step function to merge multiple cookie headers in a single entry.
+ *
+ * Use it for each cookie header at <idx> index over HTTP headers in <list>.
+ * <first> and <last> are state variables used internally and must be
+ * initialized to -1 before the first invocation.
+ */
+void http_cookie_register(struct http_hdr *list, int idx, int *first, int *last)
+{
+	/* Build a linked list of cookie headers. Use header length to point to
+	 * the next one. The last entry will contains -1.
+	 */
+
+	/* Caller is responsible to initialize *first and *last to -1 on first
+	 * invocation. Both will thus be set to a valid index after it.
+	 */
+	BUG_ON(*first > 0 && *last < 0);
+
+	/* Mark the current end of cookie linked list. */
+	list[idx].n.len = -1;
+	if (*first < 0) {
+		/* Save first found cookie for http_cookie_merge call. */
+		*first = idx;
+	}
+	else {
+		/* Update linked list of cookies. */
+		list[*last].n.len = idx;
+	}
+
+	*last = idx;
+}
+
+/* Second step to merge multiple cookie headers in a single entry.
+ *
+ * Use it when looping over HTTP headers is done and <htx> message is built.
+ * This will concatenate each cookie headers present from <list> directly into
+ * <htx> message. <first> is reused from previous http_cookie_register
+ * invocation.
+ *
+ * Returns 0 on success else non-zero.
+ */
+int http_cookie_merge(struct htx *htx, struct http_hdr *list, int first)
+{
+	uint32_t fs; /* free space */
+	uint32_t bs; /* block size */
+	uint32_t vl; /* value len */
+	uint32_t tl; /* total length */
+	struct htx_blk *blk;
+
+	if (first < 0)
+		return 0;
+
+	blk = htx_add_header(htx, ist("cookie"), list[first].v);
+	if (!blk)
+		return 1;
+
+	tl = list[first].v.len;
+	fs = htx_free_data_space(htx);
+	bs = htx_get_blksz(blk);
+
+	/* for each extra cookie, we'll extend the cookie's value and insert
+	 * ";" before the new value.
+	 */
+	fs += tl; /* first one is already counted */
+
+	/* Loop over cookies linked list built from http_cookie_register. */
+	while ((first = list[first].n.len) >= 0) {
+		vl = list[first].v.len;
+		tl += vl + 2;
+		if (tl > fs)
+			return 1;
+
+		htx_change_blk_value_len(htx, blk, tl);
+		*(char *)(htx_get_blk_ptr(htx, blk) + bs + 0) = ';';
+		*(char *)(htx_get_blk_ptr(htx, blk) + bs + 1) = ' ';
+		memcpy(htx_get_blk_ptr(htx, blk) + bs + 2,
+		       list[first].v.ptr, vl);
+		bs += vl + 2;
+	}
+
+	return 0;
 }
 
 /* Parses the "errorloc[302|303]" proxy keyword */
@@ -1834,6 +1996,11 @@ static int proxy_parse_errorloc(char **args, int section, struct proxy *curpx,
 
 	if (*(args[1]) == 0 || *(args[2]) == 0) {
 		memprintf(errmsg, "%s : expects <status_code> and <url> as arguments.\n", args[0]);
+		ret = -1;
+		goto out;
+	}
+	if (*(args[3])) {
+		memprintf(errmsg, "%s : expects exactly two arguments.\n", args[0]);
 		ret = -1;
 		goto out;
 	}
@@ -1901,6 +2068,11 @@ static int proxy_parse_errorfile(char **args, int section, struct proxy *curpx,
 
 	if (*(args[1]) == 0 || *(args[2]) == 0) {
 		memprintf(errmsg, "%s : expects <status_code> and <file> as arguments.\n", args[0]);
+		ret = -1;
+		goto out;
+	}
+	if (*(args[3])) {
+		memprintf(errmsg, "%s : expects exactly two arguments.\n", args[0]);
 		ret = -1;
 		goto out;
 	}
